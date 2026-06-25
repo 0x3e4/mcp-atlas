@@ -1,0 +1,23 @@
+# Always-on streamable-http deployment template. Copy and customize locally:
+#   cp compose.yml.example compose.yml      # compose.yml is gitignored (per-deployment)
+#   docker compose pull && docker compose up -d
+# Images are built and pushed to GHCR by .github/workflows/build.yml.
+# (For a local-build dev workflow instead of GHCR, replace the image: line with `build: .`.)
+services:
+  netscaler-mcp:
+    image: ghcr.io/0x3e4/netscaler-mcp:latest
+    env_file: ./netscaler.env
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      FASTMCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    # Localhost / single server: publish the port. Drop this block when fronting with a gateway.
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # --- MCP gateway (e.g. mcpjungle): remove the ports: above and join a shared network ---
+    # networks: [atlas-net]
+# networks:
+#   atlas-net:
+#     external: true

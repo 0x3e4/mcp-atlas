@@ -70,9 +70,57 @@ claude mcp add bookstack -- poetry run bookstack-mcp
 
 ### Always-on HTTP (optional)
 
+Run the server as a long-lived `streamable-http` service instead of per-session stdio.
+[`compose.yml`](compose.yml) already sets `MCP_TRANSPORT=streamable-http` and binds `0.0.0.0:8000`:
+
 ```bash
 docker compose up -d        # serves MCP at http://localhost:8000/mcp (streamable-http)
 ```
+
+Point any HTTP MCP client at `http://<host>:8000/mcp` (also the only mode remote clients like
+OpenAI support). **On localhost this works as-is — nothing else to change.**
+
+#### Behind an MCP gateway (shared Docker network)
+
+A gateway (e.g. [mcpjungle](https://github.com/mcpjungle/MCPJungle)) fronts many servers behind one
+endpoint. Running several atlas servers next to a gateway on one host changes two things:
+
+- The published **`8000:8000` host port collides** once more than one server uses it. Drop the host
+  port and let the gateway reach the server **by its compose service name** over a shared Docker
+  network (or, if you must publish, give each server a distinct host port like `"8001:8000"`).
+- Put the **gateway and the servers on one shared network**, so `http://bookstack-mcp:8000/mcp` resolves.
+
+Create the network once, then run this server attached to it — a gateway-flavoured `compose.yml`:
+
+```bash
+docker network create atlas-net     # once; shared by the gateway + every server
+```
+
+```yaml
+# compose.yml — gateway variant: no host port, joins the shared network
+services:
+  bookstack-mcp:
+    build: .
+    image: bookstack-mcp
+    env_file: ./bookstack.env
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      FASTMCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    # no `ports:` — only the gateway reaches it, over atlas-net
+    networks: [atlas-net]
+    restart: unless-stopped
+
+networks:
+  atlas-net:
+    external: true
+```
+
+With the gateway also on `atlas-net`, register this server at `http://bookstack-mcp:8000/mcp`
+(`mcpjungle register --name bookstack --url http://bookstack-mcp:8000/mcp`). See the repo-root
+[README → *Behind an MCP gateway*](../README.md#behind-an-mcp-gateway-eg-mcpjungle) for the full
+gateway walkthrough and client setup.
 
 ## 4. Verify
 
