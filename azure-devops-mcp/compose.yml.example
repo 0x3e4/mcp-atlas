@@ -10,8 +10,7 @@ services:
     env_file: ./azure-devops.env
     environment:
       MCP_TRANSPORT: streamable-http
-      MCP_HOST: 0.0.0.0
-      FASTMCP_HOST: 0.0.0.0
+      MCP_HOST: 0.0.0.0           # bind all interfaces (required for the published port / gateway to reach it)
       MCP_PORT: "8000"
     # Localhost / single server: publish the port. Drop this block when fronting with a gateway.
     ports:
