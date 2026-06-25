@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .config import Settings, WazuhError
 from .indexer import IndexerClient
@@ -372,6 +373,9 @@ async def manager_api_get(path: str, params: dict | None = None) -> dict:
 
 def main() -> None:
     transport = "streamable-http" if settings.transport == "streamable-http" else "stdio"
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    )
     mcp.run(transport=transport)
 
 

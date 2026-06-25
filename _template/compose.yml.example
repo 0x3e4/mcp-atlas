@@ -4,10 +4,10 @@
 # Images are built and pushed to GHCR by .github/workflows/build.yml.
 # (No GHCR? Replace the image: line with "build: ." to build from this folder instead.)
 services:
-  vcenter-mcp:
-    image: ghcr.io/0x3e4/vcenter-mcp:latest
-    container_name: vcenter-mcp          # stable name: reachable at http://vcenter-mcp:8000/mcp by the gateway and other containers
-    env_file: ./vcenter.env
+  template-mcp:
+    image: ghcr.io/0x3e4/template-mcp:latest
+    container_name: template-mcp          # stable name: reachable at http://template-mcp:8000/mcp by the gateway and other containers
+    env_file: ./template.env
     environment:
       MCP_TRANSPORT: streamable-http
       MCP_HOST: 0.0.0.0

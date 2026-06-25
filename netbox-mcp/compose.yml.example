@@ -2,10 +2,11 @@
 #   cp compose.yml.example compose.yml      # compose.yml is gitignored (per-deployment)
 #   docker compose pull && docker compose up -d
 # Images are built and pushed to GHCR by .github/workflows/build.yml.
-# (For a local-build dev workflow instead of GHCR, replace the image: line with `build: .`.)
+# (No GHCR? Replace the image: line with "build: ." to build from this folder instead.)
 services:
   netbox-mcp:
     image: ghcr.io/0x3e4/netbox-mcp:latest
+    container_name: netbox-mcp          # stable name: reachable at http://netbox-mcp:8000/mcp by the gateway and other containers
     env_file: ./netbox.env
     environment:
       MCP_TRANSPORT: streamable-http

@@ -15,6 +15,7 @@ import sys
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from .client import ZammadClient
@@ -317,6 +318,9 @@ def main() -> None:
     # FastMCP.run() ignores host/port — they must be set on the instance settings.
     mcp.settings.host = settings.host
     mcp.settings.port = settings.port
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    )
     mcp.run(transport=settings.transport)
 
 
