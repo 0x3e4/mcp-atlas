@@ -1,0 +1,13 @@
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.env
+zammad.env
+*.env
+!.env.example
+tests/
+dist/
+*.egg-info/

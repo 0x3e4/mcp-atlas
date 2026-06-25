@@ -1,0 +1,21 @@
+[project]
+name = "wazuh-mcp"
+version = "0.1.0"
+description = "Lightweight MCP server for querying Wazuh alerts, archives, and management data"
+authors = [{ name = "cai", email = "cai@nohub.lol" }]
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "mcp[cli]>=1.28,<2",
+    "httpx>=0.28",
+]
+
+[project.scripts]
+wazuh-mcp = "wazuh_mcp.server:main"
+
+[tool.poetry]
+packages = [{ include = "wazuh_mcp", from = "src" }]
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"

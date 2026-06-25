@@ -1,0 +1,17 @@
+# Optional always-on streamable-http variant.
+#   docker compose up -d         # serves MCP at http://localhost:8000/mcp
+# For Claude Code over stdio, prefer `docker run -i` (see README) instead of this.
+services:
+  bookstack-mcp:
+    build: .
+    image: bookstack-mcp
+    env_file: ./bookstack.env
+    environment:
+      MCP_TRANSPORT: streamable-http
+      # FastMCP binds to 0.0.0.0 inside the container so the port is reachable from the host.
+      MCP_HOST: 0.0.0.0
+      FASTMCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

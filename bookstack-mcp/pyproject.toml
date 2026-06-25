@@ -1,0 +1,29 @@
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "bookstack-mcp"
+version = "0.1.0"
+description = "Read-only BookStack MCP server — shelves, books, chapters, pages, search and export"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{ name = "cai", email = "cai@nohub.lol" }]
+keywords = ["mcp", "bookstack", "wiki", "documentation", "knowledge-base"]
+dependencies = [
+    "mcp[cli]>=1.28,<2",
+    "httpx>=0.28",
+]
+
+[project.scripts]
+bookstack-mcp = "bookstack_mcp.server:main"
+
+[tool.poetry]
+packages = [{ include = "bookstack_mcp", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

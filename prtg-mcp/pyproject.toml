@@ -1,0 +1,29 @@
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "prtg-mcp"
+version = "0.1.0"
+description = "Read-only PRTG Network Monitor MCP server — sensors, devices, status, logs and historic data"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{ name = "cai", email = "cai@nohub.lol" }]
+keywords = ["mcp", "prtg", "paessler", "monitoring", "network"]
+dependencies = [
+    "mcp[cli]>=1.28,<2",
+    "httpx>=0.28",
+]
+
+[project.scripts]
+prtg-mcp = "prtg_mcp.server:main"
+
+[tool.poetry]
+packages = [{ include = "prtg_mcp", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

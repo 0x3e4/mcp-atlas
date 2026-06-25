@@ -1,0 +1,29 @@
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "netbox-mcp"
+version = "0.1.0"
+description = "Read-only NetBox (DCIM/IPAM) MCP server — devices, interfaces, IPs, prefixes, VMs"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{ name = "cai", email = "cai@nohub.lol" }]
+keywords = ["mcp", "netbox", "dcim", "ipam", "network-source-of-truth"]
+dependencies = [
+    "mcp[cli]>=1.28,<2",
+    "httpx>=0.28",
+]
+
+[project.scripts]
+netbox-mcp = "netbox_mcp.server:main"
+
+[tool.poetry]
+packages = [{ include = "netbox_mcp", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
