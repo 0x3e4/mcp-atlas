@@ -4,8 +4,8 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "netscaler-mcp"
-version = "0.1.0"
-description = "Read-only NetScaler ADC (NITRO) MCP server — vservers, services, SSL certs, HA, system stats"
+version = "0.2.0"
+description = "NetScaler ADC (NITRO) MCP server — vservers, services, SSL certs, HA, system stats, WAF rollout (opt-in writes)"
 readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"

@@ -16,6 +16,10 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    # --- WAF export/import files: set NETSCALER_EXPORT_DIR=/exports in netscaler.env, then mount a host
+    #     dir writable by the container user (uid 10001): mkdir exports && chown 10001 exports ---
+    # volumes:
+    #   - ./exports:/exports
     # --- MCP gateway (e.g. mcpjungle): remove the ports: above and join a shared network ---
     # networks: [atlas-net]
 # networks:

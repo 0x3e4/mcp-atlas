@@ -6,6 +6,11 @@ re-logs-in and retries once when the appliance reports the session expired (NITR
 HTTP 401). In ``stateless`` mode it sends ``X-NITRO-USER`` / ``X-NITRO-PASS`` on every request and
 never holds a session. NITRO response envelopes are unwrapped; a non-zero ``errorcode`` becomes a
 clean ``NitroError`` so tools never leak tracebacks to the model.
+
+Write calls (``add`` / ``update`` / ``delete`` / ``action``) exist for the WAF tools and are gated at the
+tool layer by ``NETSCALER_ALLOW_WRITE``. Query strings are serialised by hand (``_encode_query``):
+httpx silently drops a URL's own query when ``params=`` is also passed, and NITRO ``args`` values
+(regex URLs) need SDK-style encoding with literal ``key:value,key:value`` separators.
 """
 
 from __future__ import annotations
@@ -135,6 +140,7 @@ class NitroClient:
         resource_name: str | None = None,
         attrs: list[str] | tuple[str, ...] | None = None,
         filter: dict[str, Any] | None = None,
+        args: dict[str, Any] | None = None,
         count: bool = False,
         pagesize: int | None = None,
         pageno: int | None = None,
@@ -143,6 +149,8 @@ class NitroClient:
 
         ``tree`` is ``config`` or ``stat``. The caller reads ``env[resourcetype]`` (the envelope key
         matches the resource type, including its casing — e.g. the stat ``Interface`` resource).
+        ``args`` carries required lookup arguments (``appfwlearningdata`` needs profilename +
+        securitycheck).
         """
         if tree not in ("config", "stat"):
             raise ValueError(f"tree must be 'config' or 'stat'; got {tree!r}.")
@@ -154,6 +162,8 @@ class NitroClient:
             params["attrs"] = ",".join(attrs)
         if filter:
             params["filter"] = ",".join(f"{k}:{v}" for k, v in filter.items())
+        if args:
+            params["args"] = args
         if count:
             params["count"] = "yes"
         if pagesize is not None:
@@ -172,22 +182,58 @@ class NitroClient:
             return await self._request("GET", path, params=params, absolute=True)
         return await self._request("GET", path.lstrip("/"), params=params)
 
+    # ---- writes (gated at the tool layer by NETSCALER_ALLOW_WRITE) ------
+
+    async def add(self, resourcetype: str, obj: dict[str, Any]) -> dict[str, Any]:
+        """POST a new config resource (``add``), body ``{"<resourcetype>": obj}``."""
+        return await self._request("POST", f"config/{resourcetype}", body={resourcetype: obj})
+
+    async def update(self, resourcetype: str, obj: dict[str, Any]) -> dict[str, Any]:
+        """PUT a config resource: ``set`` for a resource, ``bind`` for a ``*_binding`` type."""
+        return await self._request("PUT", f"config/{resourcetype}", body={resourcetype: obj})
+
+    async def delete(
+        self,
+        resourcetype: str,
+        resource_name: str | None = None,
+        *,
+        args: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """DELETE a config resource or binding (``rm`` / ``unbind``); ``args`` identifies the binding."""
+        path = f"config/{resourcetype}"
+        if resource_name:
+            path += "/" + quote(resource_name, safe="")
+        return await self._request("DELETE", path, params={"args": args} if args else None)
+
+    async def action(
+        self, resourcetype: str, action: str, obj: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """POST ``config/<resourcetype>?action=<action>`` (e.g. ``save ns config``)."""
+        return await self._request(
+            "POST", f"config/{resourcetype}", params={"action": action}, body={resourcetype: obj or {}}
+        )
+
     async def _request(
         self,
         method: str,
         path: str,
         *,
         params: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
         absolute: bool = False,
     ) -> dict[str, Any]:
         url = path if absolute else f"{self._settings.nitro_base}/{path}"
+        query = _encode_query(params)
+        if query:
+            url += ("&" if "?" in url else "?") + query
         client = await self._http()
         session_mode = self._settings.auth_mode == "session"
+        write = method != "GET"
         # Two attempts: a 444/401 on the first forces a fresh login on the retry (session mode only).
         for attempt in (1, 2):
             headers = await self._auth_headers()
             try:
-                resp = await client.request(method, url, params=params, headers=headers)
+                resp = await client.request(method, url, headers=headers, json=body)
             except httpx.HTTPError as exc:
                 raise NitroError(f"Network error calling NITRO {path}: {exc}") from exc
 
@@ -198,10 +244,16 @@ class NitroClient:
                 self._sessionid = None  # force re-login on the retry
                 continue
             if resp.status_code >= 400:
-                raise NitroError(_format_http_error(resp, env))
+                raise NitroError(
+                    _format_http_error(resp, env, write=write),
+                    errorcode=code,
+                    nitro_message=env.get("message", ""),
+                )
             if code not in (0, None):
                 raise NitroError(
-                    _format_nitro_error(env), errorcode=code, nitro_message=env.get("message", "")
+                    _format_nitro_error(env, write=write),
+                    errorcode=code,
+                    nitro_message=env.get("message", ""),
                 )
             return env
         # Loop always returns or raises above.
@@ -218,13 +270,41 @@ def _try_json(resp: httpx.Response) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _format_nitro_error(env: dict[str, Any], *, login: bool = False) -> str:
+def _encode_query(params: dict[str, Any] | None) -> str:
+    """Serialise NITRO query params by hand (httpx drops a URL's own query when ``params=`` is passed).
+
+    Plain values are percent-encoded exactly as httpx would (``attrs=name%2Ccurstate``), which the
+    appliance accepts. A dict value (``args``) is rendered like the official NITRO SDKs —
+    ``args=profilename:pr_app,starturl:%5Ehttps%3A%2F%2F...`` — literal ``:``/``,`` separators with each
+    value percent-encoded, so regex URLs containing ``, : ^ $ \\`` survive.
+    """
+    parts: list[str] = []
+    for key, value in (params or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            rendered = ",".join(
+                f"{k}:{quote(str(v), safe='')}" for k, v in value.items() if v is not None
+            )
+        else:
+            rendered = quote(str(value), safe="")
+        parts.append(f"{quote(key, safe='')}={rendered}")
+    return "&".join(parts)
+
+
+def _format_nitro_error(env: dict[str, Any], *, login: bool = False, write: bool = False) -> str:
     code = env.get("errorcode")
     message = env.get("message", "") or ""
     if code == _SESSION_EXPIRED:
         return (
             "NITRO session expired and re-login failed — check NETSCALER_USER / NETSCALER_PASSWORD "
             "and that the account is not locked."
+        )
+    if code in (2138, 257) and write:
+        return (
+            f"NITRO not authorized (errorcode {code}) — this is a configuration change; the system user "
+            "needs a command policy allowing it (appfw add/set/bind/unbind/rm, save ns config — see the "
+            "netscaler-mcp README), not just 'readonlypolicy'."
         )
     if code in (2138, 257):
         return (
@@ -246,15 +326,20 @@ def _format_nitro_error(env: dict[str, Any], *, login: bool = False) -> str:
     return f"NITRO error {code}: {message}".rstrip(": ").rstrip()
 
 
-def _format_http_error(resp: httpx.Response, env: dict[str, Any]) -> str:
+def _format_http_error(resp: httpx.Response, env: dict[str, Any], *, write: bool = False) -> str:
     # Prefer a NITRO envelope message when the body carries one.
     if env.get("errorcode") not in (0, None):
-        return _format_nitro_error(env)
+        return _format_nitro_error(env, write=write)
     status = resp.status_code
     if status == 401:
         return (
             "NITRO 401 — credentials rejected. Verify NETSCALER_USER / NETSCALER_PASSWORD "
             "(and NETSCALER_AUTH_MODE)."
+        )
+    if status == 403 and write:
+        return (
+            "NITRO 403 — the system user may not make this change; bind a command policy that allows "
+            "the appfw changes (see the netscaler-mcp README)."
         )
     if status == 403:
         return (

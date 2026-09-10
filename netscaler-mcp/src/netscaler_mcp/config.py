@@ -1,7 +1,8 @@
 """Configuration for the NetScaler ADC MCP server, loaded from environment variables.
 
 Secrets are never hardcoded; everything comes from the process environment (typically supplied
-via ``--env-file`` for Docker, or a local ``.env`` exported into the shell).
+via ``--env-file`` for Docker, or a local ``.env`` exported into the shell). WAF write tools are
+opt-in via ``NETSCALER_ALLOW_WRITE``; ``NETSCALER_EXPORT_DIR`` enables file-based export/import.
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ class Settings:
     max_rows: int = 200
     verify_ssl: bool = True
     ca_bundle: str = ""
+    allow_write: bool = False
+    export_dir: str = ""
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -80,6 +83,8 @@ class Settings:
             max_rows=_int_env(env, "NETSCALER_MAX_ROWS", 200),
             verify_ssl=_bool_env(env, "NETSCALER_VERIFY_SSL", True),
             ca_bundle=env.get("NETSCALER_CA_BUNDLE", "").strip(),
+            allow_write=_bool_env(env, "NETSCALER_ALLOW_WRITE", False),
+            export_dir=env.get("NETSCALER_EXPORT_DIR", "").strip(),
         )
 
     @property

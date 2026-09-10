@@ -6,10 +6,12 @@ These run with no credentials and make no network calls.
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pytest
 
-from netscaler_mcp import server
+from netscaler_mcp import server, waf
+from netscaler_mcp.client import _encode_query
 from netscaler_mcp.config import ConfigError, Settings
 
 EXPECTED_TOOLS = {
@@ -35,6 +37,19 @@ EXPECTED_TOOLS = {
     "list_bot_policies",
     "bot_stats",
     "nitro_get",
+    # WAF rollout (reads always on; writes gated at call time by NETSCALER_ALLOW_WRITE)
+    "list_waf_rules",
+    "list_waf_learned_rules",
+    "list_waf_urls",
+    "export_waf_profile",
+    "add_waf_rule",
+    "remove_waf_rule",
+    "deploy_waf_learned_rules",
+    "discard_waf_learned_rules",
+    "set_waf_check_actions",
+    "import_waf_profile",
+    "rehost_waf_profile",
+    "save_config",
 }
 
 
@@ -110,3 +125,176 @@ def test_verify_ssl_and_ca_bundle():
     env = _base_env()
     env["NETSCALER_CA_BUNDLE"] = "/etc/ssl/ns-ca.pem"
     assert Settings.from_env(env).httpx_verify == "/etc/ssl/ns-ca.pem"
+
+
+def test_allow_write_and_export_dir_default_off_and_parse():
+    s = Settings.from_env(_base_env())
+    assert s.allow_write is False
+    assert s.export_dir == ""
+
+    env = _base_env()
+    env["NETSCALER_ALLOW_WRITE"] = "true"
+    env["NETSCALER_EXPORT_DIR"] = "/exports"
+    s = Settings.from_env(env)
+    assert s.allow_write is True
+    assert s.export_dir == "/exports"
+
+
+# ---- NITRO query encoding + WAF helpers (pure, no network) ----------------
+
+def test_nitro_query_encoding():
+    # Plain params encode exactly as httpx did before; args keep literal separators (SDK style).
+    assert _encode_query({"attrs": "name,curstate", "pagesize": 50}) == "attrs=name%2Ccurstate&pagesize=50"
+    assert (
+        _encode_query({"args": {"profilename": "pr_app", "starturl": r"^https://a\.b/x,y$"}})
+        == "args=profilename:pr_app,starturl:%5Ehttps%3A%2F%2Fa%5C.b%2Fx%2Cy%24"
+    )
+
+
+def test_url_regex_shapes():
+    assert waf.url_regex("app.example.com") == r"^https://app\.example\.com/.*$"
+    assert waf.url_regex("app.example.com", "/api") == r"^https://app\.example\.com/api([/?].*)?$"
+    assert (
+        waf.url_regex("app.example.com", "/login.php", match="exact")
+        == r"^https://app\.example\.com/login\.php(\?.*)?$"
+    )
+    assert (
+        waf.url_regex("*", "/static/", extensions=["css", ".js"], scheme="any")
+        == r"^https?://[^/]+/static/.*\.(css|js)(\?.*)?$"
+    )
+    assert waf.url_regex("https://App.Example.com:8443/x") == r"^https://app\.example\.com:8443/.*$"
+    with pytest.raises(ValueError):
+        waf.url_regex("bad host!")
+    with pytest.raises(ValueError):
+        waf.url_regex("app.example.com", "/x", match="exact", extensions=["js"])
+
+
+def test_url_regex_matching():
+    rx = re.compile(waf.url_regex("app.example.com", "/api"))
+    assert rx.match("https://app.example.com/api")
+    assert rx.match("https://app.example.com/api/v1/x")
+    assert rx.match("https://app.example.com/api?x=1")
+    assert not rx.match("https://app.example.com/apiary")
+    assert not rx.match("https://evil.example/api")
+
+
+def test_parse_url_pattern():
+    assert waf.parse_url_pattern(r"^https://app\.example\.com/login\.php$") == {
+        "scheme": "https", "host": "app.example.com", "path": "/login.php",
+    }
+    assert waf.parse_url_pattern(r"^https?://[^/]+/static/.*$")["host"] == "*"
+    assert waf.parse_url_pattern("/error.html") == {"scheme": "", "host": "", "path": "/error.html"}
+
+
+def test_host_rewriter_forms_and_boundaries():
+    rw = waf.HostRewriter({"app.dev.corp": "app.corp"})
+    assert rw(r"^https://app\.dev\.corp/x\.php$") == r"^https://app\.corp/x\.php$"
+    assert rw("https://app.dev.corp/x") == "https://app.corp/x"
+    assert rw(r"^https://APP\.DEV\.CORP:8443/$") == r"^https://app\.corp:8443/$"
+
+    rw = waf.HostRewriter({"dev.corp": "prod.corp"})
+    assert rw(r"^https://app\.dev\.corp/x$") == r"^https://app\.dev\.corp/x$"  # subdomain untouched
+    assert rw(r"^https://dev\.corp\.evil/") == r"^https://dev\.corp\.evil/"  # longer domain untouched
+    assert rw("https://mydev.corp/") == "https://mydev.corp/"
+
+    rw = waf.HostRewriter({"a.corp": "b.corp", "b.corp": "c.corp"})
+    assert rw("https://a.corp/ https://b.corp/") == "https://b.corp/ https://c.corp/"  # no chaining
+
+
+def test_group_urls_suggests_prefix_rules():
+    groups = waf.group_urls([
+        r"^https://app\.corp/app/a\.php$",
+        r"^https://app\.corp/app/b\.php$",
+        r"^https://app\.corp/app/sub/c\.php$",
+        r"^https://app\.corp/index\.html$",
+    ])
+    top = groups[0]
+    assert (top["host"], top["prefix"], top["count"]) == ("app.corp", "/app/", 3)
+    assert top["suggested_rule"] == r"^https://app\.corp/app/.*$"
+
+
+def test_learned_mapping_and_csrf_inversion():
+    sql = waf.RULE_TYPES["sql_injection"]
+    learned = {"name": "q", "url": r"^https://a\.b/s$", "value_type": "Keyword", "value": "or", "hits": "3"}
+    assert waf.learned_rule(sql, learned) == {
+        "sqlinjection": "q", "formactionurl_sql": r"^https://a\.b/s$",
+        "as_value_type_sql": "Keyword", "as_value_expr_sql": "or",
+    }
+    # csrftag means the form ORIGIN URL on the binding but the form ACTION URL in learned data.
+    csrf = waf.RULE_TYPES["csrf_tag"]
+    row = waf.learned_rule(csrf, {"url": "ACTION", "name": "ORIGIN"})
+    assert row == {"csrftag": "ORIGIN", "csrfformactionurl": "ACTION"}
+    assert waf.learned_delete_args(csrf, row) == {"csrfformoriginurl": "ORIGIN", "csrftag": "ACTION"}
+
+
+def test_plan_bindings_merge_vs_replace():
+    desired = {"start_url": [{"starturl": "A"}, {"starturl": "B", "comment": "new"}]}
+    current = {"start_url": [
+        {"name": "p", "starturl": "B", "comment": "old", "ruletype": "ALLOW", "resourceid": "1"},
+        {"name": "p", "starturl": "C", "ruletype": "ALLOW"},
+    ]}
+    merge = waf.plan_bindings(desired, current, replace=False)["start_url"]
+    assert (merge["add"], merge["update"], merge["remove"]) == ([{"starturl": "A"}], [], [])
+    replace = waf.plan_bindings(desired, current, replace=True)["start_url"]
+    assert [u["desired"]["starturl"] for u in replace["update"]] == ["B"]
+    assert replace["remove"] == [{"starturl": "C", "ruletype": "ALLOW"}]
+
+
+def test_document_host_map_and_validation():
+    rules, other = waf.split_bindings({
+        "name": "p",
+        "appfwprofile_starturl_binding": [{"name": "p", "starturl": r"^https://app\.test\.corp/.*$"}],
+    })
+    doc = waf.build_document(
+        profile="p", appliance="https://ns", exported_at="t", learning_settings={}, rules=rules,
+        other_bindings=other, settings={"name": "p", "state": "ENABLED", "errorurl": "https://app.test.corp/e"},
+    )
+    assert waf.check_document(doc) is doc
+    assert doc["settings"] == {"errorurl": "https://app.test.corp/e"}  # read-only 'state' dropped
+    moved, replacements = waf.apply_host_map(doc, {"app.test.corp": "app.corp"})
+    assert replacements == 2
+    assert moved["rules"]["start_url"][0]["starturl"] == r"^https://app\.corp/.*$"
+    assert moved["hosts"] == {"app.corp": 1}
+    with pytest.raises(ValueError):
+        waf.check_document({"format": "something-else"})
+
+
+def test_check_actions_go_live():
+    assert waf.new_actions("start_url", ["learn", "log", "stats"], add=["block"], remove=["learn"]) == [
+        "block", "log", "stats",
+    ]
+    assert waf.new_actions("deny_url", ["none"], add=["learn"], strict=False) == ["none"]
+    with pytest.raises(ValueError):
+        waf.new_actions("deny_url", ["block"], add=["learn"])
+
+
+def test_waf_tool_params_present():
+    tools = _tools()
+    assert "dry_run" in tools["add_waf_rule"].inputSchema["properties"]
+    assert "host_map" in tools["import_waf_profile"].inputSchema["properties"]
+    assert "from_host" in tools["rehost_waf_profile"].inputSchema["properties"]
+    assert "min_hits" in tools["deploy_waf_learned_rules"].inputSchema["properties"]
+
+
+def test_write_tools_refuse_without_allow_write():
+    server._client = server.NitroClient(Settings.from_env(_base_env()))
+    try:
+        with pytest.raises(ValueError, match="NETSCALER_ALLOW_WRITE"):
+            asyncio.run(server.save_config())
+        with pytest.raises(ValueError, match="NETSCALER_ALLOW_WRITE"):
+            asyncio.run(server.add_waf_rule("pr_app", "allow_url", host="app.example.com", dry_run=False))
+    finally:
+        server._client = None
+
+
+def test_export_path_confined_to_export_dir(tmp_path):
+    env = _base_env()
+    env["NETSCALER_EXPORT_DIR"] = str(tmp_path)
+    server._client = server.NitroClient(Settings.from_env(env))
+    try:
+        assert server._export_path("pr_app-test") == tmp_path / "pr_app-test.json"
+        for bad in ("../evil", "sub/x.json", ".hidden.json", "a..b.json", "C:\\x.json"):
+            with pytest.raises(ValueError):
+                server._export_path(bad)
+    finally:
+        server._client = None
