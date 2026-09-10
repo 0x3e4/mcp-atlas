@@ -8,10 +8,11 @@ from __future__ import annotations
 import asyncio
 import re
 
+import httpx
 import pytest
 
 from netscaler_mcp import server, waf
-from netscaler_mcp.client import _encode_query
+from netscaler_mcp.client import _encode_query, _format_nitro_error
 from netscaler_mcp.config import ConfigError, Settings
 
 EXPECTED_TOOLS = {
@@ -298,3 +299,41 @@ def test_export_path_confined_to_export_dir(tmp_path):
                 server._export_path(bad)
     finally:
         server._client = None
+
+
+def test_nitro_get_sends_args_like_the_nitro_reference():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.raw_path.decode())
+        return httpx.Response(200, json={"errorcode": 0, "message": "Done"})
+
+    env = _base_env()
+    env["NETSCALER_AUTH_MODE"] = "stateless"  # no login request in the log
+    client = server.NitroClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    server._client = client
+
+    async def calls():
+        await server.nitro_get("config", "appfwlearningdata", args="profilename:pr_app,securitycheck:startURL")
+        await server.nitro_get("config", "systemfile", args={"filelocation": "/nsconfig/ssl"}, pagesize=10, pageno=1)
+        with pytest.raises(ValueError, match="key:value"):
+            await server.nitro_get("config", "appfwlearningdata", args="profilename")
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None
+    assert seen == [
+        "/nitro/v1/config/appfwlearningdata?args=profilename:pr_app,securitycheck:startURL",
+        "/nitro/v1/config/systemfile?args=filelocation:%2Fnsconfig%2Fssl&pagesize=10&pageno=1",
+    ]
+    assert "args" in _tools()["nitro_get"].inputSchema["properties"]
+
+
+def test_missing_lookup_argument_errors_point_to_args():
+    missing = _format_nitro_error({"errorcode": 1095, "message": "Required argument missing [profileName]"})
+    assert "profileName" in missing and "args" in missing
+    assert "args" in _format_nitro_error({"errorcode": 1090, "message": "No such argument [arguid]"})
+    # a write missing a body attribute isn't an args problem
+    assert "args" not in _format_nitro_error({"errorcode": 1095, "message": "Required argument missing [name]"}, write=True)

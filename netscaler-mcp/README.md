@@ -39,7 +39,7 @@ hostname switching.
 | `system_health(full?)` | Appliance CPU / memory / disk / uptime (stat `ns`). |
 | `vserver_stats(kind="lb"\|"cs"\|"gslb", name?, limit?, full?)` | Live vserver traffic/health counters. |
 | `system_info(full?)` | Version, hardware, license and HA summary in one call. |
-| `nitro_get(tree, resourcetype, name?, attrs?, filter?, count?, pagesize?, pageno?)` | Escape hatch: raw read-only GET against any NITRO resource. |
+| `nitro_get(tree, resourcetype, name?, attrs?, filter?, args?, count?, pagesize?, pageno?)` | Escape hatch: raw read-only GET against any NITRO resource; `args` reaches resources with required lookup arguments (e.g. `appfwlearningdata`, `systemfile`). |
 
 Results are trimmed to the useful columns by default; pass `full=true` for the raw NITRO objects, and
 list results are capped (`NETSCALER_MAX_ROWS`, default 200) unless `full`.
@@ -288,3 +288,7 @@ poetry run mcp dev src/netscaler_mcp/server.py  # MCP Inspector to exercise tool
 - The whole-config resources `nsrunningconfig` / `nssavedconfig` are reachable via `nitro_get` but
   return very large payloads — prefer a targeted resource.
 - The stat `Interface` resource is **capitalized** — query it via `nitro_get("stat", "Interface")`.
+- **Resources with required lookup arguments** (`appfwlearningdata` needs `profilename` +
+  `securitycheck`, `systemfile` needs `filelocation`) only answer to `?args=`, not `name` or
+  `filter`: `nitro_get("config", "appfwlearningdata", args="profilename:pr_app,securitycheck:startURL")`
+  sends `…/config/appfwlearningdata?args=profilename:pr_app,securitycheck:startURL`.

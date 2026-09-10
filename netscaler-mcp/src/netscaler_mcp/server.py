@@ -1261,13 +1261,31 @@ async def save_config() -> dict[str, Any]:
 
 # ---- tool: raw escape hatch ---------------------------------------------
 
+def _pairs(value: dict[str, Any] | str | None, param: str) -> dict[str, str] | None:
+    """Parse NITRO ``key:value,key:value`` text (or take a dict as-is) for the filter / args params."""
+    if not value:
+        return None
+    if isinstance(value, dict):
+        return {str(k).strip(): str(v) for k, v in value.items()}
+    pairs: dict[str, str] = {}
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        if ":" not in item:
+            raise ValueError(f"{param} must be comma-separated key:value pairs; got {item.strip()!r}.")
+        key, val = item.split(":", 1)
+        pairs[key.strip()] = val.strip()
+    return pairs
+
+
 @mcp.tool()
 async def nitro_get(
     tree: Annotated[str, Field(description="Which NITRO tree: 'config' or 'stat'.")],
     resourcetype: Annotated[str, Field(description="NITRO resource type, e.g. 'route', 'nsip', 'sslcertkey'. Note the stat 'Interface' resource is Capitalized.")],
-    name: Annotated[str | None, Field(description="Optional exact resource name to fetch a single object.")] = None,
+    name: Annotated[str | None, Field(description="Optional exact resource name to fetch a single object (sent as a path segment).")] = None,
     attrs: Annotated[str | None, Field(description="Comma-separated attributes to project, e.g. 'name,curstate'.")] = None,
     filter: Annotated[str | None, Field(description="NITRO filter: comma-separated key:value pairs, e.g. 'curstate:UP,servicetype:HTTP'.")] = None,
+    args: Annotated[dict[str, str] | str | None, Field(description="NITRO lookup arguments (?args=) for resources that require them: comma-separated key:value pairs, e.g. 'profilename:pr_app,securitycheck:startURL' for appfwlearningdata or 'filelocation:/nsconfig/ssl' for systemfile. Pass an object instead when a value contains a comma.")] = None,
     count: Annotated[bool, Field(description="Return only the count of matching resources.")] = False,
     pagesize: Annotated[int | None, Field(description="Page size for pagination.", ge=1)] = None,
     pageno: Annotated[int | None, Field(description="Page number (1-indexed).", ge=1)] = None,
@@ -1275,25 +1293,24 @@ async def nitro_get(
     """Escape hatch: raw read-only NITRO GET against any config/stat resource on the appliance.
 
     Use for resources without a dedicated tool (routes, nsip, nsfeature, appfw policies, the
-    capitalized 'Interface' stat, etc.). The whole-config resources 'nsrunningconfig' and
-    'nssavedconfig' are reachable here but return very large payloads — prefer a targeted resource.
-    Returns the raw NITRO envelope.
+    capitalized 'Interface' stat, etc.). Resources with required lookup arguments — appfwlearningdata
+    (profilename + securitycheck), systemfile (filelocation), … — take them via args, not name or
+    filter: NITRO answers 1095 "Required argument missing" without them and reads a name as 'arguid'.
+    args values are percent-encoded with literal ':' / ',' separators, as the NITRO SDKs send them.
+    (For WAF learned data, list_waf_learned_rules adds hit sorting and the deployable rule.) The
+    whole-config resources 'nsrunningconfig' and 'nssavedconfig' are reachable here but return very
+    large payloads — prefer a targeted resource. Returns the raw NITRO envelope.
     """
     if tree not in ("config", "stat"):
         raise ValueError("tree must be 'config' or 'stat'.")
-    filt: dict[str, str] | None = None
-    if filter:
-        filt = {}
-        for pair in filter.split(","):
-            if ":" in pair:
-                key, value = pair.split(":", 1)
-                filt[key.strip()] = value.strip()
+    filt, lookup = _pairs(filter, "filter"), _pairs(args, "args")
     return await _get_client().get(
         tree,
         resourcetype,
         resource_name=name,
         attrs=_csv(attrs),
         filter=filt,
+        args=lookup,
         count=count,
         pagesize=pagesize,
         pageno=pageno,

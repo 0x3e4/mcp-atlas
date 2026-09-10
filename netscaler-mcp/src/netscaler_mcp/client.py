@@ -316,6 +316,17 @@ def _format_nitro_error(env: dict[str, Any], *, login: bool = False, write: bool
             f"NITRO feature not enabled (errorcode {code}) — enable the relevant feature "
             "(e.g. GSLB, AppFW) on the appliance, or this resource is unavailable."
         )
+    if code == 1095 and not write:
+        return (
+            f"NITRO required argument missing (errorcode {code}): {message} — this resource needs lookup "
+            "arguments; pass them via args as key:value pairs (e.g. appfwlearningdata: "
+            "'profilename:<profile>,securitycheck:startURL')."
+        )
+    if code == 1090 and not write:
+        return (
+            f"NITRO no such argument (errorcode {code}): {message} — this resource doesn't take a name "
+            "in the path; pass its lookup arguments via args instead."
+        )
     if code in (258, 461, 462):
         return f"NITRO resource not found (errorcode {code}): {message}".rstrip(": ").rstrip()
     if login and code == 354:
