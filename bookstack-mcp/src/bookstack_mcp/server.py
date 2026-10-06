@@ -1,14 +1,17 @@
-"""FastMCP server exposing read-only BookStack (REST API) tools.
+"""FastMCP server exposing BookStack (REST API) tools.
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
-always-on HTTP server. All tools are read-only (GET). Curated tools cover the content hierarchy
-(shelves → books → chapters → pages), search, export and attachments; the raw ``bookstack_get``
-escape hatch reaches anything else (users, roles, comments, image-gallery, audit-log, …).
+always-on HTTP server. Read tools (GET) cover the content hierarchy (shelves → books → chapters →
+pages), search, export and attachments; the raw ``bookstack_get`` escape hatch reaches anything else
+(users, roles, comments, image-gallery, audit-log, …). Write tools (create/update pages, chapters,
+books and shelves, comment on a page) are **opt-in**: they refuse unless ``BOOKSTACK_ALLOW_WRITE=true``
+and need a token whose user has the matching permissions. With the flag off the server is read-only.
 """
 
 from __future__ import annotations
 
 import sys
+from html import escape
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -31,6 +34,15 @@ def _get_client() -> BookStackClient:
     return _client
 
 
+def _require_write() -> None:
+    """Gate write tools behind the opt-in BOOKSTACK_ALLOW_WRITE flag."""
+    if not _get_client().settings.allow_write:
+        raise ValueError(
+            "Write tools are disabled. Set BOOKSTACK_ALLOW_WRITE=true (and use a token whose user has "
+            "the matching create/update permissions) to create or edit pages, chapters, books and shelves."
+        )
+
+
 # ---- curated field projections ------------------------------------------
 _SHELF_FIELDS = ("id", "name", "slug", "description", "created_at", "updated_at")
 _BOOK_FIELDS = ("id", "name", "slug", "description", "created_at", "updated_at")
@@ -46,6 +58,14 @@ _PAGE_DETAIL_FIELDS = (
     "id", "book_id", "chapter_id", "name", "slug", "draft", "template", "tags",
     "created_by", "owned_by", "created_at", "updated_at",
 )
+# kind -> fields kept from a create/update response (write responses carry full bodies)
+_WRITE_FIELDS = {
+    "page": ("id", "book_id", "chapter_id", "name", "slug", "draft", "revision_count", "tags", "updated_at"),
+    "chapter": ("id", "book_id", "name", "slug", "description", "tags", "updated_at"),
+    "book": ("id", "name", "slug", "description", "tags", "updated_at"),
+    "shelf": ("id", "name", "slug", "description", "tags", "updated_at"),
+}
+_COMMENT_FIELDS = ("id", "local_id", "commentable_id", "parent_id", "created_at")
 
 
 # ---- helpers ------------------------------------------------------------
@@ -99,6 +119,39 @@ async def _get_list(
     if not full:
         rows = [_pick(r, fields) if isinstance(r, dict) else r for r in rows]
     return {"total": total, "count": len(rows), "data": rows}
+
+
+def _fields(**values: Any) -> dict[str, Any]:
+    """Drop unset (None) fields so a write only sends — and a PUT only changes — what was given."""
+    return {k: v for k, v in values.items() if v is not None}
+
+
+def _tags(tags: dict[str, str] | None) -> list[dict[str, str]] | None:
+    """``{name: value}`` → BookStack's ``[{name, value}]`` tag list (``''`` = a tag without a value)."""
+    if tags is None:
+        return None
+    return [{"name": name, "value": "" if value is None else str(value)} for name, value in tags.items()]
+
+
+def _text_html(text: str) -> str:
+    """Plain text → escaped HTML paragraphs (blank line = new paragraph, newline = ``<br>``)."""
+    paragraphs = [p.strip() for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
+    return "".join("<p>" + escape(p).replace("\n", "<br>") + "</p>" for p in paragraphs)
+
+
+def _written(kind: str, data: Any) -> dict[str, Any]:
+    """Trim a create/update response to the key fields plus the item's browser URL."""
+    if not isinstance(data, dict):
+        return {"result": data}
+    out = _pick(data, _WRITE_FIELDS[kind])
+    base = _get_client().settings.base_url
+    out["url"] = {
+        "page": f"{base}/link/{data.get('id')}",  # BookStack's page permalink
+        "chapter": f"{base}/books/{data.get('book_slug')}/chapter/{data.get('slug')}",
+        "book": f"{base}/books/{data.get('slug')}",
+        "shelf": f"{base}/shelves/{data.get('slug')}",
+    }[kind]
+    return out
 
 
 # ---- tools: content hierarchy (list) ------------------------------------
@@ -290,6 +343,189 @@ async def bookstack_get(
     """
     data = await _get_client().get_raw(path, params=params)
     return data if isinstance(data, dict) else {"data": data}
+
+
+# ---- tools: writes (opt-in, gated by BOOKSTACK_ALLOW_WRITE) --------------
+
+@mcp.tool()
+async def create_page(
+    name: Annotated[str, Field(description="Page title.", min_length=1, max_length=255)],
+    book_id: Annotated[int | None, Field(description="Book to create the page in (top level). Give this or chapter_id.")] = None,
+    chapter_id: Annotated[int | None, Field(description="Chapter to create the page in. Wins over book_id if both are given.")] = None,
+    markdown: Annotated[str | None, Field(description="Page body as markdown (the page then uses the markdown editor). Give this or html.")] = None,
+    html: Annotated[str | None, Field(description="Page body as HTML. Give this or markdown.")] = None,
+    tags: Annotated[dict[str, str] | None, Field(description="Tags as {name: value}; use '' for a tag without a value.")] = None,
+    changelog: Annotated[str | None, Field(description="Revision note for the page history.", min_length=1, max_length=180)] = None,
+) -> dict[str, Any]:
+    """Create a page in a book or chapter (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/pages.
+
+    The page is published straight away (no draft). Returns its id and URL.
+    """
+    _require_write()
+    if book_id is None and chapter_id is None:
+        raise ValueError("Give book_id or chapter_id for the new page.")
+    if (markdown is None) == (html is None):
+        raise ValueError("Give exactly one body: markdown or html.")
+    payload = _fields(
+        name=name, book_id=book_id, chapter_id=chapter_id, markdown=markdown, html=html,
+        tags=_tags(tags), changelog=changelog,
+    )
+    return _written("page", await _get_client().post("pages", json=payload))
+
+
+@mcp.tool()
+async def update_page(
+    id: Annotated[int, Field(description="Page id.")],
+    name: Annotated[str | None, Field(description="New title.", min_length=1, max_length=255)] = None,
+    markdown: Annotated[str | None, Field(description="New body as markdown — replaces the whole page content.")] = None,
+    html: Annotated[str | None, Field(description="New body as HTML — replaces the whole page content.")] = None,
+    tags: Annotated[dict[str, str] | None, Field(description="Replaces ALL tags: {name: value} ('' = no value), {} clears them. Omit to keep the current tags.")] = None,
+    move_to_book_id: Annotated[int | None, Field(description="Move the page to the top level of this book.")] = None,
+    move_to_chapter_id: Annotated[int | None, Field(description="Move the page into this chapter.")] = None,
+    changelog: Annotated[str | None, Field(description="Revision note for the page history.", min_length=1, max_length=180)] = None,
+) -> dict[str, Any]:
+    """Update a page's title, body or tags, or move it (WRITE — requires BOOKSTACK_ALLOW_WRITE).
+
+    PUTs /api/pages/{id}; only the fields you give change. A new body replaces the whole content
+    (read it with get_page first to edit in place); BookStack keeps the old version as a revision.
+    Moving needs delete permission on the page.
+    """
+    _require_write()
+    if markdown is not None and html is not None:
+        raise ValueError("Give one body: markdown or html, not both.")
+    if move_to_book_id is not None and move_to_chapter_id is not None:
+        raise ValueError("Move to a book or to a chapter, not both.")
+    payload = _fields(
+        name=name, markdown=markdown, html=html, tags=_tags(tags),
+        book_id=move_to_book_id, chapter_id=move_to_chapter_id, changelog=changelog,
+    )
+    if not payload.keys() - {"changelog"}:
+        raise ValueError("Nothing to update: provide name, markdown/html, tags or a move target.")
+    return _written("page", await _get_client().put(f"pages/{id}", json=payload))
+
+
+@mcp.tool()
+async def create_chapter(
+    book_id: Annotated[int, Field(description="Book to create the chapter in.")],
+    name: Annotated[str, Field(description="Chapter name.", min_length=1, max_length=255)],
+    description: Annotated[str | None, Field(description="Plain-text description.", max_length=1900)] = None,
+    tags: Annotated[dict[str, str] | None, Field(description="Tags as {name: value}; use '' for a tag without a value.")] = None,
+) -> dict[str, Any]:
+    """Create a chapter in a book (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/chapters."""
+    _require_write()
+    payload = _fields(book_id=book_id, name=name, description=description, tags=_tags(tags))
+    return _written("chapter", await _get_client().post("chapters", json=payload))
+
+
+@mcp.tool()
+async def update_chapter(
+    id: Annotated[int, Field(description="Chapter id.")],
+    name: Annotated[str | None, Field(description="New name.", min_length=1, max_length=255)] = None,
+    description: Annotated[str | None, Field(description="New plain-text description.", max_length=1900)] = None,
+    tags: Annotated[dict[str, str] | None, Field(description="Replaces ALL tags: {name: value} ('' = no value), {} clears them. Omit to keep the current tags.")] = None,
+    move_to_book_id: Annotated[int | None, Field(description="Move the chapter (with its pages) to this book.")] = None,
+) -> dict[str, Any]:
+    """Update a chapter's name, description or tags, or move it (WRITE — requires BOOKSTACK_ALLOW_WRITE).
+
+    PUTs /api/chapters/{id}; only the fields you give change. Moving needs delete permission.
+    """
+    _require_write()
+    payload = _fields(name=name, description=description, tags=_tags(tags), book_id=move_to_book_id)
+    if not payload:
+        raise ValueError("Nothing to update: provide name, description, tags or move_to_book_id.")
+    return _written("chapter", await _get_client().put(f"chapters/{id}", json=payload))
+
+
+@mcp.tool()
+async def create_book(
+    name: Annotated[str, Field(description="Book name.", min_length=1, max_length=255)],
+    description: Annotated[str | None, Field(description="Plain-text description.", max_length=1900)] = None,
+    tags: Annotated[dict[str, str] | None, Field(description="Tags as {name: value}; use '' for a tag without a value.")] = None,
+) -> dict[str, Any]:
+    """Create a book (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/books.
+
+    New books sit on no shelf; use update_shelf(add_book_ids=[...]) to place one.
+    """
+    _require_write()
+    payload = _fields(name=name, description=description, tags=_tags(tags))
+    return _written("book", await _get_client().post("books", json=payload))
+
+
+@mcp.tool()
+async def update_book(
+    id: Annotated[int, Field(description="Book id.")],
+    name: Annotated[str | None, Field(description="New name.", min_length=1, max_length=255)] = None,
+    description: Annotated[str | None, Field(description="New plain-text description.", max_length=1900)] = None,
+    tags: Annotated[dict[str, str] | None, Field(description="Replaces ALL tags: {name: value} ('' = no value), {} clears them. Omit to keep the current tags.")] = None,
+) -> dict[str, Any]:
+    """Update a book's name, description or tags (WRITE — requires BOOKSTACK_ALLOW_WRITE). PUTs /api/books/{id}."""
+    _require_write()
+    payload = _fields(name=name, description=description, tags=_tags(tags))
+    if not payload:
+        raise ValueError("Nothing to update: provide name, description and/or tags.")
+    return _written("book", await _get_client().put(f"books/{id}", json=payload))
+
+
+@mcp.tool()
+async def create_shelf(
+    name: Annotated[str, Field(description="Shelf name.", min_length=1, max_length=255)],
+    description: Annotated[str | None, Field(description="Plain-text description.", max_length=1900)] = None,
+    book_ids: Annotated[list[int] | None, Field(description="Books to put on the shelf, in display order.")] = None,
+    tags: Annotated[dict[str, str] | None, Field(description="Tags as {name: value}; use '' for a tag without a value.")] = None,
+) -> dict[str, Any]:
+    """Create a shelf, optionally with books on it (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/shelves."""
+    _require_write()
+    payload = _fields(name=name, description=description, books=book_ids, tags=_tags(tags))
+    return _written("shelf", await _get_client().post("shelves", json=payload))
+
+
+@mcp.tool()
+async def update_shelf(
+    id: Annotated[int, Field(description="Shelf id.")],
+    name: Annotated[str | None, Field(description="New name.", min_length=1, max_length=255)] = None,
+    description: Annotated[str | None, Field(description="New plain-text description.", max_length=1900)] = None,
+    add_book_ids: Annotated[list[int] | None, Field(description="Books to add to the end of the shelf.")] = None,
+    remove_book_ids: Annotated[list[int] | None, Field(description="Books to take off the shelf (the books themselves stay).")] = None,
+    tags: Annotated[dict[str, str] | None, Field(description="Replaces ALL tags: {name: value} ('' = no value), {} clears them. Omit to keep the current tags.")] = None,
+) -> dict[str, Any]:
+    """Update a shelf's name, description or tags, or add/remove books (WRITE — requires BOOKSTACK_ALLOW_WRITE).
+
+    PUTs /api/shelves/{id}. BookStack replaces a shelf's whole book list, so add/remove reads the
+    current list first and keeps every other book in its place.
+    """
+    _require_write()
+    payload = _fields(name=name, description=description, tags=_tags(tags))
+    if add_book_ids or remove_book_ids:
+        shelf = await _get_client().get(f"shelves/{id}")
+        current = [b.get("id") for b in shelf.get("books") or [] if isinstance(b, dict)]
+        drop = set(remove_book_ids or ())
+        keep = [b for b in current if b not in drop]
+        payload["books"] = keep + [b for b in dict.fromkeys(add_book_ids or ()) if b not in keep]
+    if not payload:
+        raise ValueError("Nothing to update: provide name, description, tags, add_book_ids or remove_book_ids.")
+    out = _written("shelf", await _get_client().put(f"shelves/{id}", json=payload))
+    if "books" in payload:
+        out["book_ids"] = payload["books"]
+    return out
+
+
+@mcp.tool()
+async def add_comment(
+    page_id: Annotated[int, Field(description="The page to comment on.")],
+    body: Annotated[str, Field(description="Comment text (plain text unless html=true).", min_length=1)],
+    html: Annotated[bool, Field(description="Treat body as HTML instead of plain text.")] = False,
+    reply_to: Annotated[int | None, Field(description="local_id of the comment to reply to (see get_page full=true → comments).")] = None,
+) -> dict[str, Any]:
+    """Comment on a page (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/comments.
+
+    Needs a BookStack release with the comments API (older ones answer 404).
+    """
+    _require_write()
+    payload = _fields(page_id=page_id, html=body if html else _text_html(body), reply_to=reply_to)
+    data = await _get_client().post("comments", json=payload)
+    out = _pick(data, _COMMENT_FIELDS) if isinstance(data, dict) else {"result": data}
+    out["url"] = f"{_get_client().settings.base_url}/link/{page_id}"
+    return out
 
 
 def main() -> None:

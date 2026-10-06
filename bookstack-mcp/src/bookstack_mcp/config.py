@@ -1,7 +1,8 @@
 """Configuration for the BookStack MCP server, loaded from environment variables.
 
 Secrets are never hardcoded; everything comes from the process environment (typically supplied
-via ``--env-file`` for Docker, or a local ``.env`` exported into the shell).
+via ``--env-file`` for Docker, or a local ``.env`` exported into the shell). Writes are opt-in via
+``BOOKSTACK_ALLOW_WRITE``.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ class Settings:
     base_url: str
     token_id: str
     token_secret: str
+    allow_write: bool = False
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -61,6 +63,7 @@ class Settings:
             base_url=env["BOOKSTACK_BASE_URL"].strip().rstrip("/"),
             token_id=env["BOOKSTACK_TOKEN_ID"].strip(),
             token_secret=env["BOOKSTACK_TOKEN_SECRET"],
+            allow_write=_bool_env(env, "BOOKSTACK_ALLOW_WRITE", False),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),

@@ -3,7 +3,7 @@
 A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
 Claude Code) to a **[Zammad](https://zammad.org)** helpdesk through its REST API. Ask about your
 tickets in natural language — browse/search tickets, read the conversation (articles), look up users
-and organizations — and, opt-in, **add notes/comments, update tickets, and create tickets**.
+and organizations — and, opt-in, **add notes/comments, update, create and tag tickets**.
 
 - One shared `httpx.AsyncClient`; **token** auth (`Authorization: Token token=<token>`).
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
@@ -38,8 +38,9 @@ clear message). The token also needs **agent** (`ticket.agent`) permission.
 | Tool | What it does |
 |---|---|
 | `add_note(ticket_id, body, internal=true, html=false)` | Add a note to a ticket. `internal=true` (default) is an **agent-only internal comment**; `internal=false` is visible to the customer. Always `type=note`, so it never sends an email. |
-| `update_ticket(ticket_id, state?, priority?, group?, owner_id?, title?)` | Update a ticket's fields (state/priority/group by name). |
+| `update_ticket(ticket_id, state?, priority?, group?, owner_id?, title?, pending_time?)` | Update a ticket's fields (state/priority/group by name). Pending states take a `pending_time` (ISO 8601). |
 | `create_ticket(title, group, customer, body, internal?, state?, priority?, html?)` | Create a ticket with an initial note. `customer` is an email or user id (prefix an unknown email with `guess:`). |
+| `tag_ticket(ticket_id, add?, remove?)` | Add and/or remove tags; returns the ticket's tags afterwards. |
 
 ## 1. Create an API token
 
@@ -132,6 +133,55 @@ With the gateway also on `atlas-net`, register this server at `http://zammad-mcp
 [README → *Behind an MCP gateway*](../README.md#behind-an-mcp-gateway-eg-mcpjungle) for the full
 gateway walkthrough and client setup.
 
+#### Multiple instances (one image, several env files)
+
+The same image runs as several containers side by side, each with its own env file —
+for example the shared read-only instance next to a write-enabled one that uses another
+token, or one container per Zammad instance.
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+
+```yaml
+x-zammad: &zammad
+  image: ghcr.io/0x3e4/zammad-mcp:latest
+  environment:
+    MCP_TRANSPORT: streamable-http
+    MCP_HOST: 0.0.0.0
+    MCP_PORT: "8000"
+  restart: unless-stopped
+  networks: [atlas-net]
+
+services:
+  zammad-mcp:                    # existing shared read-only instance
+    <<: *zammad
+    container_name: zammad-mcp
+    env_file: ./zammad.env
+
+  zammad-mcp-instance-a:         # write access with instance a's token
+    <<: *zammad
+    container_name: zammad-mcp-instance-a
+    env_file: ./env/instance_a.env
+
+networks:
+  atlas-net:
+    external: true
+```
+
+- `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
+  env/instance_a.env`) with instance a's token and `ZAMMAD_ALLOW_WRITE=true`. The shared instance keeps
+  the flag off. `*.env` is gitignored, so it stays local.
+- Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
+  gateway reaches each one by its `container_name`. Register them under separate names:
+
+  ```bash
+  mcpjungle register --name zammad --url http://zammad-mcp:8000/mcp
+  mcpjungle register --name zammad-instance-a --url http://zammad-mcp-instance-a:8000/mcp
+  ```
+
+- `<<:` merges shallowly: an instance that sets its own `environment:` replaces the anchor's whole
+  block, so keep per-instance settings in its env file.
+- Over stdio no compose is needed — register a second server with the other env file:
+  `claude mcp add zammad-instance-a -- docker run -i --rm --env-file ./env/instance_a.env zammad-mcp`
+
 ## 4. Verify
 
 In Claude Code, run `/mcp` to confirm the `zammad` server connected, then ask things like:
@@ -143,7 +193,8 @@ In Claude Code, run `/mcp` to confirm the `zammad` server connected, then ask th
 With `ZAMMAD_ALLOW_WRITE=true` you can also:
 
 - "Add an internal note to ticket 4521: 'Called the user, awaiting logs.'"
-- "Set ticket 4521 to pending reminder and assign it to agent 8."
+- "Set ticket 4521 to pending reminder for Monday 9:00 and assign it to agent 8."
+- "Tag ticket 4521 with vpn and escalated."
 - "Create a ticket in group Support for alice@example.com titled 'Laptop won't boot'."
 
 ## Notes & scope

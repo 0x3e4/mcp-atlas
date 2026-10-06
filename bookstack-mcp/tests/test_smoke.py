@@ -6,10 +6,13 @@ These run with no credentials and make no network calls.
 from __future__ import annotations
 
 import asyncio
+import json
 
+import httpx
 import pytest
 
 from bookstack_mcp import server
+from bookstack_mcp.client import BookStackError
 from bookstack_mcp.config import ConfigError, Settings
 
 EXPECTED_TOOLS = {
@@ -25,6 +28,15 @@ EXPECTED_TOOLS = {
     "list_attachments",
     "system_info",
     "bookstack_get",
+    "create_page",
+    "update_page",
+    "create_chapter",
+    "update_chapter",
+    "create_book",
+    "update_book",
+    "create_shelf",
+    "update_shelf",
+    "add_comment",
 }
 
 
@@ -52,6 +64,15 @@ def test_required_params_present():
     assert "query" in tools["search"].inputSchema["properties"]
     assert "id" in tools["get_page"].inputSchema["properties"]
     assert "kind" in tools["export_content"].inputSchema["properties"]
+    # write tools (always registered; gated at call time by BOOKSTACK_ALLOW_WRITE)
+    for p in ("name", "book_id", "chapter_id", "markdown", "html", "tags"):
+        assert p in tools["create_page"].inputSchema["properties"]
+    for p in ("id", "move_to_book_id", "move_to_chapter_id", "changelog"):
+        assert p in tools["update_page"].inputSchema["properties"]
+    for p in ("add_book_ids", "remove_book_ids"):
+        assert p in tools["update_shelf"].inputSchema["properties"]
+    for p in ("page_id", "body", "reply_to"):
+        assert p in tools["add_comment"].inputSchema["properties"]
 
 
 def test_settings_requires_credentials():
@@ -98,3 +119,87 @@ def test_verify_ssl_and_ca_bundle():
     env = _base_env()
     env["BOOKSTACK_CA_BUNDLE"] = "/etc/ssl/bs-ca.pem"
     assert Settings.from_env(env).httpx_verify == "/etc/ssl/bs-ca.pem"
+
+
+def test_allow_write_defaults_off_and_parses():
+    assert Settings.from_env(_base_env()).allow_write is False
+    env = _base_env()
+    env["BOOKSTACK_ALLOW_WRITE"] = "true"
+    assert Settings.from_env(env).allow_write is True
+
+
+def test_write_tools_refuse_without_allow_write():
+    server._client = server.BookStackClient(Settings.from_env(_base_env()))
+    try:
+        with pytest.raises(ValueError, match="BOOKSTACK_ALLOW_WRITE"):
+            asyncio.run(server.create_page("Runbook", book_id=1, markdown="# hi"))
+        with pytest.raises(ValueError, match="BOOKSTACK_ALLOW_WRITE"):
+            asyncio.run(server.update_shelf(3, add_book_ids=[9]))
+    finally:
+        server._client = None
+
+
+def _write_client(handler) -> server.BookStackClient:
+    env = _base_env()
+    env["BOOKSTACK_ALLOW_WRITE"] = "true"
+    client = server.BookStackClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client
+
+
+def test_write_payloads_match_the_bookstack_api():
+    seen: list[tuple[str, str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, body))
+        if request.method == "GET":  # update_shelf reads the current book list first
+            return httpx.Response(200, json={"id": 3, "books": [{"id": 1}, {"id": 2}, {"id": 5}]})
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(200, json={"id": 40, "local_id": 2, "commentable_id": 12, "parent_id": 1})
+        return httpx.Response(200, json={"id": 12, "name": "Runbook", "slug": "runbook", "book_slug": "ops",
+                                         "html": "<p>big</p>", "markdown": "big"})
+
+    server._client = _write_client(handler)
+
+    async def calls():
+        page = await server.create_page("Runbook", chapter_id=7, markdown="# Steps", tags={"team": "ops", "draft": ""})
+        assert page["url"] == "https://docs.example.com/link/12" and "html" not in page
+        chapter = await server.update_chapter(4, name="Ops", move_to_book_id=2)
+        assert chapter["url"] == "https://docs.example.com/books/ops/chapter/runbook"
+        shelf = await server.update_shelf(3, add_book_ids=[9, 2], remove_book_ids=[1])
+        assert shelf["book_ids"] == [2, 5, 9]
+        comment = await server.add_comment(12, "Looks good <b>\r\nship it\n\nthanks", reply_to=1)
+        assert comment["local_id"] == 2
+        with pytest.raises(ValueError, match="exactly one body"):
+            await server.create_page("x", book_id=1)
+        with pytest.raises(ValueError, match="Nothing to update"):
+            await server.update_page(12, changelog="noop")
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None
+
+    assert seen == [
+        ("POST", "/api/pages", {"name": "Runbook", "chapter_id": 7, "markdown": "# Steps",
+                                "tags": [{"name": "team", "value": "ops"}, {"name": "draft", "value": ""}]}),
+        ("PUT", "/api/chapters/4", {"name": "Ops", "book_id": 2}),
+        ("GET", "/api/shelves/3", None),
+        ("PUT", "/api/shelves/3", {"books": [2, 5, 9]}),
+        ("POST", "/api/comments", {"page_id": 12, "reply_to": 1,
+                                   "html": "<p>Looks good &lt;b&gt;<br>ship it</p><p>thanks</p>"}),
+    ]
+
+
+def test_validation_errors_name_the_fields():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"error": {"code": 422, "message": "The given data was invalid.",
+                                                   "validation": {"name": ["The name field is required."]}}})
+
+    server._client = _write_client(handler)
+    try:
+        with pytest.raises(BookStackError, match="name: The name field is required"):
+            asyncio.run(server.create_book("x"))
+    finally:
+        server._client = None

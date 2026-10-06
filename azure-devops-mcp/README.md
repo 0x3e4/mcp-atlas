@@ -147,6 +147,55 @@ With the gateway also on `atlas-net`, register this server at `http://azure-devo
 [README → *Behind an MCP gateway*](../README.md#behind-an-mcp-gateway-eg-mcpjungle) for the full
 gateway walkthrough and client setup.
 
+#### Multiple instances (one image, several env files)
+
+The same image runs as several containers side by side, each with its own env file —
+for example the shared read-only instance next to a write-enabled one that uses another
+PAT, or one container per collection or server.
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+
+```yaml
+x-azure-devops: &azure-devops
+  image: ghcr.io/0x3e4/azure-devops-mcp:latest
+  environment:
+    MCP_TRANSPORT: streamable-http
+    MCP_HOST: 0.0.0.0
+    MCP_PORT: "8000"
+  restart: unless-stopped
+  networks: [atlas-net]
+
+services:
+  azure-devops-mcp:                    # existing shared read-only instance
+    <<: *azure-devops
+    container_name: azure-devops-mcp
+    env_file: ./azure-devops.env
+
+  azure-devops-mcp-instance-a:         # write access with instance a's PAT
+    <<: *azure-devops
+    container_name: azure-devops-mcp-instance-a
+    env_file: ./env/instance_a.env
+
+networks:
+  atlas-net:
+    external: true
+```
+
+- `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
+  env/instance_a.env`) with instance a's PAT and `AZDO_ALLOW_WRITE=true`. The shared instance keeps
+  the flag off. `*.env` is gitignored, so it stays local.
+- Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
+  gateway reaches each one by its `container_name`. Register them under separate names:
+
+  ```bash
+  mcpjungle register --name azure-devops --url http://azure-devops-mcp:8000/mcp
+  mcpjungle register --name azure-devops-instance-a --url http://azure-devops-mcp-instance-a:8000/mcp
+  ```
+
+- `<<:` merges shallowly: an instance that sets its own `environment:` replaces the anchor's whole
+  block, so keep per-instance settings in its env file.
+- Over stdio no compose is needed — register a second server with the other env file:
+  `claude mcp add azuredevops-instance-a -- docker run -i --rm --env-file ./env/instance_a.env azure-devops-mcp`
+
 ## 4. Verify
 
 In Claude Code, run `/mcp` to confirm the `azuredevops` server connected, then ask things like:

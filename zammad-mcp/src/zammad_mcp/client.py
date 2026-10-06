@@ -3,7 +3,7 @@
 A single ``httpx.AsyncClient`` is shared across all tools. Auth is a token header
 (``Authorization: Token token=<token>``). List endpoints return a JSON array; single resources
 return the object directly. Failures become a clean ``ZammadError`` (using Zammad's ``error_human``
-when present) so tools never leak tracebacks to the model. Writes (POST/PUT) are gated at the tool
+when present) so tools never leak tracebacks to the model. Writes (POST/PUT/DELETE) are gated at the tool
 layer by ``ZAMMAD_ALLOW_WRITE``.
 """
 
@@ -64,6 +64,10 @@ class ZammadClient:
     async def put(self, path: str, *, json: Any, params: dict[str, Any] | None = None) -> Any:
         """PUT ``json`` (write)."""
         return await self._request("PUT", self._url(path), params=params, json=json)
+
+    async def delete(self, path: str, *, json: Any | None = None) -> Any:
+        """DELETE, optionally with a ``json`` body (write; Zammad's tag removal takes one)."""
+        return await self._request("DELETE", self._url(path), json=json)
 
     async def get_raw(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
         """Escape hatch: GET an arbitrary ``/api/v1/...`` path (or absolute URL on the same host)."""

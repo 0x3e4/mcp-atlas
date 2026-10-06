@@ -1,9 +1,11 @@
-"""Async BookStack REST API client (read-only, API-token auth).
+"""Async BookStack REST API client (API-token auth).
 
 A single ``httpx.AsyncClient`` is shared across all tools. Authentication is a BookStack API token
 sent as ``Authorization: Token <id>:<secret>`` on every request. List endpoints return
 ``{"data": [...], "total": N}``; single resources return the object directly; export endpoints
-return text. Failures become a clean ``BookStackError`` so tools never leak tracebacks to the model.
+return text. Failures become a clean ``BookStackError`` (with the per-field reasons of a 422) so
+tools never leak tracebacks to the model. Writes (POST/PUT JSON) are gated at the tool layer by
+``BOOKSTACK_ALLOW_WRITE``.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ class BookStackError(RuntimeError):
 
 
 class BookStackClient:
-    """Minimal async client for the BookStack REST API (GET only)."""
+    """Minimal async client for the BookStack REST API."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -67,6 +69,14 @@ class BookStackClient:
         """GET a text resource (used for the export endpoints)."""
         return await self._request("GET", self._url(path), params=params, as_text=True)
 
+    async def post(self, path: str, *, json: Any) -> Any:
+        """POST ``json`` (write)."""
+        return await self._request("POST", self._url(path), json=json)
+
+    async def put(self, path: str, *, json: Any) -> Any:
+        """PUT ``json`` (write)."""
+        return await self._request("PUT", self._url(path), json=json)
+
     async def get_raw(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
         """Escape hatch: GET an arbitrary ``/api/...`` path (or absolute URL on the same host)."""
         if path.startswith(("http://", "https://")):
@@ -83,11 +93,17 @@ class BookStackClient:
         return await self._request("GET", url, params=params)
 
     async def _request(
-        self, method: str, url: str, *, params: dict[str, Any] | None = None, as_text: bool = False
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: Any | None = None,
+        as_text: bool = False,
     ) -> Any:
         client = await self._http()
         try:
-            resp = await client.request(method, url, params=params, headers=self._auth_headers())
+            resp = await client.request(method, url, params=params, json=json, headers=self._auth_headers())
         except httpx.HTTPError as exc:
             raise BookStackError(f"Network error calling BookStack {url}: {exc}") from exc
 
@@ -127,6 +143,18 @@ def _bs_message(data: Any) -> str:
     return ""
 
 
+def _validation(data: Any) -> str:
+    """Flatten a 422's ``error.validation`` ({field: [reasons]}) into one line."""
+    err = data.get("error") if isinstance(data, dict) else None
+    fields = err.get("validation") if isinstance(err, dict) else None
+    if not isinstance(fields, dict):
+        return ""
+    return "; ".join(
+        f"{name}: {' '.join(map(str, reasons)) if isinstance(reasons, list) else reasons}"
+        for name, reasons in fields.items()
+    )
+
+
 def _format_error(status: int, data: Any, resp: httpx.Response) -> str:
     msg = _bs_message(data)
     if status == 401:
@@ -135,11 +163,14 @@ def _format_error(status: int, data: Any, resp: httpx.Response) -> str:
             "that the token's user has the 'Access System API' permission."
         )
     if status == 403:
-        return f"BookStack 403 — the token's user lacks permission for this resource. {msg}".rstrip()
+        return (
+            "BookStack 403 — the token's user lacks permission for this resource (writes need the "
+            f"matching create/update permission on the item). {msg}"
+        ).rstrip()
     if status == 404:
         return f"BookStack 404 — not found. {msg}".rstrip()
     if status == 422:
-        return f"BookStack 422 — invalid request parameters. {msg}".rstrip()
+        return f"BookStack 422 — invalid request parameters. {_validation(data) or msg}".rstrip()
     if status == 429:
         return "BookStack 429 — rate limit exceeded (API_REQUESTS_PER_MIN); back off and retry."
     detail = msg or (resp.text[:300] if resp.text else "")

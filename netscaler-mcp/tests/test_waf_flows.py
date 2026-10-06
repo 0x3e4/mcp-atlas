@@ -1,8 +1,7 @@
-"""WAF tool flows against a stateful fake NITRO appliance (httpx.MockTransport) — no network.
+"""WAF tool flows against the fake NITRO appliance (tests/fake_netscaler.py) — no network.
 
-The fake follows the NetScaler 14.1 NITRO reference: bindings are added with PUT and removed with
-DELETE ?args=, read-only attributes are rejected, duplicates return AppFw's per-check codes, and args
-are parsed SDK-style (split on literal ',' and ':' first, then percent-decode each value).
+The fake and the ``ns`` fixture are shared with test_bot_flows.py; see fake_netscaler.py for the NITRO
+behaviour it reproduces.
 """
 
 from __future__ import annotations
@@ -10,178 +9,11 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
-from urllib.parse import unquote
 
-import httpx
 import pytest
 
+from fake_netscaler import STATIC
 from netscaler_mcp import server
-from netscaler_mcp.config import Settings
-
-BINDING_IDENTITY = {
-    "appfwprofile_starturl_binding": ("starturl", "ruletype"),
-    "appfwprofile_denyurl_binding": ("denyurl", "ruletype"),
-    "appfwprofile_sqlinjection_binding": (
-        "sqlinjection", "formactionurl_sql", "as_scan_location_sql", "as_value_type_sql", "as_value_expr_sql", "ruletype",
-    ),
-}
-EXISTS_CODE = {"appfwprofile_starturl_binding": 3121, "appfwprofile_denyurl_binding": 3123,
-               "appfwprofile_sqlinjection_binding": 3131}
-PROFILE_READ_ONLY = {"state", "learning", "csrftag", "builtin", "_nextgenapiresource", "__count", "defaults"}
-BINDING_READ_ONLY = {"alertonly", "resourceid", "__count", "_nextgenapiresource"}
-LEARNED_FIELD = {"starturl": "url", "sqlinjection": "name", "formactionurl_sql": "url",
-                 "as_value_type_sql": "value_type", "as_value_expr_sql": "value"}
-STATIC = r"^https?://[^/]+/static/.*$"
-
-
-def _reply(status: int = 200, errorcode: int = 0, message: str = "Done", **payload: Any) -> httpx.Response:
-    return httpx.Response(status, json={"errorcode": errorcode, "message": message, **payload})
-
-
-class FakeNetScaler:
-    """Just enough of the NITRO appfw API, with state, to drive every WAF tool."""
-
-    def __init__(self) -> None:
-        self.seq = 0
-        self.saved = False
-        self.writes: list[tuple[str, str, str | None, dict[str, str], Any]] = []
-        self.profiles = {"pr_app": self.profile(
-            "pr_app", learning="ON", starturlaction=["learn", "log", "stats"],
-            sqlinjectionaction=["learn", "log", "stats"], errorurl="https://app.test.corp/error.html",
-        )}
-        self.learning_settings = {"pr_app": {"profilename": "pr_app", "starturlminthreshold": 5}}
-        self.bindings = {"pr_app": {
-            "appfwprofile_starturl_binding": [
-                self.row("pr_app", "appfwprofile_starturl_binding", {"starturl": r"^https://app\.test\.corp/app/.*$"}),
-                self.row("pr_app", "appfwprofile_starturl_binding", {"starturl": STATIC}),
-            ],
-            "appfwprofile_sqlinjection_binding": [self.row(
-                "pr_app", "appfwprofile_sqlinjection_binding",
-                {"sqlinjection": "q", "formactionurl_sql": r"^https://app\.test\.corp/search$"},
-            )],
-            "appfwprofile_logexpression_binding": [{"name": "pr_app", "logexpression": "le1"}],
-        }}
-        self.learned = {"pr_app": {
-            "startURL": [
-                {"url": r"^https://app\.test\.corp/app/a\.php$", "hits": "12"},
-                {"url": r"^https://app\.test\.corp/portal/b\.php$", "hits": "30"},
-                {"url": r"^https://app\.test\.corp/portal/c,d\.php$", "hits": "2"},
-                {"url": r"^https://app\.test\.corp/wp-login\.php$", "hits": "1"},
-            ],
-            "SQLInjection": [{"name": "comment", "url": r"^https://app\.test\.corp/post$",
-                              "value_type": "SpecialString", "value": "'", "hits": "4"}],
-        }}
-
-    @staticmethod
-    def profile(name: str, **attrs: Any) -> dict[str, Any]:
-        return {"name": name, "state": "ENABLED", "learning": "OFF", "builtin": ["MODIFIABLE"], "type": ["HTML"],
-                "starturlaction": ["none"], "sqlinjectionaction": ["none"], "denyurlaction": ["none"], **attrs}
-
-    def row(self, profile: str, binding: str, attrs: dict[str, Any]) -> dict[str, Any]:
-        """A binding as the appliance stores it: defaults filled in, a resourceid assigned."""
-        self.seq += 1
-        row = {"name": profile, "state": "ENABLED", "ruletype": "ALLOW", "alertonly": "OFF", **attrs,
-               "resourceid": f"res{self.seq}"}
-        if binding == "appfwprofile_sqlinjection_binding":
-            row.setdefault("as_scan_location_sql", "FORMFIELD")
-        return row
-
-    def start_urls(self, profile: str) -> list[str]:
-        return sorted(r["starturl"] for r in self.bindings[profile].get("appfwprofile_starturl_binding", []))
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        path, _, query = request.url.raw_path.decode().partition("?")
-        resource, _, name = path.split("/nitro/v1/config/", 1)[1].partition("/")
-        name = unquote(name) or None
-        params = dict(p.partition("=")[::2] for p in query.split("&")) if query else {}
-        args = {k: unquote(v) for k, _, v in (i.partition(":") for i in params.get("args", "").split(",") if i)}
-        body = json.loads(request.content) if request.content else {}
-        if resource == "login":
-            return httpx.Response(201, json={"errorcode": 0, "sessionid": "s1"})
-        if request.method != "GET":
-            self.writes.append((request.method, resource, name, args, body))
-        if resource == "nsconfig":
-            self.saved = params.get("action") == "save"
-            return _reply()
-        if resource == "appfwprofile":
-            return self._profile_api(request.method, name, body.get(resource) or {})
-        if resource == "appfwlearningsettings":
-            if request.method == "GET":
-                return _reply(appfwlearningsettings=[self.learning_settings[name]])
-            self.learning_settings[body[resource]["profilename"]].update(body[resource])
-            return _reply()
-        if resource == "appfwlearningdata":
-            return self._learning_api(request.method, args)
-        if resource == "appfwprofile_binding":
-            if name not in self.profiles:
-                return _reply(404, 3190, "No such profile.")
-            return _reply(appfwprofile_binding=[{"name": name, **self.bindings[name]}])
-        return self._binding_api(request.method, resource, name, args, body.get(resource) or {})
-
-    def _profile_api(self, method: str, name: str | None, obj: dict[str, Any]) -> httpx.Response:
-        if method == "GET":
-            return _reply(appfwprofile=[self.profiles[name]]) if name in self.profiles else _reply(404, 258, "No such resource")
-        if set(obj) & PROFILE_READ_ONLY:
-            return _reply(400, 278, f"Invalid argument [{sorted(set(obj) & PROFILE_READ_ONLY)[0]}]")
-        if method == "POST":
-            self.profiles[obj["name"]] = self.profile(**obj)
-            self.bindings[obj["name"]] = {}
-            self.learning_settings[obj["name"]] = {"profilename": obj["name"], "starturlminthreshold": 1}
-            return _reply(201)
-        self.profiles[obj["name"]].update(obj)
-        return _reply()
-
-    def _binding_api(self, method: str, binding: str, name: str | None, args: dict[str, str], obj: dict[str, Any]) -> httpx.Response:
-        profile = name or obj.get("name")
-        if profile not in self.profiles:
-            return _reply(404, 3190, "No such profile.")
-        rows = self.bindings[profile].setdefault(binding, [])
-        if method == "GET":
-            return _reply(**({binding: rows} if rows else {}))
-        if method == "PUT":
-            if set(obj) & BINDING_READ_ONLY:
-                return _reply(400, 278, "Invalid argument")
-            new = self.row(profile, binding, {k: v for k, v in obj.items() if k != "name"})
-            ident = lambda r: tuple(str(r.get(a, "")) for a in BINDING_IDENTITY[binding])  # noqa: E731
-            if any(ident(r) == ident(new) for r in rows):
-                return _reply(409, EXISTS_CODE[binding], "Rule already exists")
-            rows.append(new)
-            return _reply(201)
-        keep = [r for r in rows if not all(str(r.get(k, "")) == v for k, v in args.items())]
-        if len(keep) == len(rows):
-            return _reply(404, 3120, "No such rule")
-        self.bindings[profile][binding] = keep
-        return _reply()
-
-    def _learning_api(self, method: str, args: dict[str, str]) -> httpx.Response:
-        checks = self.learned.get(args["profilename"], {})
-        if method == "GET":
-            return _reply(appfwlearningdata=checks.get(args["securitycheck"], []))
-        wanted = {LEARNED_FIELD[k]: v for k, v in args.items() if k != "profilename"}
-        for check, rows in checks.items():
-            keep = [r for r in rows if not all(str(r.get(k, "")) == v for k, v in wanted.items())]
-            if len(keep) != len(rows):
-                checks[check] = keep
-                return _reply()
-        return _reply(404, 258, "No such resource")
-
-
-@pytest.fixture
-def ns(tmp_path):
-    """A fresh fake appliance wired into the server; ns.use(allow_write=False) flips the write flag."""
-    fake = FakeNetScaler()
-
-    def use(allow_write: bool = True) -> None:
-        env = {"NETSCALER_BASE_URL": "https://ns", "NETSCALER_USER": "u", "NETSCALER_PASSWORD": "p",
-               "NETSCALER_ALLOW_WRITE": str(allow_write).lower(), "NETSCALER_EXPORT_DIR": str(tmp_path)}
-        client = server.NitroClient(Settings.from_env(env))
-        client._client = httpx.AsyncClient(transport=httpx.MockTransport(fake))
-        server._client = client
-
-    fake.use = use
-    use()
-    yield fake
-    server._client = None
 
 
 def test_previews_work_read_only_and_writes_refuse(ns):

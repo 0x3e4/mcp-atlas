@@ -24,7 +24,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
-from . import waf
+from . import bot, waf
 from .client import NitroClient, NitroError
 from .config import ConfigError, Settings
 
@@ -538,18 +538,23 @@ def _tally(statuses: list[str]) -> dict[str, int]:
     return counts
 
 
-async def _profile_rules(profile: str) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+async def _profile_rules(
+    kind: waf.ProfileKind, profile: str
+) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
     """A profile's live bindings split into modelled rule types and other binding arrays."""
-    env = await _get_client().get("config", "appfwprofile_binding", resource_name=profile)
-    return waf.split_bindings(_one(env, "appfwprofile_binding"))
+    env = await _get_client().get("config", kind.aggregate, resource_name=profile)
+    return kind.split_bindings(_one(env, kind.aggregate))
 
 
-async def _learning_settings(profile: str) -> dict[str, Any]:
+async def _extra_settings(kind: waf.ProfileKind, profile: str) -> dict[str, Any]:
+    """The family's second per-profile resource (AppFw learning thresholds); {} when it has none."""
+    if kind.extra is None:
+        return {}
     try:
-        env = await _get_client().get("config", "appfwlearningsettings", resource_name=profile)
+        env = await _get_client().get("config", kind.extra.resource, resource_name=profile)
     except NitroError:
         return {}
-    return _one(env, "appfwlearningsettings")
+    return _one(env, kind.extra.resource)
 
 
 async def _learned_entries(
@@ -621,32 +626,38 @@ async def _update_attrs(resourcetype: str, ident: dict[str, str], changes: dict[
     return errors
 
 
-async def _export_document(profile: str) -> dict[str, Any]:
+async def _export_document(kind: waf.ProfileKind, profile: str) -> dict[str, Any]:
     client = _get_client()
-    settings = _one(await client.get("config", "appfwprofile", resource_name=profile), "appfwprofile")
-    rules, other = await _profile_rules(profile)
-    return waf.build_document(
+    settings = _one(await client.get("config", kind.profile, resource_name=profile), kind.profile)
+    rules, other = await _profile_rules(kind, profile)
+    return kind.build_document(
         profile=profile,
         appliance=client.settings.base_origin,
         exported_at=datetime.now(UTC).isoformat(timespec="seconds"),
         settings=settings,
-        learning_settings=await _learning_settings(profile),
         rules=rules,
         other_bindings=other,
+        extra_settings=await _extra_settings(kind, profile),
     )
 
 
 async def _apply_document(
-    doc: dict[str, Any], target: str, *, mode: str, include_settings: bool | None, dry_run: bool
+    kind: waf.ProfileKind,
+    doc: dict[str, Any],
+    target: str,
+    *,
+    mode: str,
+    include_settings: bool | None,
+    dry_run: bool,
 ) -> dict[str, Any]:
-    """Plan a WAF profile document against ``target`` and, unless dry_run, apply it in a traffic-safe order."""
+    """Plan a profile document against ``target`` and, unless dry_run, apply it in a traffic-safe order."""
     if mode not in ("merge", "replace"):
         raise ValueError("mode must be 'merge' or 'replace'.")
     if not dry_run:
         _require_write()
     client = _get_client()
     try:
-        current = _one(await client.get("config", "appfwprofile", resource_name=target), "appfwprofile")
+        current = _one(await client.get("config", kind.profile, resource_name=target), kind.profile)
     except NitroError as exc:
         if not _is_missing(exc):
             raise
@@ -654,29 +665,33 @@ async def _apply_document(
     exists = bool(current)
     apply_settings = (not exists) if include_settings is None else include_settings
     desired_settings = doc.get("settings") or {}
-    desired_learning = doc.get("learning_settings") or {}
+    extra_key = kind.extra.doc_key if kind.extra else None
+    desired_extra = (doc.get(extra_key) or {}) if extra_key else {}
     setting_changes: dict[str, Any] = {}
-    learning_changes: dict[str, Any] = {}
+    extra_changes: dict[str, Any] = {}
     if apply_settings and exists:
         setting_changes = waf.settings_changes(desired_settings, current)
-        learning_changes = waf.settings_changes(desired_learning, await _learning_settings(target))
+        if extra_key:
+            extra_changes = waf.settings_changes(desired_extra, await _extra_settings(kind, target))
     elif apply_settings:  # a new profile's defaults are unknown until it exists
-        setting_changes, learning_changes = dict(desired_settings), dict(desired_learning)
-    current_rules = (await _profile_rules(target))[0] if exists else {}
-    plan = waf.plan_bindings(doc.get("rules") or {}, current_rules, replace=mode == "replace")
+        setting_changes, extra_changes = dict(desired_settings), dict(desired_extra)
+    current_rules = (await _profile_rules(kind, target))[0] if exists else {}
+    plan = kind.plan_bindings(doc.get("rules") or {}, current_rules, replace=mode == "replace")
 
     out: dict[str, Any] = {
+        "kind": kind.key,
         "target_profile": target,
         "mode": mode,
         "dry_run": dry_run,
         "profile": "exists" if exists else ("would create" if dry_run else "created"),
         "settings_changes": setting_changes,
-        "learning_settings_changes": learning_changes,
         "rules": {
             key: {op: len(v) if isinstance(v, list) else v for op, v in ops.items()} for key, ops in plan.items()
         },
         "not_imported": {k: len(v) for k, v in (doc.get("other_bindings") or {}).items()},
     }
+    if extra_key:
+        out[f"{extra_key}_changes"] = extra_changes
     if dry_run:
         out["preview"] = {
             key: {op: v[:25] for op, v in ops.items() if isinstance(v, list) and v} for key, ops in plan.items()
@@ -689,43 +704,222 @@ async def _apply_document(
     errors: list[str] = []
     if not exists:
         body: dict[str, Any] = {"name": target}
-        if desired_settings.get("type"):
-            body["type"] = desired_settings["type"]
-        await client.add("appfwprofile", body)
+        for attr in kind.create_attrs:
+            if desired_settings.get(attr):
+                body[attr] = desired_settings[attr]
+        await client.add(kind.profile, body)
         if apply_settings:  # diff against the fresh profile's defaults so only real differences are sent
-            fresh = _one(await client.get("config", "appfwprofile", resource_name=target), "appfwprofile")
+            fresh = _one(await client.get("config", kind.profile, resource_name=target), kind.profile)
             setting_changes = waf.settings_changes(desired_settings, fresh)
-            learning_changes = waf.settings_changes(desired_learning, await _learning_settings(target))
+            if extra_key:
+                extra_changes = waf.settings_changes(desired_extra, await _extra_settings(kind, target))
     if setting_changes:
-        errors += await _update_attrs("appfwprofile", {"name": target}, setting_changes)
-    if learning_changes:
-        errors += await _update_attrs("appfwlearningsettings", {"profilename": target}, learning_changes)
+        errors += await _update_attrs(kind.profile, {"name": target}, setting_changes)
+    if extra_changes and kind.extra:
+        errors += await _update_attrs(kind.extra.resource, {kind.extra.ident: target}, extra_changes)
 
     applied: dict[str, list[str]] = {}
 
     def _record(key: str, op: str, status: str, row: dict[str, Any]) -> None:
         applied.setdefault(key, []).append(status)
         if status.startswith("error") and len(errors) < 50:
-            errors.append(f"{key} {op} {row.get(waf.RULE_TYPES[key].identity[0])!r}: {status[len('error: '):]}")
+            errors.append(f"{key} {op} {row.get(kind.types[key].identity[0])!r}: {status[len('error: '):]}")
 
     # Add first, re-bind changed, remove last: allowed traffic never loses its rule mid-import.
     for key, ops in plan.items():
         for row in ops["add"]:
-            _record(key, "add", await _bind(waf.RULE_TYPES[key], target, row), row)
+            _record(key, "add", await _bind(kind.types[key], target, row), row)
     for key, ops in plan.items():
         for change in ops["update"]:
-            status = await _unbind(waf.RULE_TYPES[key], target, change["current"])
+            status = await _unbind(kind.types[key], target, change["current"])
             if not status.startswith("error"):
-                status = await _bind(waf.RULE_TYPES[key], target, change["desired"])
+                status = await _bind(kind.types[key], target, change["desired"])
                 status = "updated" if status == "added" else status
             _record(key, "update", status, change["desired"])
     for key, ops in plan.items():
         for row in ops["remove"]:
-            _record(key, "remove", await _unbind(waf.RULE_TYPES[key], target, row), row)
+            _record(key, "remove", await _unbind(kind.types[key], target, row), row)
 
     out["applied"] = {key: _tally(statuses) for key, statuses in applied.items()}
     out["errors"] = errors
     return out
+
+
+# ---- shared tool bodies: the WAF and Bot families differ only in their ProfileKind ----
+
+async def _rules_overview(
+    kind: waf.ProfileKind, profile: str, rule_type: str | None, contains: str | None, limit: int
+) -> dict[str, Any]:
+    """Shared body of list_waf_rules / list_bot_rules."""
+    rules, other = await _profile_rules(kind, profile)
+    keys = [kind.rule_type(rule_type)] if rule_type else list(kind.types)
+    counts: dict[str, int] = {}
+    shown: dict[str, list[dict[str, Any]]] = {}
+    for key in keys:
+        rows = [r for r in (waf.clean_binding(row) for row in rules.get(key, [])) if _matches(r, contains)]
+        if rows:
+            counts[key] = len(rows)
+            shown[key] = rows[: _clamp(limit, default=200, maximum=2000)]
+    return {
+        "profile": profile,
+        "counts": counts,
+        "rules": shown,
+        "other_bindings": {k: len(v) for k, v in other.items()},
+    }
+
+
+async def _apply_rule(
+    kind: waf.ProfileKind,
+    profile: str,
+    key: str,
+    row: dict[str, Any],
+    *,
+    comment: str | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Shared body of add_waf_rule / add_bot_rule: bind the rule on each profile that lacks it."""
+    spec = kind.types[key]
+    if not row.get(spec.identity[0]):
+        raise ValueError(f"The rule needs {spec.identity[0]!r} (in binding_attrs for rule='raw').")
+    if comment:
+        row[spec.comment_attr] = comment
+    if not dry_run:
+        _require_write()
+    results = []
+    for name in _profiles(profile):
+        try:
+            existing = _rows(await _get_client().get("config", spec.binding, resource_name=name), spec.binding)
+        except NitroError as exc:
+            results.append({"profile": name, "status": f"error: {exc}"})
+            continue
+        if waf.binding_key(spec, row) in {waf.binding_key(spec, r) for r in existing}:
+            status = "exists"
+        elif dry_run:
+            status = "would add"
+        else:
+            status = await _bind(spec, name, row)
+        results.append({"profile": name, "status": status})
+    out: dict[str, Any] = {"dry_run": dry_run, "rule_type": key, "rule": row, "results": results}
+    if dry_run:
+        out["next"] = "Call again with dry_run=false to bind (needs NETSCALER_ALLOW_WRITE); persist with save_config."
+    return out
+
+
+async def _remove_rule(
+    kind: waf.ProfileKind,
+    profile: str,
+    rule_type: str,
+    rule: dict[str, Any],
+    all_matches: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Shared body of remove_waf_rule / remove_bot_rule."""
+    key = kind.rule_type(rule_type)
+    spec = kind.types[key]
+    identity = spec.identity + spec.ident_extra
+    given = {a: v for a, v in (rule or {}).items() if a in identity and v not in (None, "")}
+    if spec.identity[0] not in given:
+        raise ValueError(f"rule must include {spec.identity[0]!r}.")
+    if not dry_run:
+        _require_write()
+    existing = _rows(await _get_client().get("config", spec.binding, resource_name=profile), spec.binding)
+    matches = [waf.clean_binding(r) for r in existing if waf.row_matches(spec, r, given)]
+    if len(matches) > 1 and not all_matches:
+        raise ValueError(
+            f"{len(matches)} rules match; add identifying attributes or pass all_matches=true. "
+            f"Matches: {matches[:10]}"
+        )
+    results = []
+    for row in matches:
+        status = "would remove" if dry_run else await _unbind(spec, profile, row)
+        results.append({"rule": row, "status": status})
+    return {"profile": profile, "rule_type": key, "dry_run": dry_run, "matched": len(matches), "results": results}
+
+
+async def _export_profile(
+    kind: waf.ProfileKind, profile: str, host_map: dict[str, str] | None, save_as: str | None
+) -> dict[str, Any]:
+    """Shared body of export_waf_profile / export_bot_profile."""
+    doc = await _export_document(kind, profile)
+    extra: dict[str, Any] = {}
+    if host_map:
+        doc, replacements = kind.apply_host_map(doc, host_map)
+        extra["host_replacements"] = replacements
+    if not save_as:
+        return {**doc, **extra}
+    path = _export_path(save_as)
+    try:
+        path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"Could not write {path}: {exc}") from exc
+    return {
+        "saved_to": str(path),
+        "source": doc["source"],
+        "hosts": doc["hosts"],
+        "settings": len(doc["settings"]),
+        "rules": {k: len(v) for k, v in doc["rules"].items()},
+        "other_bindings": {k: len(v) for k, v in doc["other_bindings"].items()},
+        **extra,
+    }
+
+
+async def _import_profile(
+    kind: waf.ProfileKind,
+    document: dict[str, Any] | str | None,
+    file: str | None,
+    target_profile: str | None,
+    host_map: dict[str, str] | None,
+    mode: str,
+    include_settings: bool | None,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Shared body of import_waf_profile / import_bot_profile."""
+    if (document is None) == (file is None):
+        raise ValueError("Pass exactly one of document or file.")
+    if file is not None:
+        path = _export_path(file)
+        try:
+            document = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"Could not read {path}: {exc}") from exc
+    if isinstance(document, str):
+        try:
+            document = json.loads(document)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"document is not valid JSON: {exc}") from exc
+    doc = kind.check_document(document)
+    target = (target_profile or "").strip() or str((doc.get("source") or {}).get("profile") or "")
+    if not target:
+        raise ValueError("target_profile is required (the document names no source profile).")
+    extra: dict[str, Any] = {}
+    if host_map:
+        doc, extra["host_replacements"] = kind.apply_host_map(doc, host_map)
+    out = await _apply_document(kind, doc, target, mode=mode, include_settings=include_settings, dry_run=dry_run)
+    return {**extra, **out}
+
+
+async def _rehost_profile(
+    kind: waf.ProfileKind,
+    profile: str,
+    from_host: str,
+    to_host: str,
+    target_profile: str | None,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Shared body of rehost_waf_profile / rehost_bot_profile."""
+    doc, replacements = kind.apply_host_map(await _export_document(kind, profile), {from_host: to_host})
+    if not replacements:
+        return {
+            "profile": profile,
+            "message": f"No rule or setting references {from_host!r}; nothing to switch.",
+            "hosts": doc["hosts"],
+        }
+    target = (target_profile or "").strip() or profile
+    in_place = target == profile
+    out = await _apply_document(
+        kind, doc, target, mode="replace", include_settings=True if in_place else None, dry_run=dry_run
+    )
+    return {"host_replacements": replacements, **out}
 
 
 @mcp.tool()
@@ -742,21 +936,7 @@ async def list_waf_rules(
     attributes, so one can be passed straight to remove_waf_rule. 'counts' are totals after the filter;
     binding types this server doesn't model are counted under 'other_bindings'.
     """
-    rules, other = await _profile_rules(profile)
-    keys = [waf.rule_type(rule_type)] if rule_type else list(waf.RULE_TYPES)
-    counts: dict[str, int] = {}
-    shown: dict[str, list[dict[str, Any]]] = {}
-    for key in keys:
-        rows = [r for r in (waf.clean_binding(row) for row in rules.get(key, [])) if _matches(r, contains)]
-        if rows:
-            counts[key] = len(rows)
-            shown[key] = rows[: _clamp(limit, default=200, maximum=2000)]
-    return {
-        "profile": profile,
-        "counts": counts,
-        "rules": shown,
-        "other_bindings": {k: len(v) for k, v in other.items()},
-    }
+    return await _rules_overview(waf.WAF, profile, rule_type, contains, limit)
 
 
 @mcp.tool()
@@ -821,7 +1001,7 @@ async def list_waf_urls(
     - uncovered_groups: uncovered learned URLs grouped by host + first path segment, each with a
       suggested prefix rule — the shortlist to add before switching the start URL check to block.
     """
-    rules, _ = await _profile_rules(profile)
+    rules, _ = await _profile_rules(waf.WAF, profile)
     only = waf.normalize_host(host) if host else None
     cap = _clamp(limit, default=500, maximum=5000)
     hosts: dict[str, dict[str, int]] = {}
@@ -889,27 +1069,7 @@ async def export_waf_profile(
     'hosts' lists the hostnames the rules reference. Bindings this server doesn't model are kept under
     'other_bindings' for reference but are not imported. Read-only on the appliance.
     """
-    doc = await _export_document(profile)
-    extra: dict[str, Any] = {}
-    if host_map:
-        doc, replacements = waf.apply_host_map(doc, host_map)
-        extra["host_replacements"] = replacements
-    if not save_as:
-        return {**doc, **extra}
-    path = _export_path(save_as)
-    try:
-        path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    except OSError as exc:
-        raise ValueError(f"Could not write {path}: {exc}") from exc
-    return {
-        "saved_to": str(path),
-        "source": doc["source"],
-        "hosts": doc["hosts"],
-        "settings": len(doc["settings"]),
-        "rules": {k: len(v) for k, v in doc["rules"].items()},
-        "other_bindings": {k: len(v) for k, v in doc["other_bindings"].items()},
-        **extra,
-    }
+    return await _export_profile(waf.WAF, profile, host_map, save_as)
 
 
 @mcp.tool()
@@ -939,38 +1099,14 @@ async def add_waf_rule(
     persist with save_config.
     """
     if rule == "raw":
-        key = waf.rule_type(rule_type)
+        key = waf.WAF.rule_type(rule_type)
         row = waf.clean_binding(dict(binding_attrs or {}))
     else:
         key, row = waf.easy_rule(
             rule, host=host, path=path, match=match, scheme=scheme, extensions=extensions, field=field,
             field_is_regex=field_is_regex, location=location, value=value,
         )
-    spec = waf.RULE_TYPES[key]
-    if not row.get(spec.identity[0]):
-        raise ValueError(f"The rule needs {spec.identity[0]!r} (in binding_attrs for rule='raw').")
-    if comment:
-        row["comment"] = comment
-    if not dry_run:
-        _require_write()
-    results = []
-    for name in _profiles(profile):
-        try:
-            existing = _rows(await _get_client().get("config", spec.binding, resource_name=name), spec.binding)
-        except NitroError as exc:
-            results.append({"profile": name, "status": f"error: {exc}"})
-            continue
-        if waf.binding_key(spec, row) in {waf.binding_key(spec, r) for r in existing}:
-            status = "exists"
-        elif dry_run:
-            status = "would add"
-        else:
-            status = await _bind(spec, name, row)
-        results.append({"profile": name, "status": status})
-    out: dict[str, Any] = {"dry_run": dry_run, "rule_type": key, "rule": row, "results": results}
-    if dry_run:
-        out["next"] = "Call again with dry_run=false to bind (needs NETSCALER_ALLOW_WRITE); persist with save_config."
-    return out
+    return await _apply_rule(waf.WAF, profile, key, row, comment=comment, dry_run=dry_run)
 
 
 @mcp.tool()
@@ -987,25 +1123,7 @@ async def remove_waf_rule(
     type/expression, ruletype); other keys are ignored. Previews by default. Live immediately once
     applied; persist with save_config.
     """
-    key = waf.rule_type(rule_type)
-    spec = waf.RULE_TYPES[key]
-    given = {a: v for a, v in (rule or {}).items() if a in spec.identity + ("ruletype",) and v not in (None, "")}
-    if spec.identity[0] not in given:
-        raise ValueError(f"rule must include {spec.identity[0]!r}.")
-    if not dry_run:
-        _require_write()
-    existing = _rows(await _get_client().get("config", spec.binding, resource_name=profile), spec.binding)
-    matches = [waf.clean_binding(r) for r in existing if waf.row_matches(spec, r, given)]
-    if len(matches) > 1 and not all_matches:
-        raise ValueError(
-            f"{len(matches)} rules match; add identifying attributes or pass all_matches=true. "
-            f"Matches: {matches[:10]}"
-        )
-    results = []
-    for row in matches:
-        status = "would remove" if dry_run else await _unbind(spec, profile, row)
-        results.append({"rule": row, "status": status})
-    return {"profile": profile, "rule_type": key, "dry_run": dry_run, "matched": len(matches), "results": results}
+    return await _remove_rule(waf.WAF, profile, rule_type, rule, all_matches, dry_run)
 
 
 @mcp.tool()
@@ -1027,7 +1145,7 @@ async def deploy_waf_learned_rules(
     few broad add_waf_rule prefixes usually beat hundreds of exact URLs (add those first; covered
     entries are then just cleared). Live immediately once applied; persist with save_config.
     """
-    key = waf.rule_type(rule_type)
+    key = waf.WAF.rule_type(rule_type)
     spec = waf.RULE_TYPES[key]
     if not spec.learned:
         learnable = tuple(k for k, r in waf.RULE_TYPES.items() if r.learned)
@@ -1095,7 +1213,7 @@ async def discard_waf_learned_rules(
 
     Needs a filter (contains / max_hits) or all_entries=true, and previews by default.
     """
-    key = waf.rule_type(rule_type)
+    key = waf.WAF.rule_type(rule_type)
     spec = waf.RULE_TYPES[key]
     if not spec.learned:
         learnable = tuple(k for k, r in waf.RULE_TYPES.items() if r.learned)
@@ -1190,28 +1308,9 @@ async def import_waf_profile(
     create profile → settings → add rules → re-bind changed → remove extras. A new profile still has to
     be bound to an AppFw policy to take effect. Live immediately once applied; persist with save_config.
     """
-    if (document is None) == (file is None):
-        raise ValueError("Pass exactly one of document or file.")
-    if file is not None:
-        path = _export_path(file)
-        try:
-            document = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ValueError(f"Could not read {path}: {exc}") from exc
-    if isinstance(document, str):
-        try:
-            document = json.loads(document)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"document is not valid JSON: {exc}") from exc
-    doc = waf.check_document(document)
-    target = (target_profile or "").strip() or str((doc.get("source") or {}).get("profile") or "")
-    if not target:
-        raise ValueError("target_profile is required (the document names no source profile).")
-    extra: dict[str, Any] = {}
-    if host_map:
-        doc, extra["host_replacements"] = waf.apply_host_map(doc, host_map)
-    out = await _apply_document(doc, target, mode=mode, include_settings=include_settings, dry_run=dry_run)
-    return {**extra, **out}
+    return await _import_profile(
+        waf.WAF, document, file, target_profile, host_map, mode, include_settings, dry_run
+    )
 
 
 @mcp.tool()
@@ -1232,19 +1331,7 @@ async def rehost_waf_profile(
     mode; settings are copied only when the target is created). Rules for any host ('*') need no
     switching. Previews by default; persist with save_config.
     """
-    doc, replacements = waf.apply_host_map(await _export_document(profile), {from_host: to_host})
-    if not replacements:
-        return {
-            "profile": profile,
-            "message": f"No rule or setting references {from_host!r}; nothing to switch.",
-            "hosts": doc["hosts"],
-        }
-    target = (target_profile or "").strip() or profile
-    in_place = target == profile
-    out = await _apply_document(
-        doc, target, mode="replace", include_settings=True if in_place else None, dry_run=dry_run
-    )
-    return {"host_replacements": replacements, **out}
+    return await _rehost_profile(waf.WAF, profile, from_host, to_host, target_profile, dry_run)
 
 
 @mcp.tool()
@@ -1257,6 +1344,494 @@ async def save_config() -> dict[str, Any]:
     _require_write()
     await _get_client().action("nsconfig", "save")
     return {"saved": True}
+
+
+# ---- tools: Bot management rollout ---------------------------------------
+
+@mcp.tool()
+async def list_bot_rules(
+    profile: Annotated[str, Field(description="Bot profile name.")],
+    rule_type: Annotated[str | None, Field(description="Only this rule type: allow_list, deny_list, rate_limit, tps, captcha, ip_reputation, log_expression, km_expression, trap_url. Omit for all.")] = None,
+    contains: Annotated[str | None, Field(description="Case-insensitive substring filter on any rule value (IP, URL, category, comment).")] = None,
+    limit: Annotated[int, Field(description="Max rules returned per rule type.", ge=1, le=2000)] = 200,
+) -> dict[str, Any]:
+    """List a Bot profile's configured entries, grouped by rule type (config tree, botprofile_binding).
+
+    Covers the list-style detections: allow (whitelist) and deny (blacklist) entries, rate-limit and TPS
+    thresholds, CAPTCHA URLs, IP-reputation categories, log/KM expressions and trap URLs. Rows hold the
+    bindable attributes, so one can be passed straight to remove_bot_rule. Whether a detection runs at
+    all is a profile switch — see list_bot_detections.
+    """
+    return await _rules_overview(bot.BOT, profile, rule_type, contains, limit)
+
+
+@mcp.tool()
+async def list_bot_detections(
+    profile: Annotated[str | None, Field(description="Bot profile name; omit for appliance-wide counters only.")] = None,
+    full: Annotated[bool, Field(description="Also return the raw stat object (every counter).")] = False,
+) -> dict[str, Any]:
+    """What a Bot profile detects, and what it is actually catching (config + stat trees).
+
+    Per detection: whether it is switched on, its profile-level action list where it has one (device
+    fingerprint, trap, the signature header checks, spoofed requests), how many entries it has bound, and
+    the live counters split by outcome under 'caught' (log / drop / redirect / reset / captcha). With a
+    profile it reads stat/botprofile, otherwise the appliance-wide stat/bot. Use it before moving a
+    detection to DROP: what it counts while only logging is what would start being blocked.
+    """
+    client = _get_client()
+    out: dict[str, Any] = {"profile": profile, "scope": "profile" if profile else "appliance"}
+    if profile:
+        settings = _one(await client.get("config", bot.BOT.profile, resource_name=profile), bot.BOT.profile)
+        rules, _ = await _profile_rules(bot.BOT, profile)
+        out["signature_object"] = settings.get("signature")
+        out["detections"] = bot.detection_config(settings, {k: len(v) for k, v in rules.items()})
+        stats = _one(await client.get("stat", "botprofile", args={"name": profile}), "botprofile")
+    else:
+        stats = _one(await client.get("stat", "bot"), "bot")
+    summary = bot.stat_summary(stats)
+    out["traffic"] = summary["traffic"]
+    out["caught"] = summary["detections"]
+    out["configured"] = summary["configured"]
+    if full:
+        out["raw_stats"] = stats
+    return out
+
+
+@mcp.tool()
+async def add_bot_rule(
+    profile: Annotated[str, Field(description="Bot profile name; comma-separate several to add the same entry to each.")],
+    rule: Annotated[str, Field(description="Preset: allow_ip, allow_expression, block_ip, block_expression, rate_limit_url, rate_limit_source_ip, rate_limit_session, rate_limit_geo, tps_source_ip, tps_url, tps_geo, tps_host, captcha, ip_reputation, trap_url, log_expression, km_expression — or 'raw' (rule_type + binding_attrs).")],
+    value: Annotated[str | None, Field(description="The entry's main value: an IP or CIDR for allow_ip / block_ip; also accepted instead of the named parameter below for the other presets.")] = None,
+    url: Annotated[str | None, Field(description="URL path for rate_limit_url / captcha / trap_url, e.g. '/login' or '/trap'.")] = None,
+    expression: Annotated[str | None, Field(description="NetScaler policy expression for allow_expression / block_expression / log_expression / km_expression.")] = None,
+    name: Annotated[str | None, Field(description="Name for a log_expression / km_expression entry.")] = None,
+    country: Annotated[str | None, Field(description="ISO country code for rate_limit_geo, e.g. 'DE'.")] = None,
+    cookie: Annotated[str | None, Field(description="Session cookie name for rate_limit_session.")] = None,
+    category: Annotated[str | None, Field(description="IP-reputation category for ip_reputation, e.g. BOTNETS, TOR_PROXY, SCANNERS, PROXY.")] = None,
+    actions: Annotated[list[str] | None, Field(description="What happens when the entry matches: NONE, LOG, DROP, REDIRECT, RESET, MITIGATION, or RESPOND_STATUS_TOO_MANY_REQUESTS (rate limit). Deny/rate-limit/CAPTCHA/IP-reputation default to ['DROP'], TPS to ['LOG']; allow-list and expression entries take none.")] = None,
+    rate: Annotated[int | None, Field(description="Rate-limit requests per timeslice (default 100).", ge=1)] = None,
+    timeslice: Annotated[int | None, Field(description="Rate-limit timeslice in milliseconds (default 1000).", ge=10)] = None,
+    threshold: Annotated[int | None, Field(description="TPS threshold: requests per second that trips the detection.", ge=1)] = None,
+    percentage: Annotated[int | None, Field(description="TPS percentage rise over the moving average that trips the detection.", ge=1)] = None,
+    log: Annotated[bool, Field(description="allow_ip / allow_expression: also log the allowed requests.")] = False,
+    rule_type: Annotated[str | None, Field(description="rule='raw' only: the rule type (see list_bot_rules).")] = None,
+    binding_attrs: Annotated[dict[str, Any] | None, Field(description="rule='raw' only: NITRO binding attributes, e.g. {\"bot_whitelist\": true, \"bot_whitelist_type\": \"SUBNET\", \"bot_whitelist_value\": \"10.0.0.0/24\"}.")] = None,
+    comment: Annotated[str | None, Field(description="Comment stored on the entry.")] = None,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+) -> dict[str, Any]:
+    """Add a Bot management entry without hand-writing NITRO attributes (WRITE — requires NETSCALER_ALLOW_WRITE).
+
+    allow_ip / block_ip classify the value themselves (IPv4, IPv6, SUBNET, IPv6_SUBNET), so
+    add_bot_rule(rule='allow_ip', value='10.0.0.0/24') whitelists a monitoring range and
+    rule='block_ip', actions=['DROP'] blocks one; rate limiting, TPS, CAPTCHA, IP reputation, trap URLs
+    and expression entries follow the same shape. The detection also has to be switched on at profile
+    level — set_bot_detections does that. Skips profiles that already have the entry; previews by
+    default. Live immediately once applied; persist with save_config.
+    """
+    if rule == "raw":
+        key = bot.BOT.rule_type(rule_type)
+        row = waf.clean_binding(dict(binding_attrs or {}))
+    else:
+        key, row = bot.easy_rule(
+            rule, value=value, url=url, expression=expression, name=name, country=country, cookie=cookie,
+            category=category, actions=actions, rate=rate, timeslice=timeslice, threshold=threshold,
+            percentage=percentage, log=log,
+        )
+    return await _apply_rule(bot.BOT, profile, key, row, comment=comment, dry_run=dry_run)
+
+
+@mcp.tool()
+async def remove_bot_rule(
+    profile: Annotated[str, Field(description="Bot profile name.")],
+    rule_type: Annotated[str, Field(description="Rule type, as in list_bot_rules (e.g. 'allow_list').")],
+    rule: Annotated[dict[str, Any], Field(description="The entry to remove: a row from list_bot_rules, or just its selector and value, e.g. {\"bot_whitelist\": true, \"bot_whitelist_value\": \"10.0.0.0/24\"}.")],
+    all_matches: Annotated[bool, Field(description="Remove every entry matching the given attributes (otherwise several matches is an error).")] = False,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+) -> dict[str, Any]:
+    """Remove (unbind) a Bot entry from a profile (WRITE — requires NETSCALER_ALLOW_WRITE).
+
+    Matches live entries on the identifying attributes you pass (the detection's boolean selector plus
+    its value, type, category or URL); other keys are ignored. Previews by default. Live immediately
+    once applied; persist with save_config.
+    """
+    return await _remove_rule(bot.BOT, profile, rule_type, rule, all_matches, dry_run)
+
+
+@mcp.tool()
+async def set_bot_detections(
+    profile: Annotated[str, Field(description="Bot profile name.")],
+    detections: Annotated[list[str], Field(description="Detections to change: allow_list, deny_list, rate_limit, tps, ip_reputation, device_fingerprint, trap, km_detection, headless_browser, signature_no_user_agent, signature_multiple_user_agent, spoofed_request — or ['all'].")],
+    enable: Annotated[bool | None, Field(description="Switch the detections on (true) or off (false); omit to change actions only.")] = None,
+    actions: Annotated[list[str] | None, Field(description="Action list for the detections that carry one on the profile (device_fingerprint, trap, signature_no_user_agent, signature_multiple_user_agent, spoofed_request): NONE, LOG, DROP, REDIRECT, RESET, MITIGATION — CHECKLAST instead of NONE for signature_multiple_user_agent.")] = None,
+    signature: Annotated[str | None, Field(description="Bind this botsignature object to the profile (static signature detection); see list_signatures.")] = None,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+) -> dict[str, Any]:
+    """Switch Bot detections on/off and set their actions — the bot counterpart of the WAF learn→block
+    step (WRITE — requires NETSCALER_ALLOW_WRITE).
+
+    Allow/deny lists, rate limiting, TPS and IP reputation only have an on/off switch at profile level;
+    each of their entries carries its own action (add_bot_rule). Device fingerprint, trap, the signature
+    header checks and spoofed-request detection do have a profile-level action list. A safe rollout runs
+    them on LOG first, then moves to DROP once list_bot_detections shows what is being caught. Shows
+    before/after per detection; previews by default. Live immediately once applied; persist with
+    save_config.
+    """
+    if enable is None and not actions and not signature:
+        raise ValueError("Pass enable, actions and/or signature.")
+    if not dry_run:
+        _require_write()
+    current = _one(await _get_client().get("config", bot.BOT.profile, resource_name=profile), bot.BOT.profile)
+    names = [d.strip().lower() for d in detections if d and d.strip()]
+    everything = names == ["all"]
+    if everything:
+        names = list(bot.DETECTIONS)
+    table: dict[str, Any] = {}
+    changes: dict[str, Any] = {}
+    for name in names:
+        key = bot.detection(name)
+        spec = bot.DETECTIONS[key]
+        row: dict[str, Any] = {}
+        if enable is not None:
+            if spec.enable:
+                after = "ON" if enable else "OFF"
+                row["enabled"] = {"before": current.get(spec.enable), "after": after}
+                if waf.settings_changes({spec.enable: after}, current):
+                    changes[spec.enable] = after
+            else:
+                row["enabled"] = "always on (no switch)"
+        if actions:
+            if spec.action:
+                after_actions = bot.detection_actions(key, actions)
+                row["action"] = {"before": current.get(spec.action), "after": after_actions}
+                if waf.settings_changes({spec.action: after_actions}, current):
+                    changes[spec.action] = after_actions
+            elif everything:
+                row["action"] = "per entry (add_bot_rule)"
+            else:
+                raise ValueError(f"'{key}' has no profile-level action; set it per entry with add_bot_rule.")
+        table[key] = row
+    if signature:
+        table["signature_object"] = {"before": current.get("signature"), "after": signature}
+        if waf.settings_changes({"signature": signature}, current):
+            changes["signature"] = signature
+    if changes and not dry_run:
+        await _get_client().update(bot.BOT.profile, {"name": profile, **changes})
+    return {"profile": profile, "dry_run": dry_run, "changed": len(changes), "detections": table}
+
+
+@mcp.tool()
+async def export_bot_profile(
+    profile: Annotated[str, Field(description="Bot profile name.")],
+    host_map: Annotated[dict[str, str] | None, Field(description="Rewrite hostnames on the way out, e.g. {\"app.test.corp\": \"app.corp\"} (bot URLs are usually paths, so this often changes nothing).")] = None,
+    save_as: Annotated[str | None, Field(description="Save to NETSCALER_EXPORT_DIR under this bare file name (e.g. 'bot_app-test.json'); the result is then a summary instead of the whole document.")] = None,
+) -> dict[str, Any]:
+    """Export a Bot profile — its detection settings and every entry — as a portable JSON document.
+
+    import_bot_profile consumes it on this or another appliance: keep it in git as the app's bot
+    baseline, diff environments, or seed another environment. Binding types this server doesn't model
+    are kept under 'other_bindings' for reference but are not imported. Read-only on the appliance.
+    """
+    return await _export_profile(bot.BOT, profile, host_map, save_as)
+
+
+@mcp.tool()
+async def import_bot_profile(
+    document: Annotated[dict[str, Any] | str | None, Field(description="An export_bot_profile document (object or JSON string).")] = None,
+    file: Annotated[str | None, Field(description="Or a bare file name in NETSCALER_EXPORT_DIR, e.g. 'bot_app-test.json'.")] = None,
+    target_profile: Annotated[str | None, Field(description="Profile to import into (created if missing); defaults to the document's source profile name.")] = None,
+    host_map: Annotated[dict[str, str] | None, Field(description="Switch hostnames on the way in, e.g. {\"app.test.corp\": \"app.corp\"}.")] = None,
+    mode: Annotated[str, Field(description="'merge' adds missing entries only; 'replace' makes the profile's entries match the document — it also re-binds changed ones and REMOVES entries not in the document.")] = "merge",
+    include_settings: Annotated[bool | None, Field(description="Apply the document's profile settings (detection switches and actions). Default: only when the profile is created, so an existing profile keeps its own switches.")] = None,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+) -> dict[str, Any]:
+    """Import a Bot profile document — copy a tuned profile to another environment or appliance
+    (WRITE — requires NETSCALER_ALLOW_WRITE).
+
+    Plans against the live target first: settings changes, and per rule type how many entries are added,
+    updated and removed (the preview shows up to 25 of each). Apply order is safe for live traffic:
+    create profile → settings → add entries → re-bind changed → remove extras. A new profile still has
+    to be selected by a bot policy to take effect (list_enforcement). Live immediately once applied;
+    persist with save_config.
+    """
+    return await _import_profile(
+        bot.BOT, document, file, target_profile, host_map, mode, include_settings, dry_run
+    )
+
+
+@mcp.tool()
+async def rehost_bot_profile(
+    profile: Annotated[str, Field(description="Bot profile whose entries to switch.")],
+    from_host: Annotated[str, Field(description="Hostname in the current entries, e.g. 'app.test.corp'.")],
+    to_host: Annotated[str, Field(description="New hostname, e.g. 'app.corp'.")],
+    target_profile: Annotated[str | None, Field(description="Write the rehosted copy into this profile (created if missing) and leave the source untouched.")] = None,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+) -> dict[str, Any]:
+    """Switch a Bot profile's entries to another hostname (WRITE — requires NETSCALER_ALLOW_WRITE).
+
+    The bot counterpart of rehost_waf_profile, for the entries that carry absolute URLs or host-bearing
+    expressions. Most bot URLs (rate-limit, CAPTCHA, trap) are paths and need no switching, so this
+    often reports nothing to do — copy such a profile with import_bot_profile instead. Previews by
+    default; persist with save_config.
+    """
+    return await _rehost_profile(bot.BOT, profile, from_host, to_host, target_profile, dry_run)
+
+
+# ---- tools: signatures, enforcement and violations (WAF + Bot) -----------
+
+# Per feature: signature resource + projected fields, settings resource + projected fields.
+_SIGNATURE_SOURCES = {
+    "waf": (
+        "appfwsignatures", ("name", "src", "encryptedversion"),
+        "appfwsettings",
+        ("signatureautoupdate", "signatureurl", "learning", "centralizedlearning", "defaultprofile",
+         "undefaction", "sessiontimeout", "learnratelimit", "malformedreqaction", "ceflogging"),
+    ),
+    "bot": (
+        "botsignature", ("name", "src", "comment", "response"),
+        "botsettings",
+        ("signatureautoupdate", "signatureurl", "defaultprofile", "defaultnonintrusiveprofile",
+         "javascriptname", "sessiontimeout", "trapurlautogenerate", "proxyserver", "proxyport"),
+    ),
+}
+_POLICY_FIELDS = ("name", "rule", "profilename", "hits", "undefhits", "comment")
+_BOUND_FIELDS = ("boundto", "priority", "labeltype", "labelname", "gotopriorityexpression", "activepolicy")
+_LOG_CHECK = re.compile(r"\b(?:APPFW|BOT)_[A-Z0-9_]+")
+_LOG_IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_LOG_URL = re.compile(r"https?://\S+|(?<=\s)/\S*")
+
+
+def _features(kind: str) -> list[str]:
+    """Resolve a kind/feature argument into ['waf'], ['bot'] or both."""
+    key = (kind or "both").strip().lower()
+    if key not in ("waf", "bot", "both"):
+        raise ValueError("kind must be 'waf', 'bot' or 'both'.")
+    return ["waf", "bot"] if key == "both" else [key]
+
+
+async def _profile_names() -> list[str]:
+    """AppFw + Bot profile names, longest first, to attribute log lines to a profile (best effort)."""
+    names: list[str] = []
+    for resource in ("appfwprofile", "botprofile"):
+        try:
+            env = await _get_client().get("config", resource, attrs=("name",))
+        except NitroError:
+            continue
+        names += [str(r.get("name")) for r in _rows(env, resource) if r.get("name")]
+    return sorted(set(names), key=len, reverse=True)
+
+
+async def _enforcement(kind: waf.ProfileKind, profile: str | None, limit: int) -> dict[str, Any]:
+    """Policies of one family with their bind points, plus profiles no policy selects."""
+    client = _get_client()
+    policies = _rows(await client.get("config", kind.policy), kind.policy)
+    if profile:
+        policies = [p for p in policies if str(p.get("profilename") or "") == profile]
+    selected = {str(p.get("profilename") or "") for p in policies}
+    rows: list[dict[str, Any]] = []
+    for policy in policies[: _clamp(limit, default=50, maximum=200)]:
+        name = str(policy.get("name") or "")
+        row = {k: policy.get(k) for k in _POLICY_FIELDS if policy.get(k) not in (None, "")}
+        bindings: list[dict[str, Any]] = []
+        try:
+            env = await client.get("config", f"{kind.policy}_binding", resource_name=name)
+        except NitroError as exc:
+            row["bindings_error"] = str(exc)
+        else:
+            for attr, bound_rows in _one(env, f"{kind.policy}_binding").items():
+                if not attr.endswith("_binding") or not isinstance(bound_rows, list):
+                    continue
+                where = attr.removeprefix(f"{kind.policy}_").removesuffix("_binding")
+                for bound in bound_rows:
+                    entry = {"bound_to_type": where}
+                    entry.update({k: bound.get(k) for k in _BOUND_FIELDS if bound.get(k) not in (None, "")})
+                    bindings.append(entry)
+        row["bindings"] = bindings
+        row["enforced"] = bool(bindings)
+        rows.append(row)
+    unused: list[str] = []
+    try:
+        env = await client.get("config", kind.profile, attrs=("name", "builtin"))
+    except NitroError:
+        env = {}
+    for entry in _rows(env, kind.profile):
+        name = str(entry.get("name") or "")
+        builtin = entry.get("builtin") or []
+        if name and name not in selected and "IMMUTABLE" not in (builtin if isinstance(builtin, list) else [builtin]):
+            unused.append(name)
+    return {"policies": rows, "profiles_without_policy": sorted(unused)}
+
+
+@mcp.tool()
+async def waf_violations(
+    profile: Annotated[str | None, Field(description="AppFw profile name; omit for appliance-wide counters.")] = None,
+    include_zero: Annotated[bool, Field(description="Also list checks that have counted nothing.")] = False,
+    full: Annotated[bool, Field(description="Also return the raw stat object (every counter).")] = False,
+) -> dict[str, Any]:
+    """Which WAF checks are firing, per security check (stat tree, appfwprofile / appfw).
+
+    Buckets NITRO's flat counters into one row per check with its 'violations' and 'logged' counts, plus
+    request/response totals. This is the readiness check before switching a check to block: violations
+    counted while the check only logs are what would start being blocked. With a profile it reads
+    stat/appfwprofile, otherwise appliance-wide stat/appfw. NITRO exposes no per-violation detail — use
+    recent_security_violations for the log lines behind the numbers.
+    """
+    client = _get_client()
+    if profile:
+        stats = _one(await client.get("stat", "appfwprofile", args={"name": profile}), "appfwprofile")
+    else:
+        stats = _one(await client.get("stat", "appfw"), "appfw")
+    summary = waf.violation_summary(stats)
+    checks = summary["checks"]
+    if not include_zero:
+        checks = {k: v for k, v in checks.items() if any(v.values())}
+    out: dict[str, Any] = {
+        "profile": profile,
+        "scope": "profile" if profile else "appliance",
+        "traffic": summary["traffic"],
+        "checks": checks,
+    }
+    if full:
+        out["raw_stats"] = stats
+    return out
+
+
+@mcp.tool()
+async def list_signatures(
+    kind: Annotated[str, Field(description="'waf', 'bot' or 'both'.")] = "both",
+    full: Annotated[bool, Field(description="Return full objects instead of a trimmed summary.")] = False,
+) -> dict[str, Any]:
+    """Installed WAF / Bot signature objects and the matching appliance settings (config tree).
+
+    Signatures are the vendor rule sets both features match requests against, so a stale set is a real
+    gap. Per object NITRO exposes only the source URL and an 'encryptedversion' integer — there is no
+    version string or update timestamp, so compare that integer or check the source. 'settings' carries
+    the signature auto-update switch and URL plus the related appliance defaults (appfwsettings /
+    botsettings). Read-only.
+    """
+    client = _get_client()
+    out: dict[str, Any] = {}
+    for feature in _features(kind):
+        resource, fields, settings_resource, settings_fields = _SIGNATURE_SOURCES[feature]
+        section: dict[str, Any] = {}
+        try:
+            rows = _rows(await client.get("config", resource), resource)
+            section["signatures"] = rows if full else [_pick(r, fields) for r in rows]
+        except NitroError as exc:
+            section["signatures_error"] = str(exc)
+        try:
+            settings = _one(await client.get("config", settings_resource), settings_resource)
+            section["settings"] = settings if full else _pick(settings, settings_fields)
+        except NitroError as exc:
+            section["settings_error"] = str(exc)
+        out[feature] = section
+    return out
+
+
+@mcp.tool()
+async def update_signatures(
+    kind: Annotated[str, Field(description="'waf' or 'bot'.")],
+    name: Annotated[str, Field(description="Signature object name, as listed by list_signatures.")],
+    merge_default: Annotated[bool, Field(description="WAF only: merge the fetched rules with the default signatures (NITRO 'mergedefault').")] = False,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+) -> dict[str, Any]:
+    """Re-fetch a signature object from its configured source URL (WRITE — requires NETSCALER_ALLOW_WRITE).
+
+    The same action as 'update appfw signatures' / 'update bot signatures': it pulls the newest rules
+    from the object's own src URL and cannot change that URL. The appliance has to reach that URL (NITRO
+    answers 3319 / 1768 when it cannot, 3323 when a sha1 check fails). New rules take effect at once for
+    every profile bound to the object, so prefer a change window; persist with save_config.
+    """
+    features = _features(kind)
+    if len(features) != 1:
+        raise ValueError("kind must be 'waf' or 'bot' for an update.")
+    resource = _SIGNATURE_SOURCES[features[0]][0]
+    body: dict[str, Any] = {"name": name}
+    if features[0] == "waf" and merge_default:
+        body["mergedefault"] = True
+    if dry_run:
+        return {
+            "dry_run": True,
+            "kind": features[0],
+            "would_post": f"config/{resource}?action=update",
+            "body": body,
+            "next": "Call again with dry_run=false to update (needs NETSCALER_ALLOW_WRITE).",
+        }
+    _require_write()
+    await _get_client().action(resource, "update", body)
+    return {"dry_run": False, "kind": features[0], "updated": name}
+
+
+@mcp.tool()
+async def list_enforcement(
+    kind: Annotated[str, Field(description="'waf', 'bot' or 'both'.")] = "both",
+    profile: Annotated[str | None, Field(description="Only policies that select this profile.")] = None,
+    limit: Annotated[int, Field(description="Max policies inspected per feature (each costs one extra call).", ge=1, le=200)] = 50,
+) -> dict[str, Any]:
+    """Trace the enforcement path: which policies select a profile and where those policies are bound.
+
+    A profile does nothing until a policy selects it and that policy is bound — to a vserver, a policy
+    label or globally. Per policy this shows its rule, hit counters and every bind point, flags policies
+    that are bound nowhere ('enforced': false), and lists profiles no policy selects. That is the usual
+    reason a freshly imported or rehosted profile seems to have no effect. Read-only.
+    """
+    return {
+        feature: await _enforcement(waf.WAF if feature == "waf" else bot.BOT, profile, limit)
+        for feature in _features(kind)
+    }
+
+
+@mcp.tool()
+async def recent_security_violations(
+    feature: Annotated[str, Field(description="'waf', 'bot' or 'both' — which log lines to keep (APPFW_* / BOT_*).")] = "both",
+    contains: Annotated[str | None, Field(description="Only lines containing this (case-insensitive): a URL, profile name or client IP.")] = None,
+    loglevel: Annotated[str, Field(description="Syslog level to pull: ALL, EMERGENCY, ALERT, CRITICAL, ERROR, WARNING, NOTICE, INFORMATIONAL or DEBUG.")] = "ALL",
+    limit: Annotated[int, Field(description="How many recent messages to pull (NITRO caps at 256).", ge=1, le=256)] = 100,
+) -> dict[str, Any]:
+    """Recent WAF / Bot log lines from the appliance's audit messages (config tree, auditmessages).
+
+    NITRO has no structured violation records, so this pulls the raw syslog buffer and keeps the APPFW_*
+    / BOT_* lines, pulling out the check, the profile, the client IP and the URL where a line carries
+    them — the answer to "why was this request blocked?". Lines only exist while the check logs (its
+    action list includes log), the format varies by build and CEF setting (the raw line is always
+    included), and the account needs permission for 'show audit messages'. Read-only.
+    """
+    wanted = tuple(f"{'APPFW' if f == 'waf' else 'BOT'}_" for f in _features(feature))
+    env = await _get_client().get(
+        "config",
+        "auditmessages",
+        args={"loglevel": (loglevel or "ALL").strip().upper(), "numofmesgs": _clamp(limit, default=100, maximum=256)},
+    )
+    profiles = await _profile_names()
+    messages: list[dict[str, Any]] = []
+    by_check: dict[str, int] = {}
+    for row in _rows(env, "auditmessages"):
+        line = str(row.get("value") or "")
+        found = _LOG_CHECK.search(line)
+        if not found or not found.group().startswith(wanted):
+            continue
+        if contains and contains.lower() not in line.lower():
+            continue
+        check = found.group()
+        by_check[check] = by_check.get(check, 0) + 1
+        tail = line[found.end():]
+        url = _LOG_URL.search(tail)
+        client_ip = _LOG_IP.search(tail)
+        lowered = line.lower()
+        messages.append({
+            "check": check,
+            "profile": next((p for p in profiles if p and p in line), None),
+            "client_ip": client_ip.group() if client_ip else None,
+            "url": url.group() if url else None,
+            "blocked": "blocked" in lowered and "not blocked" not in lowered,
+            "raw": line,
+        })
+    return {
+        "feature": (feature or "both").strip().lower(),
+        "loglevel": (loglevel or "ALL").strip().upper(),
+        "count": len(messages),
+        "by_check": dict(sorted(by_check.items(), key=lambda kv: -kv[1])),
+        "messages": messages,
+    }
 
 
 # ---- tool: raw escape hatch ---------------------------------------------

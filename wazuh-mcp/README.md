@@ -128,6 +128,53 @@ With the gateway also on `atlas-net`, register this server at `http://wazuh-mcp:
 [README → *Behind an MCP gateway*](../README.md#behind-an-mcp-gateway-eg-mcpjungle) for the full
 gateway walkthrough and client setup.
 
+### Multiple instances (one image, several env files)
+
+The same image runs as several containers side by side, each with its own env file —
+for example one container per Wazuh deployment, or a second set of credentials with other rights.
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+
+```yaml
+x-wazuh: &wazuh
+  image: ghcr.io/0x3e4/wazuh-mcp:latest
+  environment:
+    MCP_TRANSPORT: streamable-http
+    MCP_HOST: 0.0.0.0
+    MCP_PORT: "8000"
+  restart: unless-stopped
+  networks: [atlas-net]
+
+services:
+  wazuh-mcp:                    # existing shared instance
+    <<: *wazuh
+    container_name: wazuh-mcp
+    env_file: ./wazuh.env
+
+  wazuh-mcp-instance-a:         # a second Wazuh deployment
+    <<: *wazuh
+    container_name: wazuh-mcp-instance-a
+    env_file: ./env/instance_a.env
+
+networks:
+  atlas-net:
+    external: true
+```
+
+- `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
+  env/instance_a.env`) with instance a's Wazuh endpoints and credentials. `*.env` is gitignored, so it stays local.
+- Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
+  gateway reaches each one by its `container_name`. Register them under separate names:
+
+  ```bash
+  mcpjungle register --name wazuh --url http://wazuh-mcp:8000/mcp
+  mcpjungle register --name wazuh-instance-a --url http://wazuh-mcp-instance-a:8000/mcp
+  ```
+
+- `<<:` merges shallowly: an instance that sets its own `environment:` replaces the anchor's whole
+  block, so keep per-instance settings in its env file.
+- Over stdio no compose is needed — register a second server with the other env file:
+  `claude mcp add wazuh-instance-a -- docker run -i --rm --env-file /abs/path/to/env/instance_a.env wazuh-mcp`
+
 ## Inspect / test the tools
 
 ```bash

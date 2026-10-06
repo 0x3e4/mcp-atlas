@@ -4,13 +4,13 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "netscaler-mcp"
-version = "0.2.0"
-description = "NetScaler ADC (NITRO) MCP server — vservers, services, SSL certs, HA, system stats, WAF rollout (opt-in writes)"
+version = "0.3.0"
+description = "NetScaler ADC (NITRO) MCP server — vservers, services, SSL certs, HA, system stats, WAF + Bot rollout (opt-in writes)"
 readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"
 authors = [{ name = "cai", email = "cai@nohub.lol" }]
-keywords = ["mcp", "netscaler", "citrix-adc", "nitro", "load-balancer"]
+keywords = ["mcp", "netscaler", "citrix-adc", "nitro", "load-balancer", "waf", "bot-management"]
 dependencies = [
     "mcp[cli]>=1.28,<2",
     "httpx>=0.28",

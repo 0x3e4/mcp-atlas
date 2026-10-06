@@ -11,12 +11,12 @@ systems. Each server is **self-contained** — its own source, tests, Dockerfile
 |--------|--------------|
 | [defender-mcp](defender-mcp/) | Query **Microsoft Defender XDR** via the Microsoft Graph security API — advanced hunting (KQL), incidents, alerts, devices and vulnerabilities, plus raw `graph_get` / `graph_hunt` escape hatches. |
 | [wazuh-mcp](wazuh-mcp/) | Query a **Wazuh** deployment — alerts, the full event **archive** (every collected event, not just rule hits), vulnerabilities, agents, inventory, rules, SCA and manager status, across the Indexer and Manager APIs. |
-| [netscaler-mcp](netscaler-mcp/) | Query a **NetScaler ADC** appliance (or HA pair) over the **NITRO REST API** — LB/CS/GSLB vservers + state, services and servers, SSL cert expiry, **GSLB** services/sites, **DNS** records/zones/nameservers, **WAF (AppFw)** and **Bot** profiles/policies + hit stats, HA status, and box CPU/memory/throughput, plus a raw `nitro_get` escape hatch. **WAF rollout** tools cover learned rules, a URL inventory and JSON export. Optional **write** tools (easy global rules, deploy learned rules, learn→block, import/rehost profiles across environments) sit behind `NETSCALER_ALLOW_WRITE`. |
+| [netscaler-mcp](netscaler-mcp/) | Query a **NetScaler ADC** appliance (or HA pair) over the **NITRO REST API** — LB/CS/GSLB vservers + state, services and servers, SSL cert expiry, **GSLB** services/sites, **DNS** records/zones/nameservers, **WAF (AppFw)** and **Bot** profiles/policies + hit stats, HA status, and box CPU/memory/throughput, plus a raw `nitro_get` escape hatch. **WAF and Bot rollout** tools cover learned rules, a URL inventory, per-check violation counters, bot detections and entries, signature currency, the enforcement path (which policy applies a profile) and the recent violation log lines, plus JSON export/import of profiles. Optional **write** tools (easy global WAF rules, deploy learned rules, learn→block, bot allow/deny lists and rate limits, signature re-fetch, import/rehost profiles across environments) sit behind `NETSCALER_ALLOW_WRITE`. |
 | [fortigate-mcp](fortigate-mcp/) | Query a **FortiGate** firewall over the **FortiOS REST API** — firewall policies (with live hit counters), address/service objects, VIPs, interfaces, routing, IPsec VPN tunnel status, HA, and system/license health, plus a raw `fortios_get` escape hatch. |
 | [azure-devops-mcp](azure-devops-mcp/) | Query an on-prem **Azure DevOps Server** (formerly TFS) over its REST API — projects, teams, Git repos/branches/commits/pull requests, work items (WIQL), build/pipeline definitions and runs, releases and the wiki, plus a raw `azdo_get` escape hatch. Optional **write** tools (create/update work items, create/update wiki pages) behind `AZDO_ALLOW_WRITE`. |
-| [bookstack-mcp](bookstack-mcp/) | Query a **BookStack** wiki over its REST API — browse the shelves/books/chapters/pages hierarchy, read and search page content, list attachments, and export pages/books to markdown, plus a raw `bookstack_get` escape hatch. |
+| [bookstack-mcp](bookstack-mcp/) | Query a **BookStack** wiki over its REST API — browse the shelves/books/chapters/pages hierarchy, read and search page content, list attachments, and export pages/books to markdown, plus a raw `bookstack_get` escape hatch. Optional **write** tools (create/update pages, chapters, books and shelves, comment on pages) behind `BOOKSTACK_ALLOW_WRITE`. |
 | [prtg-mcp](prtg-mcp/) | Query a **PRTG Network Monitor** (Paessler) server over its HTTP API — sensors/devices/groups/probes and their up/down state, sensor channels and details, the event log, core/system health, and historic data, plus a raw `prtg_get` escape hatch. |
-| [zammad-mcp](zammad-mcp/) | Query a **Zammad** helpdesk over its REST API — browse/search tickets, read the conversation (articles), look up users/organizations and reference data, plus a raw `zammad_get` escape hatch. Optional **write** tools (add note/comment, update ticket, create ticket) behind `ZAMMAD_ALLOW_WRITE`. |
+| [zammad-mcp](zammad-mcp/) | Query a **Zammad** helpdesk over its REST API — browse/search tickets, read the conversation (articles), look up users/organizations and reference data, plus a raw `zammad_get` escape hatch. Optional **write** tools (add note/comment, update/create/tag tickets) behind `ZAMMAD_ALLOW_WRITE`. |
 | [snipeit-mcp](snipeit-mcp/) | Query a **Snipe-IT** asset-management instance over its REST API — assets (by tag/serial), who has what, and the model/category/location/license/accessory catalogs, plus a raw `snipeit_get` escape hatch. Optional **write** tools (check out/in, update, create, audit assets) behind `SNIPEIT_ALLOW_WRITE`. |
 | [netbox-mcp](netbox-mcp/) | Query a **NetBox** DCIM/IPAM source of truth over its REST API — devices and interfaces, IP addresses and prefixes, virtual machines, and the site/rack/VLAN/VRF/cluster/tenant catalogs, plus a raw `netbox_get` escape hatch. |
 | [vcenter-mcp](vcenter-mcp/) | Query a **VMware vCenter** server over the vSphere Automation REST API — VMs and power state, hosts, clusters, datastores, networks, resource pools, and appliance version/health, plus a raw `vcenter_get` escape hatch. |
@@ -82,6 +82,14 @@ For example, register the gateway with Claude Code:
 ```bash
 claude mcp add --transport http atlas-gateway http://<gateway-host>:8080/mcp
 ```
+
+### Several instances of one server
+
+One image can run as several containers, each with its own env file: for example a shared
+read-only BookStack next to a write-enabled one with another token, or one FortiGate server per
+firewall. Give each container its own `container_name` and register each one with the gateway under
+its own name. Every server README has a ready-to-copy compose example (*Multiple instances*, under
+*Always-on HTTP*).
 
 ### GitHub Copilot (VS Code, agent mode)
 

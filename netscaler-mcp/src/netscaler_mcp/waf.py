@@ -241,6 +241,175 @@ class RuleType:
     learned: tuple[tuple[str, tuple[str, ...]], ...] = ()
     # appfwlearningdata DELETE arg <- binding attr carrying its value (default: same-named identity attrs).
     learned_delete: tuple[tuple[str, str], ...] = ()
+    # Identity attributes beyond ``identity``: AppFw bindings all carry a ruletype, bot bindings none.
+    ident_extra: tuple[str, ...] = ("ruletype",)
+    comment_attr: str = "comment"  # bot bindings call it bot_bind_comment
+
+
+@dataclass(frozen=True)
+class ExtraSettings:
+    """A second per-profile resource carried in export documents (AppFw learning thresholds)."""
+
+    resource: str  # NITRO resource, e.g. appfwlearningsettings
+    ident: str  # attribute naming the profile, e.g. profilename
+    doc_key: str  # section name inside the export document
+    drop: frozenset[str] = frozenset()  # attributes a GET returns but PUT rejects
+
+
+@dataclass(frozen=True)
+class ProfileKind:
+    """A security profile family — AppFw (``waf.WAF``) or Bot (``bot.BOT``) — and its NITRO resources.
+
+    The rule, document and plan machinery is shared: the families differ only in their resources,
+    rule-type table and document format, so one implementation drives both tool families.
+    """
+
+    key: str  # "waf" | "bot"
+    label: str  # human label used in tool output and errors
+    profile: str  # profile resource (appfwprofile / botprofile)
+    aggregate: str  # bindings aggregate resource (<profile>_binding)
+    policy: str  # policy resource (appfwpolicy / botpolicy)
+    types: dict[str, RuleType]  # rule types by friendly key
+    doc_format: str  # export document format tag
+    profile_drop: frozenset[str]  # profile attrs a GET returns but add/update reject
+    extra: ExtraSettings | None = None
+    create_attrs: tuple[str, ...] = ()  # settings to pass when creating the profile (AppFw: type)
+
+    # ---- rule types
+
+    def rule_type(self, name: str | None) -> str:
+        """Validate a rule type name (case-insensitive) and return its key."""
+        key = (name or "").strip().lower()
+        if key not in self.types:
+            raise ValueError(f"rule_type must be one of {tuple(self.types)}; got {name!r}.")
+        return key
+
+    def spec(self, name: str | None) -> RuleType:
+        """The RuleType behind a rule type name."""
+        return self.types[self.rule_type(name)]
+
+    def split_bindings(self, aggregate: dict[str, Any]) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+        """Split a ``<profile>_binding`` object into modelled rule types and other binding arrays."""
+        by_binding = {rule.binding: key for key, rule in self.types.items()}
+        rules: dict[str, list[dict]] = {}
+        other: dict[str, list[dict]] = {}
+        for attr, rows in aggregate.items():
+            if not attr.endswith("_binding"):
+                continue
+            rows = rows if isinstance(rows, list) else [rows]
+            if attr in by_binding:
+                rules[by_binding[attr]] = rows
+            elif rows:
+                other[attr] = rows
+        return rules, other
+
+    def hosts_in(self, rules: dict[str, list[dict]]) -> dict[str, int]:
+        """Count the hostnames referenced by rule URLs ('*' and relative URLs skipped), most used first."""
+        counts: dict[str, int] = {}
+        for key, rows in rules.items():
+            rule = self.types.get(key)
+            for row in rows if rule else ():
+                for attr in rule.url_attrs:
+                    host = parse_url_pattern(str(row.get(attr) or ""))["host"]
+                    if host and host != "*":
+                        counts[host] = counts.get(host, 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    # ---- settings, documents and plans
+
+    def clean_settings(self, obj: dict[str, Any]) -> dict[str, Any]:
+        """Settable, non-empty attributes of a profile object."""
+        return clean_attrs(obj, self.profile_drop)
+
+    def build_document(
+        self,
+        *,
+        profile: str,
+        appliance: str,
+        exported_at: str,
+        settings: dict[str, Any],
+        rules: dict[str, list[dict]],
+        other_bindings: dict[str, list[dict]],
+        extra_settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Assemble the portable export document for one profile."""
+        doc: dict[str, Any] = {
+            "format": self.doc_format,
+            "version": DOC_VERSION,
+            "exported_at": exported_at,
+            "source": {"appliance": appliance, "profile": profile},
+            "hosts": self.hosts_in(rules),
+            "settings": self.clean_settings(settings),
+        }
+        if self.extra is not None:
+            doc[self.extra.doc_key] = clean_attrs(extra_settings or {}, self.extra.drop)
+        doc["rules"] = {k: [clean_binding(r) for r in rows] for k, rows in rules.items() if rows}
+        doc["other_bindings"] = {
+            k: [clean_binding(r) for r in rows] for k, rows in other_bindings.items() if rows
+        }
+        return doc
+
+    def check_document(self, doc: Any) -> dict[str, Any]:
+        """Validate an export document's envelope; returns it unchanged."""
+        if not isinstance(doc, dict) or doc.get("format") != self.doc_format:
+            raise ValueError(
+                f"Not a netscaler-mcp {self.label} profile export (expected format {self.doc_format!r})."
+            )
+        if doc.get("version") != DOC_VERSION:
+            raise ValueError(
+                f"Unsupported document version {doc.get('version')!r} (this server reads {DOC_VERSION})."
+            )
+        rules = doc.get("rules")
+        if not isinstance(rules, dict) or not all(
+            isinstance(rows, list) and all(isinstance(r, dict) for r in rows) for rows in rules.values()
+        ):
+            raise ValueError("document 'rules' must map rule types to lists of rule objects.")
+        unknown = sorted(set(rules) - set(self.types))
+        if unknown:
+            raise ValueError(f"document has unknown {self.label} rule types {unknown}.")
+        return doc
+
+    def apply_host_map(self, doc: dict[str, Any], host_map: dict[str, str]) -> tuple[dict[str, Any], int]:
+        """Rewrite hostnames across a document's settings and rules; returns (new doc, replacements)."""
+        rewriter = HostRewriter(host_map)
+        out = dict(doc)
+        for section in ("settings", "rules", "other_bindings"):
+            if section in doc:
+                out[section] = rewrite_strings(doc[section], rewriter)
+        out["hosts"] = self.hosts_in(out.get("rules") or {})
+        out["host_map_applied"] = {**doc.get("host_map_applied", {}), **rewriter.host_map}
+        return out, rewriter.replacements
+
+    def plan_bindings(
+        self, desired: dict[str, list[dict]], current: dict[str, list[dict]], *, replace: bool
+    ) -> dict[str, dict[str, Any]]:
+        """Diff rules per type into add / update / remove (update and remove only when ``replace``).
+
+        ``desired`` rows are export rows, ``current`` rows raw GET rows. A rule on both sides whose
+        settings (state, comment, limits, ...) differ is an update; only the desired side's attributes
+        are compared, so an import never churns on attributes the document doesn't carry.
+        """
+        plan: dict[str, dict[str, Any]] = {}
+        for key, rule in self.types.items():
+            want = {binding_key(rule, row): clean_binding(row) for row in desired.get(key, [])}
+            have = {binding_key(rule, row): clean_binding(row) for row in current.get(key, [])}
+            add = [row for k, row in want.items() if k not in have]
+            update: list[dict[str, Any]] = []
+            remove: list[dict[str, Any]] = []
+            if replace:
+                skip = set(rule.identity) | {"ruletype"} | _COMPARE_IGNORE
+                for k, row in want.items():
+                    if k in have and any(
+                        _norm_setting(v) != _norm_setting(have[k].get(attr))
+                        for attr, v in row.items()
+                        if attr not in skip
+                    ):
+                        update.append({"current": have[k], "desired": row})
+                remove = [row for k, row in have.items() if k not in want]
+            unchanged = len(want) - len(add) - len(update)
+            if add or update or remove:
+                plan[key] = {"add": add, "update": update, "remove": remove, "unchanged": unchanged}
+        return plan
 
 
 def _field_rule(binding: str, field: str, suffix: str, check: str | None = None) -> RuleType:
@@ -333,19 +502,13 @@ LIST_ONLY_CHECKS = {"xml_dos": "XMLDoSCheck", "xml_wsi": "XMLWSICheck", "xml_att
 EXISTS_CODES = frozenset({
     273, 3198, 3121, 3123, 3125, 3127, 3129, 3131, 3133, 3135, 3229, 3173, 3183, 3218, 3292, 3332, 3364,
     2549, 3582, 3448,
+    1703, 1929,  # bot: entity already bound / object already exists
 })
 MISSING_CODES = frozenset({
     258, 461, 462, 3190, 3201, 3120, 3122, 3124, 3126, 3128, 3130, 3132, 3134, 3228, 3175, 3184, 3219,
     3291, 3316, 3363, 2554, 2553, 3450, 2986,
+    1889, 1944,  # bot: no such profile / object being updated or removed does not exist
 })
-
-
-def rule_type(name: str | None) -> str:
-    """Validate a rule type name (case-insensitive) and return its key."""
-    key = (name or "").strip().lower()
-    if key not in RULE_TYPES:
-        raise ValueError(f"rule_type must be one of {tuple(RULE_TYPES)}; got {name!r}.")
-    return key
 
 
 def resolve_check(name: str) -> tuple[str | None, str]:
@@ -374,12 +537,19 @@ def as_int(value: Any) -> int | None:
 _BINDING_DROP = frozenset({"name", "alertonly", "resourceid", "__count", "_nextgenapiresource"})
 # Not worth re-binding a rule over (how the rule was created, not what it does).
 _COMPARE_IGNORE = frozenset({"isautodeployed"})
-_ENUM_ATTR = re.compile(r"ruletype|as_scan_location_\w+|as_value_type_\w+")
+_ENUM_ATTR = re.compile(r"ruletype|as_scan_location_\w+|as_value_type_\w+|bot_\w+_type|category")
+
+
+def arg_value(value: Any) -> str:
+    """Render a value for a NITRO ``args=`` pair (JSON booleans are lowercase on the wire)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _norm(attr: str, value: Any) -> str:
     """Normalise one identity value: enums compare case-insensitively with NetScaler's defaults applied."""
-    text = "" if value is None else str(value).strip()
+    text = "" if value is None else arg_value(value).strip()
     if _ENUM_ATTR.fullmatch(attr):
         text = text.lower()
         if not text and attr == "ruletype":
@@ -403,8 +573,8 @@ def clean_binding(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def binding_key(rule: RuleType, row: dict[str, Any]) -> tuple[str, ...]:
-    """Identity of a binding (its DELETE args + ruletype), normalised so equal rules compare equal."""
-    return tuple(_norm(attr, row.get(attr)) for attr in rule.identity + ("ruletype",))
+    """Identity of a binding (its DELETE args), normalised so equal rules compare equal."""
+    return tuple(_norm(attr, row.get(attr)) for attr in rule.identity + rule.ident_extra)
 
 
 def row_matches(rule: RuleType, row: dict[str, Any], given: dict[str, Any]) -> bool:
@@ -412,44 +582,17 @@ def row_matches(rule: RuleType, row: dict[str, Any], given: dict[str, Any]) -> b
     return all(
         _norm(attr, row.get(attr)) == _norm(attr, value)
         for attr, value in given.items()
-        if attr in rule.identity + ("ruletype",)
+        if attr in rule.identity + rule.ident_extra
     )
 
 
 def delete_args(rule: RuleType, row: dict[str, Any]) -> dict[str, str]:
     """DELETE args for a binding row as read from the appliance."""
     return {
-        attr: str(row[attr]) for attr in rule.identity + ("ruletype",) if row.get(attr) not in (None, "")
+        attr: arg_value(row[attr])
+        for attr in rule.identity + rule.ident_extra
+        if row.get(attr) not in (None, "")
     }
-
-
-def split_bindings(aggregate: dict[str, Any]) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
-    """Split an ``appfwprofile_binding`` object into modelled rule types and other binding arrays."""
-    by_binding = {rule.binding: key for key, rule in RULE_TYPES.items()}
-    rules: dict[str, list[dict]] = {}
-    other: dict[str, list[dict]] = {}
-    for attr, rows in aggregate.items():
-        if not attr.endswith("_binding"):
-            continue
-        rows = rows if isinstance(rows, list) else [rows]
-        if attr in by_binding:
-            rules[by_binding[attr]] = rows
-        elif rows:
-            other[attr] = rows
-    return rules, other
-
-
-def hosts_in(rules: dict[str, list[dict]]) -> dict[str, int]:
-    """Count the hostnames referenced by rule URLs ('*' and relative URLs skipped), most used first."""
-    counts: dict[str, int] = {}
-    for key, rows in rules.items():
-        rule = RULE_TYPES.get(key)
-        for row in rows if rule else ():
-            for attr in rule.url_attrs:
-                host = parse_url_pattern(str(row.get(attr) or ""))["host"]
-                if host and host != "*":
-                    counts[host] = counts.get(host, 0) + 1
-    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def compile_patterns(patterns: list[str]) -> list[re.Pattern[str]]:
@@ -653,96 +796,94 @@ _PROFILE_DROP = frozenset({
 })
 _LEARNING_DROP = frozenset({"profilename", "_nextgenapiresource", "__count"})
 
+# The AppFw family: what the WAF tools hand to the shared machinery (bot.BOT is its Bot twin).
+WAF = ProfileKind(
+    key="waf",
+    label="WAF",
+    profile="appfwprofile",
+    aggregate="appfwprofile_binding",
+    policy="appfwpolicy",
+    types=RULE_TYPES,
+    doc_format=DOC_FORMAT,
+    profile_drop=_PROFILE_DROP,
+    extra=ExtraSettings("appfwlearningsettings", "profilename", "learning_settings", _LEARNING_DROP),
+    create_attrs=("type",),
+)
 
-def clean_settings(obj: dict[str, Any], *, learning: bool = False) -> dict[str, Any]:
-    """Settable, non-empty attributes of an appfwprofile (or appfwlearningsettings) object."""
-    drop = _LEARNING_DROP if learning else _PROFILE_DROP
+
+def clean_attrs(obj: dict[str, Any], drop: frozenset[str]) -> dict[str, Any]:
+    """Non-empty attributes of a NITRO object minus ``drop`` (its read-only / add-only ones)."""
     return {k: v for k, v in obj.items() if k not in drop and v not in (None, "", [])}
+
+
+# ---- violation statistics ------------------------------------------------
+
+# stat appfw / stat appfwprofile counter names are irregular (viol*/log* prefixes, *violations/*logs
+# suffixes, and per-profile renames that flip word order), so counters are classified by token instead
+# of from a hard-coded name list, and unknown tokens keep their raw name.
+_STAT_CHECKS = {
+    "starturl": "start_url", "denyurl": "deny_url", "refererheader": "referer_header",
+    "bufferoverflow": "buffer_overflow", "postbodylimit": "post_body_limit",
+    "cookie": "cookie_consistency", "cookiehijack": "cookie_hijacking", "csrftag": "csrf_tag",
+    "xss": "cross_site_scripting", "transformxss": "cross_site_scripting_transformed",
+    "xformxss": "cross_site_scripting_transformed", "sql": "sql_injection",
+    "transformsql": "sql_injection_transformed", "xformsql": "sql_injection_transformed",
+    "fieldformat": "field_format", "fieldconsistency": "field_consistency",
+    "fileuploadtypes": "file_upload_types", "creditcard": "credit_card", "safeobject": "safe_object",
+    "signature": "signatures", "contenttype": "content_type", "cmd": "cmd_injection",
+    "jsondos": "json_dos", "jsonsql": "json_sql", "jsonxss": "json_xss", "jsoncmd": "json_cmd",
+    "grpc": "grpc", "blockkeyword": "block_keyword", "jsonblockkeyword": "json_block_keyword",
+    "sqlgram": "sql_injection_grammar", "cmdgram": "cmd_injection_grammar",
+    "jsonsqlgram": "json_sql_grammar", "jsoncmdgram": "json_cmd_grammar", "xdos": "xml_dos",
+    "wsi": "xml_wsi", "xmlsql": "xml_sql", "xmlxss": "xml_xss", "xmlattachment": "xml_attachment",
+    "xmlsoapfault": "xml_soap_fault", "xmlgen": "xml_other", "xmlgeneric": "xml_other",
+    "wellformedness": "xml_wellformedness", "msgval": "xml_message_validation",
+    "xmlpayloadcontenttypemismatch": "xml_payload_content_type",
+}
+_TRAFFIC_COUNTERS = {
+    "requests": "requests", "responses": "responses", "reqbytes": "request_bytes",
+    "resbytes": "response_bytes", "totalviol": "total_violations", "totallog": "total_logged",
+    "aborts": "aborts", "redirects": "redirects", "ret4xx": "responses_4xx", "ret5xx": "responses_5xx",
+}
+
+
+def violation_summary(stats: dict[str, Any]) -> dict[str, Any]:
+    """Bucket flat ``stat appfw`` / ``stat appfwprofile`` counters into traffic totals and per-check rows.
+
+    Each check row carries its 'violations' and 'logged' counts; the rate twins are skipped. A check
+    with violations while it only logs is what would start blocking once the check is set to block.
+    """
+    traffic: dict[str, int] = {}
+    checks: dict[str, dict[str, int]] = {}
+    for key, value in stats.items():
+        count = as_int(value)
+        if count is None:
+            continue
+        token = key.removeprefix("appfirewall")
+        if token.endswith("rate"):
+            continue
+        token = token.removesuffix("perprofile").removesuffix("profile")
+        if token in _TRAFFIC_COUNTERS:
+            traffic[_TRAFFIC_COUNTERS[token]] = count
+            continue
+        if token.startswith("viol"):
+            kind, rest = "violations", token.removeprefix("viol")
+        elif token.startswith("log"):
+            kind, rest = "logged", token.removeprefix("log")
+        elif token.endswith("violations"):
+            kind, rest = "violations", token.removesuffix("violations")
+        elif token.endswith("logs"):
+            kind, rest = "logged", token.removesuffix("logs")
+        else:
+            continue  # config gauges and session gauges
+        rest = rest.removesuffix("violations").removesuffix("logs")
+        if rest not in _STAT_CHECKS and rest[:1] == "s" and rest[1:] in _STAT_CHECKS:
+            rest = rest[1:]  # the logsjsonsql / logsjsonxss spellings
+        checks.setdefault(_STAT_CHECKS.get(rest, rest or "other"), {})[kind] = count
+    ordered = sorted(checks.items(), key=lambda kv: (-kv[1].get("violations", 0), -kv[1].get("logged", 0), kv[0]))
+    return {"traffic": traffic, "checks": dict(ordered)}
 
 
 def settings_changes(desired: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     """Desired attributes whose value differs from the live object (lists compare order-insensitively)."""
     return {k: v for k, v in desired.items() if _norm_setting(v) != _norm_setting(current.get(k))}
-
-
-def build_document(
-    *,
-    profile: str,
-    appliance: str,
-    exported_at: str,
-    settings: dict[str, Any],
-    learning_settings: dict[str, Any],
-    rules: dict[str, list[dict]],
-    other_bindings: dict[str, list[dict]],
-) -> dict[str, Any]:
-    """Assemble the portable export document for one profile."""
-    return {
-        "format": DOC_FORMAT,
-        "version": DOC_VERSION,
-        "exported_at": exported_at,
-        "source": {"appliance": appliance, "profile": profile},
-        "hosts": hosts_in(rules),
-        "settings": clean_settings(settings),
-        "learning_settings": clean_settings(learning_settings, learning=True),
-        "rules": {k: [clean_binding(r) for r in rows] for k, rows in rules.items() if rows},
-        "other_bindings": {k: [clean_binding(r) for r in rows] for k, rows in other_bindings.items() if rows},
-    }
-
-
-def check_document(doc: Any) -> dict[str, Any]:
-    """Validate an export document's envelope; returns it unchanged."""
-    if not isinstance(doc, dict) or doc.get("format") != DOC_FORMAT:
-        raise ValueError(f"Not a netscaler-mcp WAF profile export (expected format {DOC_FORMAT!r}).")
-    if doc.get("version") != DOC_VERSION:
-        raise ValueError(f"Unsupported document version {doc.get('version')!r} (this server reads {DOC_VERSION}).")
-    rules = doc.get("rules")
-    if not isinstance(rules, dict) or not all(
-        isinstance(rows, list) and all(isinstance(r, dict) for r in rows) for rows in rules.values()
-    ):
-        raise ValueError("document 'rules' must map rule types to lists of rule objects.")
-    unknown = sorted(set(rules) - set(RULE_TYPES))
-    if unknown:
-        raise ValueError(f"document has unknown rule types {unknown}.")
-    return doc
-
-
-def apply_host_map(doc: dict[str, Any], host_map: dict[str, str]) -> tuple[dict[str, Any], int]:
-    """Rewrite hostnames across a document's settings and rules; returns (new doc, replacements made)."""
-    rewriter = HostRewriter(host_map)
-    out = dict(doc)
-    for section in ("settings", "rules", "other_bindings"):
-        if section in doc:
-            out[section] = rewrite_strings(doc[section], rewriter)
-    out["hosts"] = hosts_in(out.get("rules") or {})
-    out["host_map_applied"] = {**doc.get("host_map_applied", {}), **rewriter.host_map}
-    return out, rewriter.replacements
-
-
-def plan_bindings(
-    desired: dict[str, list[dict]], current: dict[str, list[dict]], *, replace: bool
-) -> dict[str, dict[str, Any]]:
-    """Diff rules per type into add / update / remove (update and remove only when ``replace``).
-
-    ``desired`` rows are export rows, ``current`` rows raw GET rows. A rule on both sides whose
-    settings (state, comment, limits, …) differ is an update; only the desired side's attributes are
-    compared, so an import never churns on attributes the document doesn't carry.
-    """
-    plan: dict[str, dict[str, Any]] = {}
-    for key, rule in RULE_TYPES.items():
-        want = {binding_key(rule, row): clean_binding(row) for row in desired.get(key, [])}
-        have = {binding_key(rule, row): clean_binding(row) for row in current.get(key, [])}
-        add = [row for k, row in want.items() if k not in have]
-        update: list[dict[str, Any]] = []
-        remove: list[dict[str, Any]] = []
-        if replace:
-            skip = set(rule.identity) | {"ruletype"} | _COMPARE_IGNORE
-            for k, row in want.items():
-                if k in have and any(
-                    _norm_setting(v) != _norm_setting(have[k].get(attr)) for attr, v in row.items() if attr not in skip
-                ):
-                    update.append({"current": have[k], "desired": row})
-            remove = [row for k, row in have.items() if k not in want]
-        unchanged = len(want) - len(add) - len(update)
-        if add or update or remove:
-            plan[key] = {"add": add, "update": update, "remove": remove, "unchanged": unchanged}
-    return plan

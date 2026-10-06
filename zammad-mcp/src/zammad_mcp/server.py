@@ -3,7 +3,7 @@
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
 always-on HTTP server. Read tools (tickets, articles, users, organizations, reference data) are GET;
 the raw ``zammad_get`` escape hatch reaches anything else. Write tools (add a note/comment, update
-a ticket, create a ticket) are **opt-in**: they refuse unless ``ZAMMAD_ALLOW_WRITE=true`` and need a
+a ticket, create a ticket, tag a ticket) are **opt-in**: they refuse unless ``ZAMMAD_ALLOW_WRITE=true`` and need a
 token with agent (ticket.agent) permission. With the flag off the server is effectively read-only.
 
 Reads pass ``expand=true`` so *_id fields come back as human-readable names.
@@ -39,7 +39,7 @@ def _require_write() -> None:
     if not _get_client().settings.allow_write:
         raise ValueError(
             "Write tools are disabled. Set ZAMMAD_ALLOW_WRITE=true (and use a token with "
-            "ticket.agent permission) to enable adding notes / updating / creating tickets."
+            "ticket.agent permission) to enable adding notes / updating / creating / tagging tickets."
         )
 
 
@@ -249,10 +249,12 @@ async def update_ticket(
     group: Annotated[str | None, Field(description="New group name.")] = None,
     owner_id: Annotated[int | None, Field(description="New owner (agent) user id.")] = None,
     title: Annotated[str | None, Field(description="New title.")] = None,
+    pending_time: Annotated[str | None, Field(description="When a pending state is due, ISO 8601 (e.g. '2026-10-12T08:00:00Z'). Give it with state 'pending reminder' / 'pending close'.")] = None,
 ) -> dict[str, Any]:
     """Update a ticket's state/priority/group/owner/title (WRITE — requires ZAMMAD_ALLOW_WRITE).
 
-    PUTs /tickets/{id}. State/priority/group accept their names (Zammad resolves them).
+    PUTs /tickets/{id}. State/priority/group accept their names (Zammad resolves them). Pending
+    states need a pending_time.
     """
     _require_write()
     payload: dict[str, Any] = {}
@@ -266,8 +268,10 @@ async def update_ticket(
         payload["owner_id"] = owner_id
     if title is not None:
         payload["title"] = title
+    if pending_time is not None:
+        payload["pending_time"] = pending_time
     if not payload:
-        raise ValueError("Nothing to update: provide state, priority, group, owner_id and/or title.")
+        raise ValueError("Nothing to update: provide state, priority, group, owner_id, title and/or pending_time.")
     data = await _get_client().put(f"tickets/{ticket_id}", json=payload, params={"expand": "true"})
     return _pick(data, _TICKET_FIELDS)
 
@@ -301,6 +305,29 @@ async def create_ticket(
         payload["priority"] = priority
     data = await _get_client().post("tickets", json=payload, params={"expand": "true"})
     return _pick(data, _TICKET_FIELDS)
+
+
+@mcp.tool()
+async def tag_ticket(
+    ticket_id: Annotated[int, Field(description="The ticket id.")],
+    add: Annotated[list[str] | None, Field(description="Tags to add, e.g. ['vpn', 'escalated'].")] = None,
+    remove: Annotated[list[str] | None, Field(description="Tags to remove.")] = None,
+) -> dict[str, Any]:
+    """Add and/or remove tags on a ticket (WRITE — requires ZAMMAD_ALLOW_WRITE).
+
+    POSTs /tags/add and DELETEs /tags/remove once per tag, then returns the ticket's tags. A tag that
+    doesn't exist yet is created, unless the instance only lets admins create new tags.
+    """
+    _require_write()
+    if not add and not remove:
+        raise ValueError("Nothing to do: provide add and/or remove.")
+    client = _get_client()
+    for tag in add or ():
+        await client.post("tags/add", json={"item": tag, "object": "Ticket", "o_id": ticket_id})
+    for tag in remove or ():
+        await client.delete("tags/remove", json={"item": tag, "object": "Ticket", "o_id": ticket_id})
+    data = await client.get("tags", params={"object": "Ticket", "o_id": ticket_id})
+    return {"ticket_id": ticket_id, "tags": data.get("tags", []) if isinstance(data, dict) else data}
 
 
 def main() -> None:

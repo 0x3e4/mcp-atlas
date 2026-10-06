@@ -51,6 +51,21 @@ EXPECTED_TOOLS = {
     "import_waf_profile",
     "rehost_waf_profile",
     "save_config",
+    # Bot management rollout
+    "list_bot_rules",
+    "list_bot_detections",
+    "add_bot_rule",
+    "remove_bot_rule",
+    "set_bot_detections",
+    "export_bot_profile",
+    "import_bot_profile",
+    "rehost_bot_profile",
+    # signatures, enforcement and violations (WAF + Bot)
+    "waf_violations",
+    "list_signatures",
+    "update_signatures",
+    "list_enforcement",
+    "recent_security_violations",
 }
 
 
@@ -234,30 +249,30 @@ def test_plan_bindings_merge_vs_replace():
         {"name": "p", "starturl": "B", "comment": "old", "ruletype": "ALLOW", "resourceid": "1"},
         {"name": "p", "starturl": "C", "ruletype": "ALLOW"},
     ]}
-    merge = waf.plan_bindings(desired, current, replace=False)["start_url"]
+    merge = waf.WAF.plan_bindings(desired, current, replace=False)["start_url"]
     assert (merge["add"], merge["update"], merge["remove"]) == ([{"starturl": "A"}], [], [])
-    replace = waf.plan_bindings(desired, current, replace=True)["start_url"]
+    replace = waf.WAF.plan_bindings(desired, current, replace=True)["start_url"]
     assert [u["desired"]["starturl"] for u in replace["update"]] == ["B"]
     assert replace["remove"] == [{"starturl": "C", "ruletype": "ALLOW"}]
 
 
 def test_document_host_map_and_validation():
-    rules, other = waf.split_bindings({
+    rules, other = waf.WAF.split_bindings({
         "name": "p",
         "appfwprofile_starturl_binding": [{"name": "p", "starturl": r"^https://app\.test\.corp/.*$"}],
     })
-    doc = waf.build_document(
-        profile="p", appliance="https://ns", exported_at="t", learning_settings={}, rules=rules,
-        other_bindings=other, settings={"name": "p", "state": "ENABLED", "errorurl": "https://app.test.corp/e"},
+    doc = waf.WAF.build_document(
+        profile="p", appliance="https://ns", exported_at="t", rules=rules, other_bindings=other,
+        settings={"name": "p", "state": "ENABLED", "errorurl": "https://app.test.corp/e"},
     )
-    assert waf.check_document(doc) is doc
+    assert waf.WAF.check_document(doc) is doc
     assert doc["settings"] == {"errorurl": "https://app.test.corp/e"}  # read-only 'state' dropped
-    moved, replacements = waf.apply_host_map(doc, {"app.test.corp": "app.corp"})
+    moved, replacements = waf.WAF.apply_host_map(doc, {"app.test.corp": "app.corp"})
     assert replacements == 2
     assert moved["rules"]["start_url"][0]["starturl"] == r"^https://app\.corp/.*$"
     assert moved["hosts"] == {"app.corp": 1}
     with pytest.raises(ValueError):
-        waf.check_document({"format": "something-else"})
+        waf.WAF.check_document({"format": "something-else"})
 
 
 def test_check_actions_go_live():
