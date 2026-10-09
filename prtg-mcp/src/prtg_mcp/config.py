@@ -1,8 +1,10 @@
 """Configuration for the PRTG MCP server, loaded from environment variables.
 
-Authentication is either a PRTG **API token** (recommended — create a read-only API key in
-Setup → API Keys; works on PRTG 23.x+) or the legacy **username + passhash** (or username +
-password). Secrets are never hardcoded; everything comes from the process environment.
+Authentication is either a PRTG **API token** (recommended — create an API key in Setup → API
+Keys with read access, or write access for the opt-in writes; PRTG 23.x+) or the legacy **username + passhash** (or username +
+password). Secrets are never hardcoded; everything comes from the process environment. Writes
+(pause/resume, acknowledge, scan now) are opt-in via ``PRTG_ALLOW_WRITE``; each write then needs the
+user's confirmation unless ``PRTG_CONFIRM_WRITE=false``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ class Settings:
     username: str = ""
     passhash: str = ""
     password: str = ""
+    allow_write: bool = False
+    confirm_write: bool = True
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -73,6 +77,8 @@ class Settings:
             username=username,
             passhash=passhash,
             password=password,
+            allow_write=_bool_env(env, "PRTG_ALLOW_WRITE", False),
+            confirm_write=_bool_env(env, "PRTG_CONFIRM_WRITE", True),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),

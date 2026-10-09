@@ -1,17 +1,29 @@
-"""FastMCP server exposing read-only Wazuh tools over stdio (or streamable-http).
+"""FastMCP server exposing Wazuh tools over stdio (or streamable-http).
 
 Events (alerts/archives/vulnerabilities) are queried from the Wazuh Indexer; agents,
 inventory, rules, SCA and status come from the Manager REST API. Two raw escape-hatch
-tools (``indexer_search``, ``manager_api_get``) make anything else reachable.
+tools (``indexer_search``, ``manager_api_get``) make anything else reachable (read-only).
+
+Write tools (restart agents, assign/unassign agent groups, run an active-response command)
+go to the Manager API only, never the Indexer, and are **opt-in**: they refuse unless
+``WAZUH_ALLOW_WRITE=true`` and the API user's RBAC role allows the action. Unless
+``WAZUH_CONFIRM_WRITE=false``, every write first returns a preview plus a confirm code and
+only runs when called again with that code, after the user has confirmed.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import re
+import secrets
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
 
 from .config import Settings, WazuhError
 from .indexer import IndexerClient
@@ -48,7 +60,18 @@ async def lifespan(_server: FastMCP):
             await _indexer.aclose()
 
 
-mcp = FastMCP("wazuh", lifespan=lifespan, host=settings.host, port=settings.port)
+mcp = FastMCP(
+    "wazuh",
+    instructions=(
+        "Write tools (restart_agents, add_agent_to_group, remove_agent_from_group, run_active_response) "
+        "need the user's confirmation: the first call changes nothing and returns a preview with a "
+        "confirm_code. Show the user a short overview of what will change, end with 'Confirm it?', and "
+        "only after they say yes repeat the call with confirm=<code>."
+    ),
+    lifespan=lifespan,
+    host=settings.host,
+    port=settings.port,
+)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -369,6 +392,203 @@ async def manager_api_get(path: str, params: dict | None = None) -> dict:
     if not path.startswith("/"):
         path = "/" + path
     return await manager().get(path, params=params or None)
+
+
+# ------------------------------------- write tools (Manager API, opt-in via WAZUH_ALLOW_WRITE)
+
+
+def _require_write() -> None:
+    """Gate write tools behind the opt-in WAZUH_ALLOW_WRITE flag."""
+    if not settings.allow_write:
+        raise ValueError(
+            "Write tools are disabled. Set WAZUH_ALLOW_WRITE=true (and give the Manager API user a "
+            "role that allows the action) to restart agents, change agent groups or run active responses."
+        )
+
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when WAZUH_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
+
+
+# Wazuh's group_names format: a-z, A-Z, 0-9, '_', '-', '.' (max 128; '.' and '..' are reserved).
+_GROUP_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+# Active-response command: a command name from the manager's ar.conf (e.g. "firewall-drop0") or "!<script>".
+_AR_COMMAND_RE = re.compile(r"^!?[A-Za-z0-9_.-]{1,128}$")
+
+
+def _agent_ids(agent_ids: list[str], *, allow_manager: bool = False) -> list[str]:
+    """Validate + normalise explicit agent ids. Never empty: an omitted agents_list means ALL agents."""
+    ids: list[str] = []
+    for item in agent_ids or []:
+        for raw in _csv(str(item)):
+            aid = _aid(raw)
+            if not aid.isdigit():
+                raise ValueError(f"Invalid agent id {raw!r}: use numeric ids like '001' (see list_agents).")
+            if aid == "000" and not allow_manager:
+                raise ValueError("Agent 000 is the Wazuh manager itself, not an agent — leave it out.")
+            if aid not in ids:
+                ids.append(aid)
+    if not ids:
+        raise ValueError("Give at least one agent id (the API would otherwise target ALL agents).")
+    return ids
+
+
+def _group(group_id: str) -> str:
+    group_id = (group_id or "").strip()
+    if not _GROUP_RE.match(group_id) or group_id in (".", ".."):
+        raise ValueError(f"Invalid group name {group_id!r}: use letters, digits, '_', '-', '.' (max 128).")
+    return group_id
+
+
+def _written(data: dict) -> dict:
+    """Trim a Manager write response: affected/failed items (if any) plus the API message."""
+    out = _affected(data) if isinstance(data.get("data"), dict) else {}
+    if data.get("message"):
+        out["message"] = data["message"]
+    return out
+
+
+@mcp.tool()
+async def restart_agents(
+    agent_ids: Annotated[list[str], Field(description="Agent ids to restart, e.g. ['001', '005']. Required, never empty.")],
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict:
+    """Restart the Wazuh agent service on one or more agents (WRITE — requires WAZUH_ALLOW_WRITE).
+
+    PUTs /agents/restart?agents_list=... . Restarts the agent daemon only (not the host), e.g. to
+    apply a changed group config. Only active agents can be restarted; others come back under
+    "failed". Needs RBAC action agent:restart.
+    """
+    _require_write()
+    ids = _agent_ids(agent_ids)
+    params = {"agents_list": ",".join(ids)}
+    if preview := _confirm("restart_agents", {"agents_list": ids},
+                           f"Restart the Wazuh agent service on agent(s) {', '.join(ids)}.", confirm):
+        return preview
+    return _written(await manager().put("/agents/restart", params=params))
+
+
+@mcp.tool()
+async def add_agent_to_group(
+    agent_id: Annotated[str, Field(description="Agent id, e.g. '001'.")],
+    group_id: Annotated[str, Field(description="Existing group name, e.g. 'webservers' (the group must already exist).")],
+    exclusive: Annotated[bool, Field(description="Remove the agent from all its other groups first (move instead of add).")] = False,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict:
+    """Assign an agent to a group (WRITE — requires WAZUH_ALLOW_WRITE).
+
+    PUTs /agents/{agent_id}/group/{group_id} (with force_single_group=true when exclusive). The
+    agent then pulls that group's shared config (agent.conf). The group must already exist.
+    Undo with remove_agent_from_group. Needs RBAC actions agent:modify_group + group:modify_assignments.
+    """
+    _require_write()
+    aid = _agent_ids([agent_id])[0]
+    group = _group(group_id)
+    params = {"force_single_group": "true"} if exclusive else None
+    change: dict[str, Any] = {"agent_id": aid, "group_id": group}
+    if exclusive:
+        change["force_single_group"] = True
+    summary = (f"Move agent {aid} into group '{group}' only (removing it from its other groups)."
+               if exclusive else f"Add agent {aid} to group '{group}'.")
+    if preview := _confirm("add_agent_to_group", change, summary, confirm):
+        return preview
+    return _written(await manager().put(f"/agents/{aid}/group/{group}", params=params))
+
+
+@mcp.tool()
+async def remove_agent_from_group(
+    agent_id: Annotated[str, Field(description="Agent id, e.g. '001'.")],
+    group_id: Annotated[str, Field(description="Group name to unassign the agent from.")],
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict:
+    """Unassign an agent from one group (WRITE — requires WAZUH_ALLOW_WRITE).
+
+    DELETEs /agents/{agent_id}/group/{group_id}. Deletes nothing: the agent and the group stay;
+    only this assignment is removed (other groups are kept). If it was the agent's last group,
+    Wazuh reassigns it to 'default'. Needs RBAC actions agent:modify_group + group:modify_assignments.
+    """
+    _require_write()
+    aid = _agent_ids([agent_id])[0]
+    group = _group(group_id)
+    if preview := _confirm("remove_agent_from_group", {"agent_id": aid, "group_id": group},
+                           f"Remove agent {aid} from group '{group}' (agent and group are kept).", confirm):
+        return preview
+    return _written(await manager().delete(f"/agents/{aid}/group/{group}"))
+
+
+@mcp.tool()
+async def run_active_response(
+    agent_ids: Annotated[list[str], Field(description="Agent ids to run the command on, e.g. ['001']. Required, never empty.")],
+    command: Annotated[str, Field(description="A command name from the manager's active-response config as listed in ar.conf (e.g. 'firewall-drop0'), or '!<script>' to run an AR script by name (e.g. '!firewall-drop').")],
+    arguments: Annotated[list[str] | None, Field(description="Extra arguments passed to the script (extra_args).")] = None,
+    alert_data: Annotated[dict[str, Any] | None, Field(description="Alert fields the script reads, sent as alert.data, e.g. {'srcip': '10.0.0.10'} for firewall-drop / host-deny.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict:
+    """Run an active-response command on agents (WRITE — requires WAZUH_ALLOW_WRITE). PUTs /active-response.
+
+    DANGER: this executes a script on the endpoint(s). Depending on the command it can block an IP
+    in the host firewall (firewall-drop, host-deny, netsh, route-null), disable an account, kill
+    processes or restart Wazuh. Stateful commands are undone only by their timeout or by hand.
+    The agent must be active with active response enabled. Needs RBAC action active-response:command.
+    """
+    _require_write()
+    ids = _agent_ids(agent_ids, allow_manager=True)
+    command = (command or "").strip()
+    if not _AR_COMMAND_RE.match(command):
+        raise ValueError(f"Invalid active-response command {command!r}: e.g. 'firewall-drop0' or '!firewall-drop'.")
+    if alert_data is not None and not isinstance(alert_data, dict):
+        raise ValueError("alert_data must be a JSON object, e.g. {'srcip': '10.0.0.10'}.")
+    body: dict[str, Any] = {"command": command}
+    if arguments:
+        body["arguments"] = [str(a) for a in arguments]
+    if alert_data:
+        body["alert"] = {"data": alert_data}
+    params = {"agents_list": ",".join(ids)}
+    extra = []
+    if arguments:
+        extra.append(f"arguments {body['arguments']}")
+    if alert_data:
+        extra.append(f"alert data {json.dumps(alert_data, sort_keys=True)}")
+    summary = (
+        f"Run active-response command '{command}' on agent(s) {', '.join(ids)}"
+        + (f" with {' and '.join(extra)}" if extra else "")
+        + ". This executes on the endpoint and can block IPs, kill processes or disable accounts."
+    )
+    if preview := _confirm("run_active_response", {"agents_list": ids, **body}, summary, confirm):
+        return preview
+    return _written(await manager().put("/active-response", params=params, json=body))
 
 
 def main() -> None:

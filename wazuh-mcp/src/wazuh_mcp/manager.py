@@ -47,24 +47,40 @@ class ManagerClient:
 
     async def get(self, path: str, params: dict[str, Any] | None = None) -> dict:
         """GET a Manager API path and return the parsed JSON envelope."""
+        return await self._request("GET", path, params)
+
+    async def put(self, path: str, params: dict[str, Any] | None = None,
+                  json: dict[str, Any] | None = None) -> dict:
+        """PUT to a Manager API path (write tools only) and return the parsed JSON envelope."""
+        return await self._request("PUT", path, params, json)
+
+    async def delete(self, path: str, params: dict[str, Any] | None = None) -> dict:
+        """DELETE a Manager API path (write tools only) and return the parsed JSON envelope."""
+        return await self._request("DELETE", path, params)
+
+    async def _request(self, method: str, path: str, params: dict[str, Any] | None = None,
+                       json: dict[str, Any] | None = None) -> dict:
         if self._token is None:
             await self._authenticate()
 
-        resp = await self._send(path, params)
+        resp = await self._send(method, path, params, json)
         if resp.status_code == 401:
             # Token likely expired — re-authenticate once and retry.
             await self._authenticate()
-            resp = await self._send(path, params)
+            resp = await self._send(method, path, params, json)
 
         if resp.status_code >= 400:
-            raise WazuhError(f"Manager API GET {path} -> {resp.status_code}: {short(resp.text)}")
+            raise WazuhError(f"Manager API {method} {path} -> {resp.status_code}: {_error(resp)}")
         return resp.json()
 
-    async def _send(self, path: str, params: dict[str, Any] | None) -> httpx.Response:
+    async def _send(self, method: str, path: str, params: dict[str, Any] | None,
+                    json: dict[str, Any] | None = None) -> httpx.Response:
         try:
-            return await self._client.get(
+            return await self._client.request(
+                method,
                 path,
                 params=params,
+                json=json,
                 headers={"Authorization": f"Bearer {self._token}"},
             )
         except httpx.HTTPError as exc:
@@ -74,3 +90,17 @@ class ManagerClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+def _error(resp: httpx.Response) -> str:
+    """Short error text; prefers the API's ``title: detail (remediation)`` fields when present."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return short(resp.text)
+    if not isinstance(body, dict) or not (body.get("title") or body.get("detail")):
+        return short(resp.text)
+    text = ": ".join(str(body[k]) for k in ("title", "detail") if body.get(k))
+    if body.get("remediation"):
+        text += f" ({body['remediation']})"
+    return short(text)

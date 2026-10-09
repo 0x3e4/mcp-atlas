@@ -11,6 +11,10 @@ Reads pass ``expand=true`` so *_id fields come back as human-readable names.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import secrets
 import sys
 from typing import Annotated, Any
 
@@ -21,7 +25,14 @@ from pydantic import Field
 from .client import ZammadClient
 from .config import ConfigError, Settings
 
-mcp = FastMCP("zammad-mcp")
+mcp = FastMCP(
+    "zammad-mcp",
+    instructions=(
+        "Write tools need the user's confirmation: the first call changes nothing and returns a preview "
+        "with a confirm_code. Show the user a short overview of what will change, end with 'Confirm it?', "
+        "and only after they say yes repeat the call with confirm=<code>."
+    ),
+)
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: ZammadClient | None = None
@@ -41,6 +52,41 @@ def _require_write() -> None:
             "Write tools are disabled. Set ZAMMAD_ALLOW_WRITE=true (and use a token with "
             "ticket.agent permission) to enable adding notes / updating / creating / tagging tickets."
         )
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when ZAMMAD_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not _get_client().settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
 
 
 # ---- curated field projections (expand=true resolves the *_id names) -----
@@ -221,6 +267,7 @@ async def add_note(
     body: Annotated[str, Field(description="The note text.")],
     internal: Annotated[bool, Field(description="True = internal (agent-only) note; False = note visible to the customer.")] = True,
     html: Annotated[bool, Field(description="Treat body as HTML (content_type text/html) instead of plain text.")] = False,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Add a note/comment to a ticket (WRITE — requires ZAMMAD_ALLOW_WRITE).
 
@@ -237,6 +284,8 @@ async def add_note(
         "sender": "Agent",
         "content_type": "text/html" if html else "text/plain",
     }
+    if preview := _confirm("add_note", payload, f"Add {'an internal' if internal else 'a customer-visible'} note to ticket {ticket_id}.", confirm):
+        return preview
     data = await _get_client().post("ticket_articles", json=payload)
     return _pick(data, ("id", "ticket_id", "type", "internal", "sender", "created_at"))
 
@@ -250,6 +299,7 @@ async def update_ticket(
     owner_id: Annotated[int | None, Field(description="New owner (agent) user id.")] = None,
     title: Annotated[str | None, Field(description="New title.")] = None,
     pending_time: Annotated[str | None, Field(description="When a pending state is due, ISO 8601 (e.g. '2026-10-12T08:00:00Z'). Give it with state 'pending reminder' / 'pending close'.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Update a ticket's state/priority/group/owner/title (WRITE — requires ZAMMAD_ALLOW_WRITE).
 
@@ -272,6 +322,8 @@ async def update_ticket(
         payload["pending_time"] = pending_time
     if not payload:
         raise ValueError("Nothing to update: provide state, priority, group, owner_id, title and/or pending_time.")
+    if preview := _confirm("update_ticket", {"ticket_id": ticket_id, **payload}, f"Update ticket {ticket_id}: {', '.join(payload)}.", confirm):
+        return preview
     data = await _get_client().put(f"tickets/{ticket_id}", json=payload, params={"expand": "true"})
     return _pick(data, _TICKET_FIELDS)
 
@@ -286,6 +338,7 @@ async def create_ticket(
     state: Annotated[str | None, Field(description="Initial state name (optional, e.g. 'new', 'open').")] = None,
     priority: Annotated[str | None, Field(description="Initial priority name (optional).")] = None,
     html: Annotated[bool, Field(description="Treat body as HTML instead of plain text.")] = False,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Create a ticket with an initial note (WRITE — requires ZAMMAD_ALLOW_WRITE).
 
@@ -303,6 +356,8 @@ async def create_ticket(
         payload["state"] = state
     if priority is not None:
         payload["priority"] = priority
+    if preview := _confirm("create_ticket", payload, f"Create ticket '{title}' in group {group} for {customer}.", confirm):
+        return preview
     data = await _get_client().post("tickets", json=payload, params={"expand": "true"})
     return _pick(data, _TICKET_FIELDS)
 
@@ -312,6 +367,7 @@ async def tag_ticket(
     ticket_id: Annotated[int, Field(description="The ticket id.")],
     add: Annotated[list[str] | None, Field(description="Tags to add, e.g. ['vpn', 'escalated'].")] = None,
     remove: Annotated[list[str] | None, Field(description="Tags to remove.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Add and/or remove tags on a ticket (WRITE — requires ZAMMAD_ALLOW_WRITE).
 
@@ -321,6 +377,8 @@ async def tag_ticket(
     _require_write()
     if not add and not remove:
         raise ValueError("Nothing to do: provide add and/or remove.")
+    if preview := _confirm("tag_ticket", {"ticket_id": ticket_id, "add": add or [], "remove": remove or []}, f"Tags on ticket {ticket_id}: add {add or []}, remove {remove or []}.", confirm):
+        return preview
     client = _get_client()
     for tag in add or ():
         await client.post("tags/add", json={"item": tag, "object": "Ticket", "o_id": ticket_id})

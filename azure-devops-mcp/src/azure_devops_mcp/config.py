@@ -29,6 +29,7 @@ class Settings:
     api_version: str = "7.0"
     project: str = ""
     allow_write: bool = False
+    confirm_write: bool = True
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -66,6 +67,7 @@ class Settings:
             api_version=env.get("AZDO_API_VERSION", "7.0").strip(),
             project=env.get("AZDO_PROJECT", "").strip(),
             allow_write=_bool_env(env, "AZDO_ALLOW_WRITE", False),
+            confirm_write=_bool_env(env, "AZDO_CONFIRM_WRITE", True),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),

@@ -1,9 +1,10 @@
-"""Async FortiGate FortiOS REST API client (read-only, API-token auth).
+"""Async FortiGate FortiOS REST API client (API-token auth; GET plus opt-in cmdb writes).
 
 A single ``httpx.AsyncClient`` is shared across all tools. Authentication is a static REST API
 token sent as ``Authorization: Bearer <token>`` on every request — there is no session/login to
 maintain. FortiOS response envelopes are validated (``status``/``http_status``) and a failure
-becomes a clean ``FortiError`` so tools never leak tracebacks to the model.
+becomes a clean ``FortiError`` so tools never leak tracebacks to the model; FortiOS's numeric
+``error`` code and ``cli_error`` text are included in the message.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ class FortiError(RuntimeError):
 
 
 class FortiClient:
-    """Minimal async client for the FortiGate FortiOS REST API (GET only)."""
+    """Minimal async client for the FortiGate FortiOS REST API (GET, plus POST/PUT on cmdb)."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -71,6 +72,16 @@ class FortiClient:
         url = f"{self._settings.api_base}/{tree}/{path.lstrip('/')}"
         return await self._request("GET", url, vdom=vdom, params=params)
 
+    async def post(self, path: str, *, json: Any, vdom: str | None = None) -> dict[str, Any]:
+        """POST ``json`` to a cmdb table (write: create an object)."""
+        url = f"{self._settings.api_base}/cmdb/{path.lstrip('/')}"
+        return await self._request("POST", url, vdom=vdom, json=json)
+
+    async def put(self, path: str, *, json: Any, vdom: str | None = None) -> dict[str, Any]:
+        """PUT ``json`` to a cmdb object (write: only the given attributes change)."""
+        url = f"{self._settings.api_base}/cmdb/{path.lstrip('/')}"
+        return await self._request("PUT", url, vdom=vdom, json=json)
+
     async def get_raw(
         self, path: str, *, vdom: str | None = None, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -95,6 +106,7 @@ class FortiClient:
         *,
         vdom: str | None = None,
         params: dict[str, Any] | None = None,
+        json: Any = None,
     ) -> dict[str, Any]:
         q: dict[str, Any] = dict(params or {})
         effective_vdom = self._settings.vdom if vdom is None else vdom
@@ -103,7 +115,7 @@ class FortiClient:
 
         client = await self._http()
         try:
-            resp = await client.request(method, url, params=q, headers=self._auth_headers())
+            resp = await client.request(method, url, params=q, json=json, headers=self._auth_headers())
         except httpx.HTTPError as exc:
             raise FortiError(f"Network error calling FortiGate {url}: {exc}") from exc
 
@@ -128,10 +140,39 @@ def _try_json(resp: httpx.Response) -> dict[str, Any]:
     return data if isinstance(data, dict) else {"results": data}
 
 
+# Common FortiOS cmdb error codes (the envelope's numeric ``error`` field).
+_FOS_ERRORS = {
+    -1: "invalid length of value",
+    -3: "entry not found",
+    -5: "a duplicate entry already exists",
+    -8: "invalid IP address",
+    -14: "permission denied, insufficient privileges",
+    -20: "blank entry",
+    -651: "input value is invalid",
+    -703: "unknown keyword",
+}
+
+
+def _fos_detail(env: dict[str, Any]) -> str:
+    """FortiOS's own error detail: message, numeric ``error`` code (+ meaning) and ``cli_error``."""
+    if not isinstance(env, dict):
+        return ""
+    parts: list[str] = []
+    if env.get("message"):
+        parts.append(str(env["message"]))
+    code = env.get("error")
+    if isinstance(code, int) and not isinstance(code, bool):
+        meaning = _FOS_ERRORS.get(code)
+        parts.append(f"error {code}" + (f" ({meaning})" if meaning else ""))
+    elif code:
+        parts.append(str(code))
+    if env.get("cli_error"):
+        parts.append(f"cli_error: {str(env['cli_error']).strip()}")
+    return "; ".join(parts)
+
+
 def _format_error(status: int, env: dict[str, Any], resp: httpx.Response) -> str:
-    msg = ""
-    if isinstance(env, dict):
-        msg = env.get("message") or env.get("error") or ""
+    msg = _fos_detail(env)
     if status == 401:
         return (
             "FortiGate 401 — API token invalid/expired, or the source IP is not in the REST API "
@@ -139,11 +180,13 @@ def _format_error(status: int, env: dict[str, Any], resp: httpx.Response) -> str
         )
     if status == 403:
         return (
-            "FortiGate 403 — the REST API admin's access profile lacks read permission for this "
-            "resource (grant read on the relevant permission group, e.g. fwgrp/sysgrp/netgrp)."
+            "FortiGate 403 — the REST API admin's access profile lacks permission for this resource "
+            "(grant read on the relevant permission group, e.g. fwgrp/sysgrp/netgrp; write tools need "
+            "read-write on Firewall)."
         )
     if status == 404:
-        return "FortiGate 404 — no resource at that API path (or it does not exist in this VDOM)."
+        tail = f" ({msg})" if msg else ""
+        return f"FortiGate 404 — no resource at that API path (or it does not exist in this VDOM){tail}."
     if status == 424:
         return f"FortiGate 424 — failed dependency. {msg}".rstrip()
     if status == 429:

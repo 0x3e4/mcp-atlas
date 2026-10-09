@@ -141,6 +141,7 @@ def test_tag_and_pending_payloads_match_the_zammad_api():
 
     env = _base_env()
     env["ZAMMAD_ALLOW_WRITE"] = "true"
+    env["ZAMMAD_CONFIRM_WRITE"] = "false"
     client = server.ZammadClient(Settings.from_env(env))
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     server._client = client
@@ -164,3 +165,48 @@ def test_tag_and_pending_payloads_match_the_zammad_api():
         ("GET", "/api/v1/tags?object=Ticket&o_id=42", None),
         ("PUT", "/api/v1/tickets/42?expand=true", {"state": "pending reminder", "pending_time": "2026-10-12T08:00:00Z"}),
     ]
+
+
+CONFIRM_TOOLS = {'create_ticket', 'update_ticket', 'add_note', 'tag_ticket'}
+
+
+def test_write_tools_take_a_confirm_code_and_confirm_defaults_on():
+    tools = _tools()
+    for name in CONFIRM_TOOLS:
+        assert "confirm" in tools[name].inputSchema["properties"], name
+    assert Settings.from_env(_base_env()).confirm_write is True
+    env = _base_env()
+    env["ZAMMAD_CONFIRM_WRITE"] = "false"
+    assert Settings.from_env(env).confirm_write is False
+
+
+def test_writes_need_a_matching_confirm_code():
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.method)
+        return httpx.Response(200, json={"id": 9, "ticket_id": 42})
+
+    env = _base_env()
+    env["ZAMMAD_ALLOW_WRITE"] = "true"
+    client = server.ZammadClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    server._client = client
+
+    async def calls():
+        preview = await server.add_note(42, "Called the user.")
+        assert preview["status"] == "confirmation_required" and preview["changed"] is False
+        assert "Confirm it?" in preview["next"]
+        code = preview["confirm_code"]
+        # a code only fits the exact arguments it was issued for
+        other = await server.add_note(42, "Something else.", confirm=code)
+        assert other["status"] == "confirmation_required" and "did not match" in other["note"]
+        assert sent == []
+        done = await server.add_note(42, "Called the user.", confirm=code)
+        assert done.get("status") != "confirmation_required"
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None
+    assert sent == ["POST"]

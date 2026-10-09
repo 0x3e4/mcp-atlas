@@ -12,6 +12,10 @@ off the server is effectively read-only.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import secrets
 import sys
 from typing import Annotated, Any
 
@@ -22,7 +26,14 @@ from pydantic import Field
 from .client import AzdoClient, AzdoError
 from .config import ConfigError, Settings
 
-mcp = FastMCP("azure-devops-mcp")
+mcp = FastMCP(
+    "azure-devops-mcp",
+    instructions=(
+        "Write tools need the user's confirmation: the first call changes nothing and returns a preview "
+        "with a confirm_code. Show the user a short overview of what will change, end with 'Confirm it?', "
+        "and only after they say yes repeat the call with confirm=<code>."
+    ),
+)
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: AzdoClient | None = None
@@ -50,6 +61,41 @@ def _require_write() -> None:
             "Write tools are disabled. Set AZDO_ALLOW_WRITE=true (and use a PAT with write scopes) "
             "to enable work-item and wiki writes."
         )
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when AZDO_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not _get_client().settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
 
 
 # ---- curated field projections (dotted paths reach into nested objects) --
@@ -366,6 +412,7 @@ async def create_work_item(
     area_path: Annotated[str | None, Field(description="Area path (System.AreaPath).")] = None,
     iteration_path: Annotated[str | None, Field(description="Iteration path (System.IterationPath).")] = None,
     fields: Annotated[dict[str, Any] | None, Field(description="Extra fields by reference name, e.g. {\"Microsoft.VSTS.Common.Priority\": 2}.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Create a work item (WRITE — requires AZDO_ALLOW_WRITE).
 
@@ -385,6 +432,8 @@ async def create_work_item(
     for ref, value in (fields or {}).items():
         ops.append({"op": "add", "path": f"/fields/{ref}", "value": value})
     path = f"_apis/wit/workitems/${quote(work_item_type, safe='')}"
+    if preview := _confirm("create_work_item", {"project": _proj(project), "type": work_item_type, "ops": ops}, f"Create {work_item_type} '{title}' in project {_proj(project)}.", confirm):
+        return preview
     data = await _get_client().json_patch("POST", path, ops, project=_proj(project))
     return _pick(data, ("id", "rev", "fields", "url"))
 
@@ -397,6 +446,7 @@ async def update_work_item(
     assigned_to: Annotated[str | None, Field(description="New assignee (System.AssignedTo).")] = None,
     comment: Annotated[str | None, Field(description="Add a discussion comment (recorded in System.History).")] = None,
     fields: Annotated[dict[str, Any] | None, Field(description="Other fields to set by reference name.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Update a work item's fields and/or add a comment (WRITE — requires AZDO_ALLOW_WRITE).
 
@@ -415,6 +465,8 @@ async def update_work_item(
         ops.append({"op": "add", "path": "/fields/System.History", "value": comment})
     if not ops:
         raise ValueError("Nothing to update: provide title, state, assigned_to, fields, and/or comment.")
+    if preview := _confirm("update_work_item", {"id": id, "ops": ops}, f"Update work item {id}: {', '.join(o['path'].removeprefix('/fields/') for o in ops)}.", confirm):
+        return preview
     data = await _get_client().json_patch("PATCH", f"_apis/wit/workitems/{id}", ops)
     return _pick(data, ("id", "rev", "fields", "url"))
 
@@ -427,6 +479,7 @@ async def create_or_update_wiki_page(
     path: Annotated[str, Field(description="Page path, e.g. '/Runbooks/Deploy'. Parent pages must exist.")],
     content: Annotated[str, Field(description="The page's markdown content (replaces existing content).")],
     project: Annotated[str | None, Field(description="Project name/id; omit to use AZDO_PROJECT.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Create a wiki page, or replace its content if it exists (WRITE — requires AZDO_ALLOW_WRITE).
 
@@ -446,6 +499,8 @@ async def create_or_update_wiki_page(
     except AzdoError as exc:
         if exc.status != 404:
             raise  # a real error (auth, etc.), not "page absent"
+    if preview := _confirm("create_or_update_wiki_page", {"wiki": wiki, "path": path, "project": proj, "content": content, "version": etag}, f"{'Replace' if existed else 'Create'} wiki page {path} in wiki {wiki}.", confirm):
+        return preview
     result, new_etag = await client.put_json(
         page_path, {"content": content}, project=proj, params={"path": path},
         if_match=etag if existed else None,

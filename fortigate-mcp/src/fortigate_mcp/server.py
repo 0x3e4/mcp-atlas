@@ -1,13 +1,22 @@
-"""FastMCP server exposing read-only FortiGate (FortiOS REST API) tools.
+"""FastMCP server exposing FortiGate (FortiOS REST API) tools.
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
-always-on HTTP server. All tools are GET-only (read-only) — there are no configuration actions.
-Curated tools cover the common questions across the cmdb (config) and monitor (live) trees; the raw
-``fortios_get`` escape hatch reaches anything else.
+always-on HTTP server. Read tools (GET) cover the common questions across the cmdb (config) and
+monitor (live) trees; the raw ``fortios_get`` escape hatch reaches anything else. Write tools
+(create/update address objects, add/remove address-group members, enable/disable a policy) are
+**opt-in**: they refuse unless ``FORTIGATE_ALLOW_WRITE=true`` and need a REST API admin with a
+read-write access profile for Firewall. With the flag off the server is read-only. Unless
+``FORTIGATE_CONFIRM_WRITE=false``, every write first returns a preview plus a confirm code and only
+runs when called again with that code, after the user has confirmed.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import ipaddress
+import json
+import secrets
 import sys
 from typing import Annotated, Any
 from urllib.parse import quote
@@ -19,7 +28,15 @@ from pydantic import Field
 from .client import FortiClient, FortiError
 from .config import ConfigError, Settings
 
-mcp = FastMCP("fortigate-mcp")
+mcp = FastMCP(
+    "fortigate-mcp",
+    instructions=(
+        "Write tools (create_address/update_address/add_to_address_group/remove_from_address_group/"
+        "set_policy_status) need the user's confirmation: the first call changes nothing and returns a "
+        "preview with a confirm_code. Show the user a short overview of what will change, end with "
+        "'Confirm it?', and only after they say yes repeat the call with confirm=<code>."
+    ),
+)
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: FortiClient | None = None
@@ -30,6 +47,51 @@ def _get_client() -> FortiClient:
     if _client is None:
         _client = FortiClient(Settings.from_env())
     return _client
+
+
+def _require_write() -> None:
+    """Gate write tools behind the opt-in FORTIGATE_ALLOW_WRITE flag."""
+    if not _get_client().settings.allow_write:
+        raise ValueError(
+            "Write tools are disabled. Set FORTIGATE_ALLOW_WRITE=true (and use a REST API admin whose "
+            "access profile has read-write on Firewall) to change address objects, groups and policies."
+        )
+
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when FORTIGATE_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not _get_client().settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
 
 
 # ---- curated field projections (the useful columns per resource) --------
@@ -57,6 +119,8 @@ _POLICY_STAT_FIELDS = (
 )
 _VPN_FIELDS = ("name", "rgwy", "incoming_bytes", "outgoing_bytes", "connection_count", "proxyid")
 _ROUTE_MON_FIELDS = ("type", "ip_mask", "gateway", "interface", "distance", "metric", "uptime")
+# fields kept from a cmdb POST/PUT response envelope
+_WRITE_FIELDS = ("http_method", "status", "http_status", "mkey", "vdom", "revision_changed")
 
 
 # ---- helpers ------------------------------------------------------------
@@ -119,6 +183,77 @@ async def _get_list(
     if not full:
         rows = [_pick(r, fields) if isinstance(r, dict) else r for r in rows]
     return {"vdom": env.get("vdom"), "count": len(rows), "results": rows}
+
+
+def _written(env: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    """Trim a cmdb write response to the envelope essentials plus what was written."""
+    out = {k: v for k, v in _pick(env, _WRITE_FIELDS).items() if v is not None}
+    out.update(extra)
+    return out
+
+
+def _enc(name: str) -> str:
+    """URL-encode an object name for a cmdb path segment (names may hold spaces, '/', etc.)."""
+    return quote(str(name), safe="")
+
+
+def _ipv4(value: str, what: str) -> ipaddress.IPv4Address:
+    try:
+        return ipaddress.IPv4Address(value.strip())
+    except ValueError as exc:
+        raise ValueError(f"{what} must be an IPv4 address; got {value!r}.") from exc
+
+
+def _subnet(value: str) -> str:
+    """'10.0.0.0/24', '10.0.0.0 255.255.255.0' or a bare IP -> FortiOS 'ip mask' form."""
+    v = " ".join(value.split())
+    try:
+        iface = ipaddress.IPv4Interface(v.replace(" ", "/"))
+    except ValueError as exc:
+        raise ValueError(
+            f"subnet must be an IPv4 address/prefix like '10.0.0.0/24' or '10.0.0.10'; got {value!r}."
+        ) from exc
+    return f"{iface.ip} {iface.netmask}"
+
+
+def _address_payload(
+    subnet: str | None, fqdn: str | None, start_ip: str | None, end_ip: str | None,
+    *, required: bool,
+) -> dict[str, Any]:
+    """Build the type + value part of a firewall/address body (exactly one kind, or none)."""
+    rng = start_ip is not None or end_ip is not None
+    kinds = sum((subnet is not None, fqdn is not None, rng))
+    if kinds > 1:
+        raise ValueError("Give one kind of address: subnet, fqdn, or start_ip+end_ip — not several.")
+    if kinds == 0:
+        if required:
+            raise ValueError("Give the address: subnet, fqdn, or start_ip+end_ip.")
+        return {}
+    if subnet is not None:
+        return {"type": "ipmask", "subnet": _subnet(subnet)}
+    if fqdn is not None:
+        f = fqdn.strip()
+        if not f or " " in f:
+            raise ValueError(f"fqdn must be a hostname like 'app.test.corp'; got {fqdn!r}.")
+        return {"type": "fqdn", "fqdn": f}
+    if start_ip is None or end_ip is None:
+        raise ValueError("An IP range needs both start_ip and end_ip.")
+    lo, hi = _ipv4(start_ip, "start_ip"), _ipv4(end_ip, "end_ip")
+    if lo > hi:
+        raise ValueError("start_ip must not be greater than end_ip.")
+    return {"type": "iprange", "start-ip": str(lo), "end-ip": str(hi)}
+
+
+async def _group_members(group: str, vdom: str | None) -> list[str]:
+    """Current member names of a firewall address group (FortiError 404 if it doesn't exist)."""
+    env = await _get_client().get("cmdb", f"firewall/addrgrp/{_enc(group)}", vdom=vdom)
+    members = _one(env).get("member") or []
+    return [m.get("name") for m in members if isinstance(m, dict) and m.get("name")]
+
+
+def _names(values: list[str]) -> list[str]:
+    """Strip, drop blanks and de-duplicate member names (keeping order)."""
+    return list(dict.fromkeys(v.strip() for v in values if v and v.strip()))
 
 
 # ---- tools: configuration (cmdb) ----------------------------------------
@@ -344,6 +479,163 @@ async def fortios_get(
     if start is not None:
         params["start"] = start
     return await _get_client().get(tree, path, vdom=vdom, params=params or None)
+
+
+# ---- tools: writes (opt-in, gated by FORTIGATE_ALLOW_WRITE) --------------
+
+_VDOM_DESC = "VDOM to change; omit to use the configured default."
+
+
+@mcp.tool()
+async def create_address(
+    name: Annotated[str, Field(description="Name of the new address object.", min_length=1)],
+    subnet: Annotated[str | None, Field(description="IPv4 host or subnet, e.g. '10.0.0.10' or '10.0.0.0/24' (type ipmask).")] = None,
+    fqdn: Annotated[str | None, Field(description="Hostname, e.g. 'app.test.corp' (type fqdn).")] = None,
+    start_ip: Annotated[str | None, Field(description="First IPv4 address of a range (type iprange; needs end_ip).")] = None,
+    end_ip: Annotated[str | None, Field(description="Last IPv4 address of a range (type iprange; needs start_ip).")] = None,
+    comment: Annotated[str | None, Field(description="Comment on the object.")] = None,
+    vdom: Annotated[str | None, Field(description=_VDOM_DESC)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Create an IPv4 firewall address object (WRITE — requires FORTIGATE_ALLOW_WRITE).
+
+    POSTs /api/v2/cmdb/firewall/address. Give exactly one of subnet, fqdn or start_ip+end_ip.
+    FortiOS refuses a duplicate name (error -5). Use add_to_address_group to put it in a group.
+    """
+    _require_write()
+    name = name.strip()
+    if not name:
+        raise ValueError("name must not be blank.")
+    payload: dict[str, Any] = {"name": name, **_address_payload(subnet, fqdn, start_ip, end_ip, required=True)}
+    if comment is not None:
+        payload["comment"] = comment
+    value = payload.get("subnet") or payload.get("fqdn") or f"{payload.get('start-ip')}-{payload.get('end-ip')}"
+    if preview := _confirm("create_address", {"vdom": vdom, **payload}, f"Create address '{name}' ({payload['type']} {value}).", confirm):
+        return preview
+    env = await _get_client().post("firewall/address", json=payload, vdom=vdom)
+    return _written(env, address=payload)
+
+
+@mcp.tool()
+async def update_address(
+    name: Annotated[str, Field(description="Name of the existing address object.", min_length=1)],
+    subnet: Annotated[str | None, Field(description="New IPv4 host or subnet, e.g. '10.0.0.0/24' (sets type ipmask).")] = None,
+    fqdn: Annotated[str | None, Field(description="New hostname (sets type fqdn).")] = None,
+    start_ip: Annotated[str | None, Field(description="New range start (sets type iprange; needs end_ip).")] = None,
+    end_ip: Annotated[str | None, Field(description="New range end (sets type iprange; needs start_ip).")] = None,
+    comment: Annotated[str | None, Field(description="New comment ('' clears it).")] = None,
+    vdom: Annotated[str | None, Field(description=_VDOM_DESC)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Change an address object's value or comment (WRITE — requires FORTIGATE_ALLOW_WRITE).
+
+    PUTs /api/v2/cmdb/firewall/address/{name}; only the fields you give change. The change applies
+    at once to every policy/group that uses the object — check list_addresses / list_policies first.
+    The object can't be renamed here.
+    """
+    _require_write()
+    payload = _address_payload(subnet, fqdn, start_ip, end_ip, required=False)
+    if comment is not None:
+        payload["comment"] = comment
+    if not payload:
+        raise ValueError("Nothing to update: provide subnet, fqdn, start_ip+end_ip or comment.")
+    change = {"name": name, "vdom": vdom, **payload}
+    if preview := _confirm("update_address", change, f"Update address '{name}': {', '.join(payload)}.", confirm):
+        return preview
+    env = await _get_client().put(f"firewall/address/{_enc(name)}", json=payload, vdom=vdom)
+    return _written(env, address={"name": name, **payload})
+
+
+@mcp.tool()
+async def add_to_address_group(
+    group: Annotated[str, Field(description="Name of the existing address group.", min_length=1)],
+    members: Annotated[list[str], Field(description="Address or address-group names to add.", min_length=1)],
+    vdom: Annotated[str | None, Field(description=_VDOM_DESC)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Add members to an address group, keeping the existing ones (WRITE — requires FORTIGATE_ALLOW_WRITE).
+
+    FortiOS replaces a group's whole member list, so this reads the current members
+    (GET /api/v2/cmdb/firewall/addrgrp/{group}) and PUTs the merged list back to the same path.
+    The members must already exist as address objects/groups.
+    """
+    _require_write()
+    wanted = _names(members)
+    if not wanted:
+        raise ValueError("Give at least one member name.")
+    current = await _group_members(group, vdom)
+    added = [m for m in wanted if m not in current]
+    if not added:
+        raise ValueError(f"Nothing to change: {', '.join(wanted)} already in group '{group}'.")
+    member = current + added
+    payload = {"member": [{"name": m} for m in member]}
+    change = {"group": group, "vdom": vdom, "add": added, **payload}
+    if preview := _confirm("add_to_address_group", change, f"Add {', '.join(added)} to address group '{group}'.", confirm):
+        return preview
+    env = await _get_client().put(f"firewall/addrgrp/{_enc(group)}", json=payload, vdom=vdom)
+    return _written(env, group=group, added=added, members=member)
+
+
+@mcp.tool()
+async def remove_from_address_group(
+    group: Annotated[str, Field(description="Name of the existing address group.", min_length=1)],
+    members: Annotated[list[str], Field(description="Member names to take out of the group (the objects themselves stay).", min_length=1)],
+    vdom: Annotated[str | None, Field(description=_VDOM_DESC)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Remove members from an address group, keeping the others (WRITE — requires FORTIGATE_ALLOW_WRITE).
+
+    Reads the current members (GET /api/v2/cmdb/firewall/addrgrp/{group}) and PUTs the remaining
+    list back to the same path. A group can't be emptied (FortiOS needs at least one member); the
+    address objects themselves are not deleted.
+    """
+    _require_write()
+    drop = _names(members)
+    if not drop:
+        raise ValueError("Give at least one member name.")
+    current = await _group_members(group, vdom)
+    removed = [m for m in current if m in drop]
+    if not removed:
+        raise ValueError(
+            f"Nothing to change: none of {', '.join(drop)} is in group '{group}' (members: {', '.join(current)})."
+        )
+    member = [m for m in current if m not in drop]
+    if not member:
+        raise ValueError(f"Refusing to empty address group '{group}': FortiOS needs at least one member.")
+    payload = {"member": [{"name": m} for m in member]}
+    change = {"group": group, "vdom": vdom, "remove": removed, **payload}
+    if preview := _confirm("remove_from_address_group", change, f"Remove {', '.join(removed)} from address group '{group}'.", confirm):
+        return preview
+    env = await _get_client().put(f"firewall/addrgrp/{_enc(group)}", json=payload, vdom=vdom)
+    out = _written(env, group=group, removed=removed, members=member)
+    if not_found := [m for m in drop if m not in removed]:
+        out["not_members"] = not_found
+    return out
+
+
+@mcp.tool()
+async def set_policy_status(
+    policy_id: Annotated[int, Field(description="Numeric policyid of the firewall policy (see list_policies).", ge=0)],
+    enabled: Annotated[bool, Field(description="true = enable the policy, false = disable it.")],
+    comment: Annotated[str | None, Field(description="Optional note; REPLACES the policy's comments field. Omit to keep it.")] = None,
+    vdom: Annotated[str | None, Field(description=_VDOM_DESC)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Enable or disable a firewall policy (WRITE — requires FORTIGATE_ALLOW_WRITE).
+
+    PUTs {"status": "enable"|"disable"} to /api/v2/cmdb/firewall/policy/{policy_id}. Disabling stops
+    new sessions matching the policy at once (traffic falls through to later policies / implicit
+    deny); it is reversible with enabled=true. Nothing else in the policy changes.
+    """
+    _require_write()
+    payload: dict[str, Any] = {"status": "enable" if enabled else "disable"}
+    if comment is not None:
+        payload["comments"] = comment
+    change = {"policy_id": policy_id, "vdom": vdom, **payload}
+    if preview := _confirm("set_policy_status", change, f"{payload['status'].capitalize()} firewall policy {policy_id}.", confirm):
+        return preview
+    env = await _get_client().put(f"firewall/policy/{policy_id}", json=payload, vdom=vdom)
+    return _written(env, policy={"policyid": policy_id, **payload})
 
 
 def main() -> None:

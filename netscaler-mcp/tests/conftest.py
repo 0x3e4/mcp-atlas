@@ -12,15 +12,19 @@ from netscaler_mcp.config import Settings
 
 @pytest.fixture
 def ns(tmp_path):
-    """A fresh fake appliance wired into the server; ns.use(allow_write=False) flips the write flag."""
+    """A fresh fake appliance wired into the server; ns.use(allow_write=False) flips the write flag.
+
+    Confirmation is off by default so flows apply directly; ns.use(confirm_write=True) turns it on.
+    """
     fake = FakeNetScaler()
 
-    def use(allow_write: bool = True) -> None:
+    def use(allow_write: bool = True, confirm_write: bool = False) -> None:
         env = {
             "NETSCALER_BASE_URL": "https://ns",
             "NETSCALER_USER": "u",
             "NETSCALER_PASSWORD": "p",
             "NETSCALER_ALLOW_WRITE": str(allow_write).lower(),
+            "NETSCALER_CONFIRM_WRITE": str(confirm_write).lower(),
             "NETSCALER_EXPORT_DIR": str(tmp_path),
         }
         client = server.NitroClient(Settings.from_env(env))

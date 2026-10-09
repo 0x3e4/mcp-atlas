@@ -8,13 +8,18 @@ WAF (AppFw) rollout tools list learned rules, the URL inventory and configured r
 profiles as portable JSON (reads). Their write tools — add/remove rules, deploy/discard learned rules,
 set check actions, import/rehost profiles, save config — are **opt-in**: they preview by default
 (``dry_run=true``) and refuse to apply unless ``NETSCALER_ALLOW_WRITE=true``. With the flag off the
-server is effectively read-only. The regex/host/plan logic lives in ``waf.py``.
+server is effectively read-only. Unless ``NETSCALER_CONFIRM_WRITE=false``, every preview also carries a
+confirm code, and a write only applies when called again with that code, after the user has confirmed.
+The regex/host/plan logic lives in ``waf.py``.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import re
+import secrets
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,7 +33,16 @@ from . import bot, waf
 from .client import NitroClient, NitroError
 from .config import ConfigError, Settings
 
-mcp = FastMCP("netscaler-mcp")
+mcp = FastMCP(
+    "netscaler-mcp",
+    instructions=(
+        "Write tools (add_*/remove_*/deploy_*/discard_*/set_*/import_*/rehost_*/update_signatures/"
+        "save_config) need the user's confirmation: a preview (dry_run=true, or a first dry_run=false call) "
+        "changes nothing and returns a confirm_code. Show the user a short overview of what will change, "
+        "end with 'Confirm it?', and only after they say yes repeat the call with dry_run=false and "
+        "confirm=<code>."
+    ),
+)
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: NitroClient | None = None
@@ -48,6 +62,87 @@ def _require_write() -> None:
             "Write tools are disabled. Set NETSCALER_ALLOW_WRITE=true (and use a system user whose "
             "command policy allows appfw changes) to apply WAF changes. dry_run=true previews still work."
         )
+
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when NETSCALER_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not _get_client().settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
+
+
+def _call_args(params: dict[str, Any]) -> dict[str, Any]:
+    """A write tool's own arguments (from ``locals()`` at the top of the tool) minus dry_run/confirm."""
+    return {k: v for k, v in params.items() if k not in ("dry_run", "confirm")}
+
+
+def _gate(
+    tool: str,
+    change: dict[str, Any],
+    summary: str,
+    preview: dict[str, Any],
+    *,
+    dry_run: bool,
+    confirm: str | None,
+    writes: bool = True,
+) -> bool:
+    """Decide whether a previewing (dry_run) write tool applies now; True means go ahead.
+
+    ``change`` is the tool's arguments plus the plan computed against the live appliance, so a changed
+    live state needs a new preview. Otherwise ``preview`` (built in "would ..." form) becomes the answer:
+    dry_run=true stays a pure preview, and with NETSCALER_CONFIRM_WRITE on it carries the confirm_code;
+    dry_run=false without the matching code answers the same way and applies nothing. A plan without
+    writes needs no confirmation.
+    """
+    if not writes:
+        return not dry_run
+    pending = _confirm(tool, change, summary, None if dry_run else confirm)
+    if pending is None:
+        return not dry_run
+    code = pending["confirm_code"]
+    # deploy/discard already use "summary" for their status tally
+    preview["change_summary" if "summary" in preview else "summary"] = summary
+    preview.update(
+        dry_run=True,
+        status=pending["status"],
+        confirm_code=code,
+        next=(
+            "Show the user a short overview of this plan and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments, dry_run=false and confirm='{code}'."
+        ),
+    )
+    if "note" in pending:
+        preview["note"] = pending["note"]
+    return False
 
 
 _EXPORT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,150}\.json")
@@ -649,8 +744,11 @@ async def _apply_document(
     mode: str,
     include_settings: bool | None,
     dry_run: bool,
+    tool: str,
+    args: dict[str, Any],
+    confirm: str | None,
 ) -> dict[str, Any]:
-    """Plan a profile document against ``target`` and, unless dry_run, apply it in a traffic-safe order."""
+    """Plan a profile document against ``target`` and, once confirmed, apply it in a traffic-safe order."""
     if mode not in ("merge", "replace"):
         raise ValueError("mode must be 'merge' or 'replace'.")
     if not dry_run:
@@ -683,7 +781,7 @@ async def _apply_document(
         "target_profile": target,
         "mode": mode,
         "dry_run": dry_run,
-        "profile": "exists" if exists else ("would create" if dry_run else "created"),
+        "profile": "exists" if exists else "would create",
         "settings_changes": setting_changes,
         "rules": {
             key: {op: len(v) if isinstance(v, list) else v for op, v in ops.items()} for key, ops in plan.items()
@@ -692,14 +790,25 @@ async def _apply_document(
     }
     if extra_key:
         out[f"{extra_key}_changes"] = extra_changes
-    if dry_run:
-        out["preview"] = {
+    preview = {
+        **out,
+        "preview": {
             key: {op: v[:25] for op, v in ops.items() if isinstance(v, list) and v} for key, ops in plan.items()
-        }
-        out["next"] = (
-            "Review, then call again with dry_run=false (needs NETSCALER_ALLOW_WRITE); persist with save_config."
-        )
-        return out
+        },
+        "next": "Review, then call again with dry_run=false (needs NETSCALER_ALLOW_WRITE); persist with save_config.",
+    }
+    writes = not exists or bool(setting_changes or extra_changes) or any(
+        isinstance(v, list) and v for ops in plan.values() for v in ops.values()
+    )
+    change = {
+        "args": args,
+        "plan": {"profile_exists": exists, "settings": setting_changes, "extra": extra_changes, "rules": plan},
+    }
+    summary = f"{'Update' if exists else 'Create'} {kind.key} profile '{target}' ({mode}) from a profile document."
+    if not _gate(tool, change, summary, preview, dry_run=dry_run, confirm=confirm, writes=writes):
+        return preview
+    if not exists:
+        out["profile"] = "created"
 
     errors: list[str] = []
     if not exists:
@@ -776,6 +885,9 @@ async def _apply_rule(
     *,
     comment: str | None = None,
     dry_run: bool = True,
+    tool: str,
+    args: dict[str, Any],
+    confirm: str | None = None,
 ) -> dict[str, Any]:
     """Shared body of add_waf_rule / add_bot_rule: bind the rule on each profile that lacks it."""
     spec = kind.types[key]
@@ -792,16 +904,21 @@ async def _apply_rule(
         except NitroError as exc:
             results.append({"profile": name, "status": f"error: {exc}"})
             continue
-        if waf.binding_key(spec, row) in {waf.binding_key(spec, r) for r in existing}:
-            status = "exists"
-        elif dry_run:
-            status = "would add"
-        else:
-            status = await _bind(spec, name, row)
-        results.append({"profile": name, "status": status})
+        exists = waf.binding_key(spec, row) in {waf.binding_key(spec, r) for r in existing}
+        results.append({"profile": name, "status": "exists" if exists else "would add"})
     out: dict[str, Any] = {"dry_run": dry_run, "rule_type": key, "rule": row, "results": results}
-    if dry_run:
-        out["next"] = "Call again with dry_run=false to bind (needs NETSCALER_ALLOW_WRITE); persist with save_config."
+    targets = [r["profile"] for r in results if r["status"] == "would add"]
+    preview = {
+        **out,
+        "next": "Call again with dry_run=false to bind (needs NETSCALER_ALLOW_WRITE); persist with save_config.",
+    }
+    change = {"args": args, "plan": {"rule_type": key, "rule": row, "results": results}}
+    summary = f"Add {kind.key} {key} rule to {', '.join(targets) or 'no profile'}."
+    if not _gate(tool, change, summary, preview, dry_run=dry_run, confirm=confirm, writes=bool(targets)):
+        return preview
+    out["results"] = [
+        {**r, "status": await _bind(spec, r["profile"], row)} if r["status"] == "would add" else r for r in results
+    ]
     return out
 
 
@@ -812,6 +929,9 @@ async def _remove_rule(
     rule: dict[str, Any],
     all_matches: bool,
     dry_run: bool,
+    tool: str,
+    args: dict[str, Any],
+    confirm: str | None,
 ) -> dict[str, Any]:
     """Shared body of remove_waf_rule / remove_bot_rule."""
     key = kind.rule_type(rule_type)
@@ -829,11 +949,14 @@ async def _remove_rule(
             f"{len(matches)} rules match; add identifying attributes or pass all_matches=true. "
             f"Matches: {matches[:10]}"
         )
-    results = []
-    for row in matches:
-        status = "would remove" if dry_run else await _unbind(spec, profile, row)
-        results.append({"rule": row, "status": status})
-    return {"profile": profile, "rule_type": key, "dry_run": dry_run, "matched": len(matches), "results": results}
+    out: dict[str, Any] = {"profile": profile, "rule_type": key, "dry_run": dry_run, "matched": len(matches)}
+    preview = {**out, "results": [{"rule": row, "status": "would remove"} for row in matches]}
+    change = {"args": args, "plan": {"rule_type": key, "remove": matches}}
+    summary = f"Remove {len(matches)} {kind.key} {key} rule(s) from profile '{profile}'."
+    if not _gate(tool, change, summary, preview, dry_run=dry_run, confirm=confirm, writes=bool(matches)):
+        return preview
+    out["results"] = [{"rule": row, "status": await _unbind(spec, profile, row)} for row in matches]
+    return out
 
 
 async def _export_profile(
@@ -872,6 +995,9 @@ async def _import_profile(
     mode: str,
     include_settings: bool | None,
     dry_run: bool,
+    tool: str,
+    args: dict[str, Any],
+    confirm: str | None,
 ) -> dict[str, Any]:
     """Shared body of import_waf_profile / import_bot_profile."""
     if (document is None) == (file is None):
@@ -894,7 +1020,10 @@ async def _import_profile(
     extra: dict[str, Any] = {}
     if host_map:
         doc, extra["host_replacements"] = kind.apply_host_map(doc, host_map)
-    out = await _apply_document(kind, doc, target, mode=mode, include_settings=include_settings, dry_run=dry_run)
+    out = await _apply_document(
+        kind, doc, target, mode=mode, include_settings=include_settings, dry_run=dry_run,
+        tool=tool, args=args, confirm=confirm,
+    )
     return {**extra, **out}
 
 
@@ -905,6 +1034,9 @@ async def _rehost_profile(
     to_host: str,
     target_profile: str | None,
     dry_run: bool,
+    tool: str,
+    args: dict[str, Any],
+    confirm: str | None,
 ) -> dict[str, Any]:
     """Shared body of rehost_waf_profile / rehost_bot_profile."""
     doc, replacements = kind.apply_host_map(await _export_document(kind, profile), {from_host: to_host})
@@ -917,7 +1049,8 @@ async def _rehost_profile(
     target = (target_profile or "").strip() or profile
     in_place = target == profile
     out = await _apply_document(
-        kind, doc, target, mode="replace", include_settings=True if in_place else None, dry_run=dry_run
+        kind, doc, target, mode="replace", include_settings=True if in_place else None, dry_run=dry_run,
+        tool=tool, args=args, confirm=confirm,
     )
     return {"host_replacements": replacements, **out}
 
@@ -1088,7 +1221,8 @@ async def add_waf_rule(
     rule_type: Annotated[str | None, Field(description="rule='raw' only: the rule type (see list_waf_rules).")] = None,
     binding_attrs: Annotated[dict[str, Any] | None, Field(description="rule='raw' only: NITRO binding attributes, e.g. {\"denyurl\": \"^https://x/admin/.*$\"}.")] = None,
     comment: Annotated[str | None, Field(description="Comment stored on the rule.")] = None,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Add an easy WAF rule without hand-writing NetScaler regexes (WRITE — requires NETSCALER_ALLOW_WRITE).
 
@@ -1098,6 +1232,7 @@ async def add_waf_rule(
     Skips profiles that already have the rule. Previews by default. Live immediately once applied;
     persist with save_config.
     """
+    args = _call_args(locals())
     if rule == "raw":
         key = waf.WAF.rule_type(rule_type)
         row = waf.clean_binding(dict(binding_attrs or {}))
@@ -1106,7 +1241,9 @@ async def add_waf_rule(
             rule, host=host, path=path, match=match, scheme=scheme, extensions=extensions, field=field,
             field_is_regex=field_is_regex, location=location, value=value,
         )
-    return await _apply_rule(waf.WAF, profile, key, row, comment=comment, dry_run=dry_run)
+    return await _apply_rule(
+        waf.WAF, profile, key, row, comment=comment, dry_run=dry_run, tool="add_waf_rule", args=args, confirm=confirm
+    )
 
 
 @mcp.tool()
@@ -1115,7 +1252,8 @@ async def remove_waf_rule(
     rule_type: Annotated[str, Field(description="Rule type, as in list_waf_rules (e.g. 'start_url').")],
     rule: Annotated[dict[str, Any], Field(description="The rule to remove: a row from list_waf_rules, or just its main value, e.g. {\"starturl\": \"^https://app\\\\.corp/old/.*$\"}.")],
     all_matches: Annotated[bool, Field(description="Remove every rule matching the given attributes (otherwise several matches is an error).")] = False,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Remove (unbind) a WAF rule from a profile (WRITE — requires NETSCALER_ALLOW_WRITE).
 
@@ -1123,7 +1261,10 @@ async def remove_waf_rule(
     type/expression, ruletype); other keys are ignored. Previews by default. Live immediately once
     applied; persist with save_config.
     """
-    return await _remove_rule(waf.WAF, profile, rule_type, rule, all_matches, dry_run)
+    return await _remove_rule(
+        waf.WAF, profile, rule_type, rule, all_matches, dry_run,
+        tool="remove_waf_rule", args=_call_args(locals()), confirm=confirm,
+    )
 
 
 @mcp.tool()
@@ -1134,7 +1275,8 @@ async def deploy_waf_learned_rules(
     min_hits: Annotated[int | None, Field(description="Only entries seen at least this many times.", ge=0)] = None,
     remove_learned: Annotated[bool, Field(description="Delete deployed entries from the learning database, as the GUI's Deploy does.")] = True,
     limit: Annotated[int, Field(description="Max rules to deploy in one call.", ge=1, le=2000)] = 500,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Deploy learned entries as WAF relaxation rules (WRITE — requires NETSCALER_ALLOW_WRITE).
 
@@ -1145,6 +1287,7 @@ async def deploy_waf_learned_rules(
     few broad add_waf_rule prefixes usually beat hundreds of exact URLs (add those first; covered
     entries are then just cleared). Live immediately once applied; persist with save_config.
     """
+    args = _call_args(locals())
     key = waf.WAF.rule_type(rule_type)
     spec = waf.RULE_TYPES[key]
     if not spec.learned:
@@ -1180,22 +1323,44 @@ async def deploy_waf_learned_rules(
         elif allow and waf.is_covered(row["starturl"], allow):
             result["status"] = "covered"
         else:
-            result["status"] = "would add" if dry_run else await _bind(spec, profile, row)
-        if remove_learned and result["status"] in ("exists", "covered", "added", "would add"):
-            result["learned"] = "would remove" if dry_run else await _forget_learned(spec, profile, row)
+            result["status"] = "would add"
+        if remove_learned:
+            result["learned"] = "would remove"
         results.append(result)
-    out: dict[str, Any] = {
-        "profile": profile,
-        "rule_type": key,
-        "dry_run": dry_run,
-        "matched": len(entries),
-        "unmapped": unmapped,
-        "summary": _tally([r["status"] for r in results]),
-        "results": results[:200],
-    }
-    if dry_run:
-        out["next"] = "Check each 'rule', then call again with dry_run=false; persist with save_config."
-    return out
+
+    def _answer(rows: list[dict[str, Any]], applied: bool) -> dict[str, Any]:
+        return {
+            "profile": profile,
+            "rule_type": key,
+            "dry_run": not applied,
+            "matched": len(entries),
+            "unmapped": unmapped,
+            "summary": _tally([r["status"] for r in rows]),
+            "results": rows[:200],
+        }
+
+    preview = _answer(results, False)
+    preview["next"] = "Check each 'rule', then call again with dry_run=false; persist with save_config."
+    # Hit counts keep moving (and reorder entries) while learning runs: bind the rules, not the counts.
+    plan = sorted(json.dumps({k: v for k, v in r.items() if k != "hits"}, sort_keys=True) for r in results)
+    adds = sum(r["status"] == "would add" for r in results)
+    summary = f"Deploy {adds} learned {key} rule(s) on profile '{profile}'" + (
+        f" and clear {len(results)} learned entries." if remove_learned else "."
+    )
+    if not _gate(
+        "deploy_waf_learned_rules", {"args": args, "plan": plan}, summary, preview,
+        dry_run=dry_run, confirm=confirm, writes=bool(adds or (remove_learned and results)),
+    ):
+        return preview
+    for result in results:
+        if result["status"] == "would add":
+            result["status"] = await _bind(spec, profile, result["rule"])
+        if "learned" in result:
+            if result["status"] in ("exists", "covered", "added"):
+                result["learned"] = await _forget_learned(spec, profile, result["rule"])
+            else:  # the bind failed: keep the learned entry
+                del result["learned"]
+    return _answer(results, True)
 
 
 @mcp.tool()
@@ -1206,13 +1371,15 @@ async def discard_waf_learned_rules(
     max_hits: Annotated[int | None, Field(description="Only entries seen at most this many times (one-off noise).", ge=0)] = None,
     all_entries: Annotated[bool, Field(description="Discard every learned entry of this check (required when no filter is given).")] = False,
     limit: Annotated[int, Field(description="Max entries to discard in one call.", ge=1, le=2000)] = 500,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Delete learned entries that must not become rules — scanner noise, attack attempts, test junk
     (WRITE — requires NETSCALER_ALLOW_WRITE).
 
     Needs a filter (contains / max_hits) or all_entries=true, and previews by default.
     """
+    args = _call_args(locals())
     key = waf.WAF.rule_type(rule_type)
     spec = waf.RULE_TYPES[key]
     if not spec.learned:
@@ -1225,22 +1392,39 @@ async def discard_waf_learned_rules(
     entries = await _learned_entries(profile, spec.check, spec, contains)
     if max_hits is not None:
         entries = [e for e in entries if (e["hits"] or 0) <= max_hits]
-    results: list[dict[str, Any]] = []
-    for entry in entries[: _clamp(limit, default=500, maximum=2000)]:
-        row = entry.get("rule") or {}
-        if not waf.learned_delete_args(spec, row):
-            status = "unmapped"
-        else:
-            status = "would remove" if dry_run else await _forget_learned(spec, profile, row)
-        results.append({"hits": entry["hits"], "learned": entry["learned"], "status": status})
-    return {
-        "profile": profile,
-        "rule_type": key,
-        "dry_run": dry_run,
-        "matched": len(entries),
-        "summary": _tally([r["status"] for r in results]),
-        "results": results[:200],
-    }
+    picked = entries[: _clamp(limit, default=500, maximum=2000)]
+    results: list[dict[str, Any]] = [
+        {
+            "hits": entry["hits"],
+            "learned": entry["learned"],
+            "status": "would remove" if waf.learned_delete_args(spec, entry.get("rule") or {}) else "unmapped",
+        }
+        for entry in picked
+    ]
+
+    def _answer(applied: bool) -> dict[str, Any]:
+        return {
+            "profile": profile,
+            "rule_type": key,
+            "dry_run": not applied,
+            "matched": len(entries),
+            "summary": _tally([r["status"] for r in results]),
+            "results": results[:200],
+        }
+
+    preview = _answer(False)
+    plan = sorted(json.dumps({"learned": r["learned"], "status": r["status"]}, sort_keys=True) for r in results)
+    removals = sum(r["status"] == "would remove" for r in results)
+    summary = f"Discard {removals} learned {key} entries from profile '{profile}'."
+    if not _gate(
+        "discard_waf_learned_rules", {"args": args, "plan": plan}, summary, preview,
+        dry_run=dry_run, confirm=confirm, writes=bool(removals),
+    ):
+        return preview
+    for entry, result in zip(picked, results):
+        if result["status"] == "would remove":
+            result["status"] = await _forget_learned(spec, profile, entry.get("rule") or {})
+    return _answer(True)
 
 
 @mcp.tool()
@@ -1250,7 +1434,8 @@ async def set_waf_check_actions(
     set_actions: Annotated[list[str] | None, Field(description="Replace the action list with these: none, block, learn, log, stats.")] = None,
     add_actions: Annotated[list[str] | None, Field(description="Add these actions, e.g. ['block'] when going live.")] = None,
     remove_actions: Annotated[list[str] | None, Field(description="Remove these actions, e.g. ['learn'] once rules are deployed.")] = None,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Change what a WAF profile does per security check — the learn → block switch (WRITE — requires
     NETSCALER_ALLOW_WRITE).
@@ -1261,6 +1446,7 @@ async def set_waf_check_actions(
     (with checks=['all'], 'learn' is skipped where unsupported). Shows before/after per check; previews
     by default. Live immediately once applied; persist with save_config.
     """
+    args = _call_args(locals())
     if set_actions is None and not add_actions and not remove_actions:
         raise ValueError("Pass set_actions, or add_actions / remove_actions.")
     if not dry_run:
@@ -1285,9 +1471,14 @@ async def set_waf_check_actions(
         table[check] = {"attribute": attr, "before": current.get(attr), "after": after, "changed": changed}
         if changed:
             changes[attr] = after
-    if changes and not dry_run:
+    out: dict[str, Any] = {"profile": profile, "dry_run": dry_run, "changed": len(changes), "checks": table}
+    summary = f"Change the actions of {len(changes)} check(s) on WAF profile '{profile}'."
+    change = {"args": args, "plan": changes}
+    if not _gate("set_waf_check_actions", change, summary, out, dry_run=dry_run, confirm=confirm, writes=bool(changes)):
+        return out
+    if changes:
         await _get_client().update("appfwprofile", {"name": profile, **changes})
-    return {"profile": profile, "dry_run": dry_run, "changed": len(changes), "checks": table}
+    return out
 
 
 @mcp.tool()
@@ -1298,7 +1489,8 @@ async def import_waf_profile(
     host_map: Annotated[dict[str, str] | None, Field(description="Switch hostnames on the way in, e.g. {\"app.test.corp\": \"app.corp\"}.")] = None,
     mode: Annotated[str, Field(description="'merge' adds missing rules only; 'replace' makes the profile's rules match the document — it also re-binds changed rules and REMOVES rules not in the document.")] = "merge",
     include_settings: Annotated[bool | None, Field(description="Apply the document's profile settings (check actions, limits, …) and learning thresholds. Default: only when the profile is created, so an existing profile keeps its own learn/block actions.")] = None,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Import a WAF profile document — copy a tuned profile to another environment or appliance
     (WRITE — requires NETSCALER_ALLOW_WRITE).
@@ -1309,7 +1501,8 @@ async def import_waf_profile(
     be bound to an AppFw policy to take effect. Live immediately once applied; persist with save_config.
     """
     return await _import_profile(
-        waf.WAF, document, file, target_profile, host_map, mode, include_settings, dry_run
+        waf.WAF, document, file, target_profile, host_map, mode, include_settings, dry_run,
+        tool="import_waf_profile", args=_call_args(locals()), confirm=confirm,
     )
 
 
@@ -1319,7 +1512,8 @@ async def rehost_waf_profile(
     from_host: Annotated[str, Field(description="Hostname in the current rules, e.g. 'app.test.corp' (append ':port' to switch a port as well).")],
     to_host: Annotated[str, Field(description="New hostname, e.g. 'app.corp'.")],
     target_profile: Annotated[str | None, Field(description="Write the rehosted copy into this profile (created if missing) and leave the source untouched.")] = None,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Switch a WAF profile's rules to another hostname — e.g. reuse the test app's tuned profile for
     prod (WRITE — requires NETSCALER_ALLOW_WRITE).
@@ -1331,17 +1525,24 @@ async def rehost_waf_profile(
     mode; settings are copied only when the target is created). Rules for any host ('*') need no
     switching. Previews by default; persist with save_config.
     """
-    return await _rehost_profile(waf.WAF, profile, from_host, to_host, target_profile, dry_run)
+    return await _rehost_profile(
+        waf.WAF, profile, from_host, to_host, target_profile, dry_run,
+        tool="rehost_waf_profile", args=_call_args(locals()), confirm=confirm,
+    )
 
 
 @mcp.tool()
-async def save_config() -> dict[str, Any]:
+async def save_config(
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
     """Save the running configuration (save ns config) so applied WAF changes survive a reboot
     (WRITE — requires NETSCALER_ALLOW_WRITE).
 
     NITRO changes are live immediately but only in the running config until saved.
     """
     _require_write()
+    if preview := _confirm("save_config", {"action": "save ns config"}, "Save the running configuration.", confirm):
+        return preview
     await _get_client().action("nsconfig", "save")
     return {"saved": True}
 
@@ -1417,7 +1618,8 @@ async def add_bot_rule(
     rule_type: Annotated[str | None, Field(description="rule='raw' only: the rule type (see list_bot_rules).")] = None,
     binding_attrs: Annotated[dict[str, Any] | None, Field(description="rule='raw' only: NITRO binding attributes, e.g. {\"bot_whitelist\": true, \"bot_whitelist_type\": \"SUBNET\", \"bot_whitelist_value\": \"10.0.0.0/24\"}.")] = None,
     comment: Annotated[str | None, Field(description="Comment stored on the entry.")] = None,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Add a Bot management entry without hand-writing NITRO attributes (WRITE — requires NETSCALER_ALLOW_WRITE).
 
@@ -1428,6 +1630,7 @@ async def add_bot_rule(
     level — set_bot_detections does that. Skips profiles that already have the entry; previews by
     default. Live immediately once applied; persist with save_config.
     """
+    args = _call_args(locals())
     if rule == "raw":
         key = bot.BOT.rule_type(rule_type)
         row = waf.clean_binding(dict(binding_attrs or {}))
@@ -1437,7 +1640,9 @@ async def add_bot_rule(
             category=category, actions=actions, rate=rate, timeslice=timeslice, threshold=threshold,
             percentage=percentage, log=log,
         )
-    return await _apply_rule(bot.BOT, profile, key, row, comment=comment, dry_run=dry_run)
+    return await _apply_rule(
+        bot.BOT, profile, key, row, comment=comment, dry_run=dry_run, tool="add_bot_rule", args=args, confirm=confirm
+    )
 
 
 @mcp.tool()
@@ -1446,7 +1651,8 @@ async def remove_bot_rule(
     rule_type: Annotated[str, Field(description="Rule type, as in list_bot_rules (e.g. 'allow_list').")],
     rule: Annotated[dict[str, Any], Field(description="The entry to remove: a row from list_bot_rules, or just its selector and value, e.g. {\"bot_whitelist\": true, \"bot_whitelist_value\": \"10.0.0.0/24\"}.")],
     all_matches: Annotated[bool, Field(description="Remove every entry matching the given attributes (otherwise several matches is an error).")] = False,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Remove (unbind) a Bot entry from a profile (WRITE — requires NETSCALER_ALLOW_WRITE).
 
@@ -1454,7 +1660,10 @@ async def remove_bot_rule(
     its value, type, category or URL); other keys are ignored. Previews by default. Live immediately
     once applied; persist with save_config.
     """
-    return await _remove_rule(bot.BOT, profile, rule_type, rule, all_matches, dry_run)
+    return await _remove_rule(
+        bot.BOT, profile, rule_type, rule, all_matches, dry_run,
+        tool="remove_bot_rule", args=_call_args(locals()), confirm=confirm,
+    )
 
 
 @mcp.tool()
@@ -1464,7 +1673,8 @@ async def set_bot_detections(
     enable: Annotated[bool | None, Field(description="Switch the detections on (true) or off (false); omit to change actions only.")] = None,
     actions: Annotated[list[str] | None, Field(description="Action list for the detections that carry one on the profile (device_fingerprint, trap, signature_no_user_agent, signature_multiple_user_agent, spoofed_request): NONE, LOG, DROP, REDIRECT, RESET, MITIGATION — CHECKLAST instead of NONE for signature_multiple_user_agent.")] = None,
     signature: Annotated[str | None, Field(description="Bind this botsignature object to the profile (static signature detection); see list_signatures.")] = None,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Switch Bot detections on/off and set their actions — the bot counterpart of the WAF learn→block
     step (WRITE — requires NETSCALER_ALLOW_WRITE).
@@ -1476,6 +1686,7 @@ async def set_bot_detections(
     before/after per detection; previews by default. Live immediately once applied; persist with
     save_config.
     """
+    args = _call_args(locals())
     if enable is None and not actions and not signature:
         raise ValueError("Pass enable, actions and/or signature.")
     if not dry_run:
@@ -1514,9 +1725,14 @@ async def set_bot_detections(
         table["signature_object"] = {"before": current.get("signature"), "after": signature}
         if waf.settings_changes({"signature": signature}, current):
             changes["signature"] = signature
-    if changes and not dry_run:
+    out: dict[str, Any] = {"profile": profile, "dry_run": dry_run, "changed": len(changes), "detections": table}
+    summary = f"Change {len(changes)} detection setting(s) on Bot profile '{profile}'."
+    change = {"args": args, "plan": changes}
+    if not _gate("set_bot_detections", change, summary, out, dry_run=dry_run, confirm=confirm, writes=bool(changes)):
+        return out
+    if changes:
         await _get_client().update(bot.BOT.profile, {"name": profile, **changes})
-    return {"profile": profile, "dry_run": dry_run, "changed": len(changes), "detections": table}
+    return out
 
 
 @mcp.tool()
@@ -1542,7 +1758,8 @@ async def import_bot_profile(
     host_map: Annotated[dict[str, str] | None, Field(description="Switch hostnames on the way in, e.g. {\"app.test.corp\": \"app.corp\"}.")] = None,
     mode: Annotated[str, Field(description="'merge' adds missing entries only; 'replace' makes the profile's entries match the document — it also re-binds changed ones and REMOVES entries not in the document.")] = "merge",
     include_settings: Annotated[bool | None, Field(description="Apply the document's profile settings (detection switches and actions). Default: only when the profile is created, so an existing profile keeps its own switches.")] = None,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Import a Bot profile document — copy a tuned profile to another environment or appliance
     (WRITE — requires NETSCALER_ALLOW_WRITE).
@@ -1554,7 +1771,8 @@ async def import_bot_profile(
     persist with save_config.
     """
     return await _import_profile(
-        bot.BOT, document, file, target_profile, host_map, mode, include_settings, dry_run
+        bot.BOT, document, file, target_profile, host_map, mode, include_settings, dry_run,
+        tool="import_bot_profile", args=_call_args(locals()), confirm=confirm,
     )
 
 
@@ -1564,7 +1782,8 @@ async def rehost_bot_profile(
     from_host: Annotated[str, Field(description="Hostname in the current entries, e.g. 'app.test.corp'.")],
     to_host: Annotated[str, Field(description="New hostname, e.g. 'app.corp'.")],
     target_profile: Annotated[str | None, Field(description="Write the rehosted copy into this profile (created if missing) and leave the source untouched.")] = None,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Switch a Bot profile's entries to another hostname (WRITE — requires NETSCALER_ALLOW_WRITE).
 
@@ -1573,7 +1792,10 @@ async def rehost_bot_profile(
     often reports nothing to do — copy such a profile with import_bot_profile instead. Previews by
     default; persist with save_config.
     """
-    return await _rehost_profile(bot.BOT, profile, from_host, to_host, target_profile, dry_run)
+    return await _rehost_profile(
+        bot.BOT, profile, from_host, to_host, target_profile, dry_run,
+        tool="rehost_bot_profile", args=_call_args(locals()), confirm=confirm,
+    )
 
 
 # ---- tools: signatures, enforcement and violations (WAF + Bot) -----------
@@ -1732,7 +1954,8 @@ async def update_signatures(
     kind: Annotated[str, Field(description="'waf' or 'bot'.")],
     name: Annotated[str, Field(description="Signature object name, as listed by list_signatures.")],
     merge_default: Annotated[bool, Field(description="WAF only: merge the fetched rules with the default signatures (NITRO 'mergedefault').")] = False,
-    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE.")] = True,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Re-fetch a signature object from its configured source URL (WRITE — requires NETSCALER_ALLOW_WRITE).
 
@@ -1741,22 +1964,27 @@ async def update_signatures(
     answers 3319 / 1768 when it cannot, 3323 when a sha1 check fails). New rules take effect at once for
     every profile bound to the object, so prefer a change window; persist with save_config.
     """
+    args = _call_args(locals())
     features = _features(kind)
     if len(features) != 1:
         raise ValueError("kind must be 'waf' or 'bot' for an update.")
+    if not dry_run:
+        _require_write()
     resource = _SIGNATURE_SOURCES[features[0]][0]
     body: dict[str, Any] = {"name": name}
     if features[0] == "waf" and merge_default:
         body["mergedefault"] = True
-    if dry_run:
-        return {
-            "dry_run": True,
-            "kind": features[0],
-            "would_post": f"config/{resource}?action=update",
-            "body": body,
-            "next": "Call again with dry_run=false to update (needs NETSCALER_ALLOW_WRITE).",
-        }
-    _require_write()
+    preview = {
+        "dry_run": True,
+        "kind": features[0],
+        "would_post": f"config/{resource}?action=update",
+        "body": body,
+        "next": "Call again with dry_run=false to update (needs NETSCALER_ALLOW_WRITE).",
+    }
+    change = {"args": args, "plan": {"resource": resource, "body": body}}
+    summary = f"Update {features[0]} signature object '{name}' from its source URL."
+    if not _gate("update_signatures", change, summary, preview, dry_run=dry_run, confirm=confirm):
+        return preview
     await _get_client().action(resource, "update", body)
     return {"dry_run": False, "kind": features[0], "updated": name}
 

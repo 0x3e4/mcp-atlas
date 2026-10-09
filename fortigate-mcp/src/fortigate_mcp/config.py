@@ -1,7 +1,9 @@
 """Configuration for the FortiGate MCP server, loaded from environment variables.
 
 Secrets are never hardcoded; everything comes from the process environment (typically supplied
-via ``--env-file`` for Docker, or a local ``.env`` exported into the shell).
+via ``--env-file`` for Docker, or a local ``.env`` exported into the shell). Writes are opt-in via
+``FORTIGATE_ALLOW_WRITE``; each write then needs the user's confirmation unless
+``FORTIGATE_CONFIRM_WRITE=false``.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ class Settings:
     base_url: str
     api_token: str
     vdom: str = "root"
+    allow_write: bool = False
+    confirm_write: bool = True
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -61,6 +65,8 @@ class Settings:
             base_url=env["FORTIGATE_BASE_URL"].strip().rstrip("/"),
             api_token=env["FORTIGATE_API_TOKEN"],
             vdom=env.get("FORTIGATE_VDOM", "root").strip(),
+            allow_write=_bool_env(env, "FORTIGATE_ALLOW_WRITE", False),
+            confirm_write=_bool_env(env, "FORTIGATE_CONFIRM_WRITE", True),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),

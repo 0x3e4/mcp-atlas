@@ -84,6 +84,10 @@ class GraphClient:
         """POST ``json`` to ``path``."""
         return await self._request("POST", path, json=json)
 
+    async def patch(self, path: str, json: Any) -> Any:
+        """PATCH ``json`` to ``path`` (only the given properties change)."""
+        return await self._request("PATCH", path, json=json)
+
     async def run_hunting_query(self, query: str, timespan: str | None = None) -> dict[str, Any]:
         """Run an advanced-hunting KQL query via ``POST /security/runHuntingQuery``.
 
@@ -160,12 +164,18 @@ def _format_graph_error(resp: httpx.Response) -> str:
     status = resp.status_code
     code = ""
     message = ""
+    details: list[str] = []
     try:
         body = resp.json()
         err = body.get("error", {})
         if isinstance(err, dict):
             code = err.get("code", "") or ""
             message = err.get("message", "") or ""
+            # Bad-request errors may list per-field problems in error.details[].
+            for d in err.get("details") or []:
+                if isinstance(d, dict) and d.get("message"):
+                    target = d.get("target")
+                    details.append(f"{target}: {d['message']}" if target else str(d["message"]))
         elif isinstance(err, str):
             code = err
             message = body.get("error_description", "") or ""
@@ -173,6 +183,13 @@ def _format_graph_error(resp: httpx.Response) -> str:
         message = resp.text[:300]
 
     if status == 403 or code == "Authorization_RequestDenied":
+        if _is_write(resp):
+            return (
+                "Graph 403 Authorization_RequestDenied — the app registration is missing an "
+                "admin-consented write permission for this call: SecurityIncident.ReadWrite.All "
+                "(update/comment incidents) or SecurityAlert.ReadWrite.All (update/comment alerts). "
+                "Grant the permission in Entra and click 'Grant admin consent', then retry."
+            )
         return (
             "Graph 403 Authorization_RequestDenied — the app registration is missing an "
             "admin-consented application permission for this call. Read-only permissions needed: "
@@ -193,4 +210,17 @@ def _format_graph_error(resp: httpx.Response) -> str:
             f"Back off and retry.{hint}"
         )
     detail = f" {code}: {message}".rstrip() if (code or message) else ""
+    if details:
+        detail += " (" + "; ".join(details) + ")"
     return f"Graph {status} error.{detail}".strip()
+
+
+def _is_write(resp: httpx.Response) -> bool:
+    """True when the failed request was a write (PATCH, or POST other than the hunting query)."""
+    try:
+        req = resp.request
+    except RuntimeError:  # a bare Response built without a request (tests)
+        return False
+    if req.method == "PATCH":
+        return True
+    return req.method == "POST" and not req.url.path.endswith("/runHuntingQuery")

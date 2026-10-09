@@ -2,7 +2,8 @@
 
 Secrets are never hardcoded; everything comes from the process environment (typically supplied
 via ``--env-file`` for Docker, or a local ``.env`` exported into the shell). WAF write tools are
-opt-in via ``NETSCALER_ALLOW_WRITE``; ``NETSCALER_EXPORT_DIR`` enables file-based export/import.
+opt-in via ``NETSCALER_ALLOW_WRITE`` and, unless ``NETSCALER_CONFIRM_WRITE=false``, need a confirm code
+from their preview before they apply; ``NETSCALER_EXPORT_DIR`` enables file-based export/import.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ class Settings:
     verify_ssl: bool = True
     ca_bundle: str = ""
     allow_write: bool = False
+    confirm_write: bool = True
     export_dir: str = ""
 
     @classmethod
@@ -84,6 +86,7 @@ class Settings:
             verify_ssl=_bool_env(env, "NETSCALER_VERIFY_SSL", True),
             ca_bundle=env.get("NETSCALER_CA_BUNDLE", "").strip(),
             allow_write=_bool_env(env, "NETSCALER_ALLOW_WRITE", False),
+            confirm_write=_bool_env(env, "NETSCALER_CONFIRM_WRITE", True),
             export_dir=env.get("NETSCALER_EXPORT_DIR", "").strip(),
         )
 

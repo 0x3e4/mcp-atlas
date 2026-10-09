@@ -27,6 +27,7 @@ class Settings:
     base_url: str
     token: str
     allow_write: bool = False
+    confirm_write: bool = True
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -62,6 +63,7 @@ class Settings:
             base_url=env["SNIPEIT_BASE_URL"].strip().rstrip("/"),
             token=env["SNIPEIT_TOKEN"],
             allow_write=_bool_env(env, "SNIPEIT_ALLOW_WRITE", False),
+            confirm_write=_bool_env(env, "SNIPEIT_CONFIRM_WRITE", True),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),

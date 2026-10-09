@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "bookstack-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "BookStack MCP server (read + opt-in write) — shelves, books, chapters, pages, search and export"
 readme = "README.md"
 requires-python = ">=3.14"

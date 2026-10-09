@@ -9,6 +9,10 @@ token whose user has the matching permissions. With the flag off the server is e
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import secrets
 import sys
 from typing import Annotated, Any
 from urllib.parse import quote
@@ -20,7 +24,14 @@ from pydantic import Field
 from .client import SnipeClient
 from .config import ConfigError, Settings
 
-mcp = FastMCP("snipeit-mcp")
+mcp = FastMCP(
+    "snipeit-mcp",
+    instructions=(
+        "Write tools need the user's confirmation: the first call changes nothing and returns a preview "
+        "with a confirm_code. Show the user a short overview of what will change, end with 'Confirm it?', "
+        "and only after they say yes repeat the call with confirm=<code>."
+    ),
+)
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: SnipeClient | None = None
@@ -40,6 +51,41 @@ def _require_write() -> None:
             "Write tools are disabled. Set SNIPEIT_ALLOW_WRITE=true (and use a token whose user has "
             "the matching permissions) to enable checkout/checkin/update/create/audit."
         )
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when SNIPEIT_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not _get_client().settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
 
 
 # ---- curated field projections (dotted paths reach nested {id,name} objects) --
@@ -232,6 +278,7 @@ async def checkout_asset(
     status_id: Annotated[int | None, Field(description="Status label id to set on checkout (optional).")] = None,
     expected_checkin: Annotated[str | None, Field(description="Expected check-in date 'YYYY-MM-DD' (optional).")] = None,
     note: Annotated[str | None, Field(description="Checkout note (optional).")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Check out an asset to a user/location/asset (WRITE — requires SNIPEIT_ALLOW_WRITE).
 
@@ -248,6 +295,8 @@ async def checkout_asset(
         payload["expected_checkin"] = expected_checkin
     if note:
         payload["note"] = note
+    if preview := _confirm("checkout_asset", {"asset_id": asset_id, **payload}, f"Check out asset {asset_id} to {to_type} {to_id}.", confirm):
+        return preview
     return _write_result(await _get_client().post(f"hardware/{asset_id}/checkout", json=payload))
 
 
@@ -257,6 +306,7 @@ async def checkin_asset(
     status_id: Annotated[int | None, Field(description="Status label id to set on check-in (optional).")] = None,
     location_id: Annotated[int | None, Field(description="Location id to set on check-in (optional).")] = None,
     note: Annotated[str | None, Field(description="Check-in note (optional).")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Check in an asset (WRITE — requires SNIPEIT_ALLOW_WRITE). POSTs /hardware/{id}/checkin."""
     _require_write()
@@ -267,6 +317,8 @@ async def checkin_asset(
         payload["location_id"] = location_id
     if note:
         payload["note"] = note
+    if preview := _confirm("checkin_asset", {"asset_id": asset_id, **payload}, f"Check in asset {asset_id}.", confirm):
+        return preview
     return _write_result(await _get_client().post(f"hardware/{asset_id}/checkin", json=payload))
 
 
@@ -281,6 +333,7 @@ async def update_asset(
     notes: Annotated[str | None, Field(description="New notes.")] = None,
     location_id: Annotated[int | None, Field(description="New (default/RTD) location id.")] = None,
     company_id: Annotated[int | None, Field(description="New company id.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Update an asset's fields (WRITE — requires SNIPEIT_ALLOW_WRITE). PATCHes /hardware/{id}."""
     _require_write()
@@ -293,6 +346,8 @@ async def update_asset(
             payload[key] = value
     if not payload:
         raise ValueError("Nothing to update: provide at least one field.")
+    if preview := _confirm("update_asset", {"asset_id": asset_id, **payload}, f"Update asset {asset_id}: {', '.join(payload)}.", confirm):
+        return preview
     return _write_result(await _get_client().patch(f"hardware/{asset_id}", json=payload))
 
 
@@ -305,6 +360,7 @@ async def create_asset(
     serial: Annotated[str | None, Field(description="Serial number (optional).")] = None,
     notes: Annotated[str | None, Field(description="Notes (optional).")] = None,
     company_id: Annotated[int | None, Field(description="Company id (optional).")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Create an asset (WRITE — requires SNIPEIT_ALLOW_WRITE). POSTs /hardware.
 
@@ -315,6 +371,8 @@ async def create_asset(
     for key, value in (("name", name), ("serial", serial), ("notes", notes), ("company_id", company_id)):
         if value is not None:
             payload[key] = value
+    if preview := _confirm("create_asset", payload, f"Create asset {asset_tag} (model {model_id}, status {status_id}).", confirm):
+        return preview
     return _write_result(await _get_client().post("hardware", json=payload))
 
 
@@ -324,6 +382,7 @@ async def audit_asset(
     location_id: Annotated[int | None, Field(description="Location id to record/update during the audit (optional).")] = None,
     note: Annotated[str | None, Field(description="Audit note (optional).")] = None,
     next_audit_date: Annotated[str | None, Field(description="Next audit date 'YYYY-MM-DD' (optional).")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Record an audit of an asset (WRITE — requires SNIPEIT_ALLOW_WRITE). POSTs /hardware/audit."""
     _require_write()
@@ -334,6 +393,8 @@ async def audit_asset(
         payload["note"] = note
     if next_audit_date:
         payload["next_audit_date"] = next_audit_date
+    if preview := _confirm("audit_asset", payload, f"Record an audit of asset {asset_tag}.", confirm):
+        return preview
     data = await _get_client().post("hardware/audit", json=payload)
     return {
         "status": data.get("status") if isinstance(data, dict) else None,

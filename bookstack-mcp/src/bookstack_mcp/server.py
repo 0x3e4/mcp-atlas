@@ -6,10 +6,16 @@ pages), search, export and attachments; the raw ``bookstack_get`` escape hatch r
 (users, roles, comments, image-gallery, audit-log, …). Write tools (create/update pages, chapters,
 books and shelves, comment on a page) are **opt-in**: they refuse unless ``BOOKSTACK_ALLOW_WRITE=true``
 and need a token whose user has the matching permissions. With the flag off the server is read-only.
+Unless ``BOOKSTACK_CONFIRM_WRITE=false``, every write first returns a preview plus a confirm code and
+only runs when called again with that code, after the user has confirmed.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import secrets
 import sys
 from html import escape
 from typing import Annotated, Any
@@ -21,7 +27,14 @@ from pydantic import Field
 from .client import BookStackClient
 from .config import ConfigError, Settings
 
-mcp = FastMCP("bookstack-mcp")
+mcp = FastMCP(
+    "bookstack-mcp",
+    instructions=(
+        "Write tools (create_*/update_*/add_comment) need the user's confirmation: the first call changes "
+        "nothing and returns a preview with a confirm_code. Show the user a short overview of what will "
+        "change, end with 'Confirm it?', and only after they say yes repeat the call with confirm=<code>."
+    ),
+)
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: BookStackClient | None = None
@@ -41,6 +54,42 @@ def _require_write() -> None:
             "Write tools are disabled. Set BOOKSTACK_ALLOW_WRITE=true (and use a token whose user has "
             "the matching create/update permissions) to create or edit pages, chapters, books and shelves."
         )
+
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when BOOKSTACK_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not _get_client().settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
 
 
 # ---- curated field projections ------------------------------------------
@@ -356,6 +405,7 @@ async def create_page(
     html: Annotated[str | None, Field(description="Page body as HTML. Give this or markdown.")] = None,
     tags: Annotated[dict[str, str] | None, Field(description="Tags as {name: value}; use '' for a tag without a value.")] = None,
     changelog: Annotated[str | None, Field(description="Revision note for the page history.", min_length=1, max_length=180)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Create a page in a book or chapter (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/pages.
 
@@ -370,6 +420,9 @@ async def create_page(
         name=name, book_id=book_id, chapter_id=chapter_id, markdown=markdown, html=html,
         tags=_tags(tags), changelog=changelog,
     )
+    where = f"chapter {chapter_id}" if chapter_id is not None else f"book {book_id}"
+    if preview := _confirm("create_page", payload, f"Create page '{name}' in {where}.", confirm):
+        return preview
     return _written("page", await _get_client().post("pages", json=payload))
 
 
@@ -383,6 +436,7 @@ async def update_page(
     move_to_book_id: Annotated[int | None, Field(description="Move the page to the top level of this book.")] = None,
     move_to_chapter_id: Annotated[int | None, Field(description="Move the page into this chapter.")] = None,
     changelog: Annotated[str | None, Field(description="Revision note for the page history.", min_length=1, max_length=180)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Update a page's title, body or tags, or move it (WRITE — requires BOOKSTACK_ALLOW_WRITE).
 
@@ -401,6 +455,8 @@ async def update_page(
     )
     if not payload.keys() - {"changelog"}:
         raise ValueError("Nothing to update: provide name, markdown/html, tags or a move target.")
+    if preview := _confirm("update_page", {"id": id, **payload}, f"Update page {id}: {', '.join(payload)}.", confirm):
+        return preview
     return _written("page", await _get_client().put(f"pages/{id}", json=payload))
 
 
@@ -410,10 +466,13 @@ async def create_chapter(
     name: Annotated[str, Field(description="Chapter name.", min_length=1, max_length=255)],
     description: Annotated[str | None, Field(description="Plain-text description.", max_length=1900)] = None,
     tags: Annotated[dict[str, str] | None, Field(description="Tags as {name: value}; use '' for a tag without a value.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Create a chapter in a book (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/chapters."""
     _require_write()
     payload = _fields(book_id=book_id, name=name, description=description, tags=_tags(tags))
+    if preview := _confirm("create_chapter", payload, f"Create chapter '{name}' in book {book_id}.", confirm):
+        return preview
     return _written("chapter", await _get_client().post("chapters", json=payload))
 
 
@@ -424,6 +483,7 @@ async def update_chapter(
     description: Annotated[str | None, Field(description="New plain-text description.", max_length=1900)] = None,
     tags: Annotated[dict[str, str] | None, Field(description="Replaces ALL tags: {name: value} ('' = no value), {} clears them. Omit to keep the current tags.")] = None,
     move_to_book_id: Annotated[int | None, Field(description="Move the chapter (with its pages) to this book.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Update a chapter's name, description or tags, or move it (WRITE — requires BOOKSTACK_ALLOW_WRITE).
 
@@ -433,6 +493,8 @@ async def update_chapter(
     payload = _fields(name=name, description=description, tags=_tags(tags), book_id=move_to_book_id)
     if not payload:
         raise ValueError("Nothing to update: provide name, description, tags or move_to_book_id.")
+    if preview := _confirm("update_chapter", {"id": id, **payload}, f"Update chapter {id}: {', '.join(payload)}.", confirm):
+        return preview
     return _written("chapter", await _get_client().put(f"chapters/{id}", json=payload))
 
 
@@ -441,6 +503,7 @@ async def create_book(
     name: Annotated[str, Field(description="Book name.", min_length=1, max_length=255)],
     description: Annotated[str | None, Field(description="Plain-text description.", max_length=1900)] = None,
     tags: Annotated[dict[str, str] | None, Field(description="Tags as {name: value}; use '' for a tag without a value.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Create a book (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/books.
 
@@ -448,6 +511,8 @@ async def create_book(
     """
     _require_write()
     payload = _fields(name=name, description=description, tags=_tags(tags))
+    if preview := _confirm("create_book", payload, f"Create book '{name}'.", confirm):
+        return preview
     return _written("book", await _get_client().post("books", json=payload))
 
 
@@ -457,12 +522,15 @@ async def update_book(
     name: Annotated[str | None, Field(description="New name.", min_length=1, max_length=255)] = None,
     description: Annotated[str | None, Field(description="New plain-text description.", max_length=1900)] = None,
     tags: Annotated[dict[str, str] | None, Field(description="Replaces ALL tags: {name: value} ('' = no value), {} clears them. Omit to keep the current tags.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Update a book's name, description or tags (WRITE — requires BOOKSTACK_ALLOW_WRITE). PUTs /api/books/{id}."""
     _require_write()
     payload = _fields(name=name, description=description, tags=_tags(tags))
     if not payload:
         raise ValueError("Nothing to update: provide name, description and/or tags.")
+    if preview := _confirm("update_book", {"id": id, **payload}, f"Update book {id}: {', '.join(payload)}.", confirm):
+        return preview
     return _written("book", await _get_client().put(f"books/{id}", json=payload))
 
 
@@ -472,10 +540,13 @@ async def create_shelf(
     description: Annotated[str | None, Field(description="Plain-text description.", max_length=1900)] = None,
     book_ids: Annotated[list[int] | None, Field(description="Books to put on the shelf, in display order.")] = None,
     tags: Annotated[dict[str, str] | None, Field(description="Tags as {name: value}; use '' for a tag without a value.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Create a shelf, optionally with books on it (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/shelves."""
     _require_write()
     payload = _fields(name=name, description=description, books=book_ids, tags=_tags(tags))
+    if preview := _confirm("create_shelf", payload, f"Create shelf '{name}'.", confirm):
+        return preview
     return _written("shelf", await _get_client().post("shelves", json=payload))
 
 
@@ -487,6 +558,7 @@ async def update_shelf(
     add_book_ids: Annotated[list[int] | None, Field(description="Books to add to the end of the shelf.")] = None,
     remove_book_ids: Annotated[list[int] | None, Field(description="Books to take off the shelf (the books themselves stay).")] = None,
     tags: Annotated[dict[str, str] | None, Field(description="Replaces ALL tags: {name: value} ('' = no value), {} clears them. Omit to keep the current tags.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Update a shelf's name, description or tags, or add/remove books (WRITE — requires BOOKSTACK_ALLOW_WRITE).
 
@@ -503,6 +575,8 @@ async def update_shelf(
         payload["books"] = keep + [b for b in dict.fromkeys(add_book_ids or ()) if b not in keep]
     if not payload:
         raise ValueError("Nothing to update: provide name, description, tags, add_book_ids or remove_book_ids.")
+    if preview := _confirm("update_shelf", {"id": id, **payload}, f"Update shelf {id}: {', '.join(payload)}.", confirm):
+        return preview
     out = _written("shelf", await _get_client().put(f"shelves/{id}", json=payload))
     if "books" in payload:
         out["book_ids"] = payload["books"]
@@ -515,6 +589,7 @@ async def add_comment(
     body: Annotated[str, Field(description="Comment text (plain text unless html=true).", min_length=1)],
     html: Annotated[bool, Field(description="Treat body as HTML instead of plain text.")] = False,
     reply_to: Annotated[int | None, Field(description="local_id of the comment to reply to (see get_page full=true → comments).")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
     """Comment on a page (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/comments.
 
@@ -522,6 +597,8 @@ async def add_comment(
     """
     _require_write()
     payload = _fields(page_id=page_id, html=body if html else _text_html(body), reply_to=reply_to)
+    if preview := _confirm("add_comment", payload, f"Comment on page {page_id}.", confirm):
+        return preview
     data = await _get_client().post("comments", json=payload)
     out = _pick(data, _COMMENT_FIELDS) if isinstance(data, dict) else {"result": data}
     out["url"] = f"{_get_client().settings.base_url}/link/{page_id}"

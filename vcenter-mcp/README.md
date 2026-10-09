@@ -1,13 +1,13 @@
 # vcenter-mcp
 
-A **lightweight, read-only** [MCP](https://modelcontextprotocol.io) server that connects a local
+A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local
 agent (e.g. Claude Code) to a **VMware vCenter Server** through the vSphere Automation REST API (the
 new `/api`, vSphere 7.0u2+/8.0). Ask about your virtual infrastructure in natural language — VMs and
 their power state, hosts, clusters, datastores, networks, and appliance health.
 
 - One shared `httpx.AsyncClient`; **session** auth (login → `vmware-api-session-id`, re-auth on expiry).
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
-- **Read-only** — GET requests only (power on/off etc. are deliberately not exposed; see Notes).
+- **Read-only by default**; VM power write tools are **opt-in** behind `VCENTER_ALLOW_WRITE` (see below).
 - A raw escape-hatch tool (`vcenter_get`) so any `/api/...` resource stays reachable.
 
 ## Tools
@@ -31,16 +31,51 @@ Results are trimmed by default; pass `full=true` for raw objects. vCenter list e
 cap and **no pagination**, so tools cap to `limit` and you narrow with filters (ids like `vm-123`,
 `domain-c12`, `host-42`). Resolve ids by listing the parent (e.g. `list_clusters` → cluster id).
 
+### Write tools (opt-in)
+
+These change VM power states and only work when **`VCENTER_ALLOW_WRITE=true`** (otherwise they refuse
+with a clear message). The account also needs a role with the matching privileges (see section 1).
+Before acting, each tool reads the VM once so the preview shows its **name and current power state**.
+
+| Tool | What it does |
+|---|---|
+| `vm_guest_power(vm, action: shutdown\|reboot\|standby)` | **Preferred.** Asks the guest OS via VMware Tools for a clean shutdown, reboot or standby. Needs the VM powered on with Tools running (503 otherwise). Returns immediately; the guest finishes on its own. |
+| `vm_power(vm, action: start\|stop\|reset\|suspend)` | Hypervisor-level power action. `start` powers on; **`stop` and `reset` are hard** (like pulling the plug / pressing reset, no guest shutdown) — use them only when the guest hangs or has no Tools. |
+
+Check the result with `get_vm_power`. A VM already in the target state comes back as a clean
+`ALREADY_IN_DESIRED_STATE` error. There is no snapshot tool: the vSphere Automation REST API has no
+documented snapshot endpoint (checked up to 9.1.1).
+
+**Confirmation before every write** (`VCENTER_CONFIRM_WRITE`, default `true`): a write tool's first
+call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
+and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
+code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
+expire when the server restarts). Set `VCENTER_CONFIRM_WRITE=false` to let writes run directly.
+
 ## 1. Use a read-only account
 
 Use vCenter SSO credentials for a user/role with **read-only** privileges (vSphere has a built-in
 "Read-only" role). That's `VCENTER_USERNAME` / `VCENTER_PASSWORD`.
+
+For the **write** tools, give the account a custom role (instead of Read-only) on the VMs or folders it
+may act on, with the privileges it needs — *Virtual machine → Interaction*:
+
+| Tool / action | Privilege |
+|---|---|
+| `vm_power` `start` | `VirtualMachine.Interact.PowerOn` |
+| `vm_power` `stop`, `vm_guest_power` `shutdown` | `VirtualMachine.Interact.PowerOff` |
+| `vm_power` `reset`, `vm_guest_power` `reboot` | `VirtualMachine.Interact.Reset` |
+| `vm_power` `suspend`, `vm_guest_power` `standby` | `VirtualMachine.Interact.Suspend` |
+
+(A custom role also carries `System.Read`, which the read tools need.) Better still, use a separate
+write-enabled instance with its own account and keep the shared one read-only.
 
 ## 2. Configure
 
 ```bash
 cp .env.example vcenter.env
 # edit vcenter.env: VCENTER_BASE_URL, VCENTER_USERNAME, VCENTER_PASSWORD
+#   (set VCENTER_ALLOW_WRITE=true to enable the power tools)
 ```
 
 - **`VCENTER_BASE_URL`** — e.g. `https://vcenter.example.com` (no `/api` suffix).
@@ -123,8 +158,10 @@ gateway walkthrough and client setup.
 #### Multiple instances (one image, several env files)
 
 The same image runs as several containers side by side, each with its own env file —
-for example one container per vCenter, or a second set of credentials with other rights.
-A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+for example the shared read-only instance next to a write-enabled one that uses another
+account, or one container per vCenter.
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys).
+Ready to copy: [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
 
 ```yaml
 x-vcenter: &vcenter
@@ -137,12 +174,12 @@ x-vcenter: &vcenter
   networks: [atlas-net]
 
 services:
-  vcenter-mcp:                    # existing shared instance
+  vcenter-mcp:                    # existing shared read-only instance
     <<: *vcenter
     container_name: vcenter-mcp
     env_file: ./vcenter.env
 
-  vcenter-mcp-instance-a:         # a second vCenter
+  vcenter-mcp-instance-a:         # write access with instance a's account
     <<: *vcenter
     container_name: vcenter-mcp-instance-a
     env_file: ./env/instance_a.env
@@ -153,7 +190,9 @@ networks:
 ```
 
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
-  env/instance_a.env`) with instance a's vCenter URL and account. `*.env` is gitignored, so it stays local.
+  env/instance_a.env`) with instance a's account and `VCENTER_ALLOW_WRITE=true`. The shared instance keeps
+  the flag off. Every write still asks for confirmation first unless
+  `VCENTER_CONFIRM_WRITE=false`. `*.env` is gitignored, so it stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 
@@ -177,10 +216,19 @@ networks:
 - "Which datastores are below 10% free?"
 - "What's the vCenter version and overall health?"
 
+With `VCENTER_ALLOW_WRITE=true` you can also:
+
+- "Shut down VM vm-42 cleanly."
+- "Reboot the guest OS of app01."
+- "Power on vm-42."
+- "vm-42 is hung and Tools don't answer — hard reset it."
+
 ## Notes & scope
 
-- **Read-only.** Power actions (`POST /api/vcenter/vm/{vm}/power/start|stop|…`) are intentionally not
-  exposed. If you want them, they can be added behind an explicit env flag (and a privileged account).
+- **Writes are opt-in.** Reads are always available; the power tools refuse unless
+  `VCENTER_ALLOW_WRITE=true` and the account has the privileges. Leave the flag unset for read-only.
+  Only power actions are covered (`POST /api/vcenter/vm/{vm}/power?action=…` and
+  `.../guest/power?action=…`); there are no create/delete/reconfigure tools and no raw write escape hatch.
 - **No pagination** — vCenter caps list results (e.g. ~4000 VMs); always narrow with filters.
 - **Session auth** is handled automatically: the server logs in on first use and transparently
   re-authenticates if the session expires.

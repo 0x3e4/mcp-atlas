@@ -26,6 +26,7 @@ class Settings:
     base_url: str
     token: str
     allow_write: bool = False
+    confirm_write: bool = True
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -61,6 +62,7 @@ class Settings:
             base_url=env["ZAMMAD_BASE_URL"].strip().rstrip("/"),
             token=env["ZAMMAD_TOKEN"],
             allow_write=_bool_env(env, "ZAMMAD_ALLOW_WRITE", False),
+            confirm_write=_bool_env(env, "ZAMMAD_CONFIRM_WRITE", True),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),

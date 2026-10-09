@@ -1,13 +1,21 @@
-"""FastMCP server exposing read-only PRTG Network Monitor (HTTP API) tools.
+"""FastMCP server exposing PRTG Network Monitor (HTTP API) tools.
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
-always-on HTTP server. All tools are read-only (GET). Curated tools cover the monitoring hierarchy
-(probes → groups → devices → sensors → channels), status, logs, health and historic data; the raw
-``prtg_get`` escape hatch reaches anything else.
+always-on HTTP server. Read tools cover the monitoring hierarchy (probes → groups → devices →
+sensors → channels), status, logs, health and historic data; the raw read-only ``prtg_get`` escape
+hatch reaches anything else. Write tools (pause/resume an object, acknowledge an alarm, scan now) are
+**opt-in**: they refuse unless ``PRTG_ALLOW_WRITE=true`` and need credentials with write access on
+the objects. With the flag off the server is read-only. Unless ``PRTG_CONFIRM_WRITE=false``, every
+write first returns a preview plus a confirm code and only runs when called again with that code,
+after the user has confirmed.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import secrets
 import sys
 from typing import Annotated, Any
 
@@ -18,7 +26,15 @@ from pydantic import Field
 from .client import PrtgClient
 from .config import ConfigError, Settings
 
-mcp = FastMCP("prtg-mcp")
+mcp = FastMCP(
+    "prtg-mcp",
+    instructions=(
+        "Write tools (pause_object/resume_object/acknowledge_alarm/scan_now) need the user's confirmation: "
+        "the first call changes nothing and returns a preview with a confirm_code. Show the user a short "
+        "overview of what will change, end with 'Confirm it?', and only after they say yes repeat the call "
+        "with confirm=<code>."
+    ),
+)
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: PrtgClient | None = None
@@ -29,6 +45,51 @@ def _get_client() -> PrtgClient:
     if _client is None:
         _client = PrtgClient(Settings.from_env())
     return _client
+
+
+def _require_write() -> None:
+    """Gate write tools behind the opt-in PRTG_ALLOW_WRITE flag."""
+    if not _get_client().settings.allow_write:
+        raise ValueError(
+            "Write tools are disabled. Set PRTG_ALLOW_WRITE=true (and use an API key / user with write "
+            "access on the objects) to pause/resume objects, acknowledge alarms or trigger a scan."
+        )
+
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when PRTG_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not _get_client().settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
 
 
 # ---- curated columns per content type -----------------------------------
@@ -267,11 +328,105 @@ async def prtg_get(
 
     Use for endpoints without a dedicated tool (e.g. 'getsensortree.xml', 'gettreenodestats.xml',
     'getobjectstatus.htm'). Pass as_text=true for XML/CSV/HTML responses. Returns JSON or raw text.
+    State-changing endpoints (pause.htm, setobjectproperty.htm, deleteobject.htm, ...) are refused.
     """
     data = await _get_client().get_raw(endpoint, params=params, as_text=as_text)
     if as_text:
         return {"content": data}
     return data if isinstance(data, dict) else {"data": data}
+
+
+# ---- tools: writes (opt-in, gated by PRTG_ALLOW_WRITE) -------------------
+
+async def _act(tool: str, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Run a PRTG action call and return a trimmed result (PRTG applies the change asynchronously)."""
+    result = await _get_client().action(endpoint, params=params)
+    return {"ok": True, "tool": tool, "endpoint": f"/api/{endpoint}", **params, **result}
+
+
+@mcp.tool()
+async def pause_object(
+    object_id: Annotated[int, Field(description="Object id of the sensor, device, group or probe to pause (not the root group 0).", ge=1)],
+    message: Annotated[str | None, Field(description="Pause message shown on the object while it is paused.", min_length=1, max_length=255)] = None,
+    duration_minutes: Annotated[int | None, Field(description="Pause for this many minutes, then resume automatically. Omit to pause indefinitely.", ge=1, le=525600)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Pause monitoring of a sensor, device, group or probe (WRITE — requires PRTG_ALLOW_WRITE).
+
+    GETs /api/pause.htm?id=&action=0&pausemsg= (indefinitely) or
+    /api/pauseobjectfor.htm?id=&duration=&pausemsg= (minutes, then auto-resume). Pausing a
+    device/group/probe pauses everything below it. Undo with resume_object.
+    """
+    _require_write()
+    if duration_minutes is None:
+        endpoint, params = "pause.htm", {"id": object_id, "action": 0}
+        how = "indefinitely"
+    else:
+        endpoint, params = "pauseobjectfor.htm", {"id": object_id, "duration": duration_minutes}
+        how = f"for {duration_minutes} min"
+    if message is not None:
+        params["pausemsg"] = message
+    if preview := _confirm("pause_object", {"endpoint": endpoint, **params}, f"Pause object {object_id} {how}.", confirm):
+        return preview
+    return await _act("pause_object", endpoint, params)
+
+
+@mcp.tool()
+async def resume_object(
+    object_id: Annotated[int, Field(description="Object id of the paused sensor, device, group or probe.", ge=0)],
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Resume monitoring of a paused object (WRITE — requires PRTG_ALLOW_WRITE). GETs /api/pause.htm?id=&action=1.
+
+    Only lifts a manual pause; objects paused by a dependency, schedule or a paused parent stay paused.
+    """
+    _require_write()
+    params = {"id": object_id, "action": 1}
+    if preview := _confirm("resume_object", {"endpoint": "pause.htm", **params}, f"Resume object {object_id}.", confirm):
+        return preview
+    return await _act("resume_object", "pause.htm", params)
+
+
+@mcp.tool()
+async def acknowledge_alarm(
+    sensor_id: Annotated[int, Field(description="Object id of the sensor in a Down state.", ge=1)],
+    message: Annotated[str | None, Field(description="Acknowledgement message shown on the sensor.", min_length=1, max_length=255)] = None,
+    duration_minutes: Annotated[int | None, Field(description="Acknowledge for this many minutes only. Omit to acknowledge indefinitely (until the sensor changes state).", ge=1, le=525600)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Acknowledge a Down sensor's alarm (WRITE — requires PRTG_ALLOW_WRITE). GETs /api/acknowledgealarm.htm?id=&ackmsg=.
+
+    The sensor goes to 'Down (Acknowledged)' (status_raw 13) and stops re-alerting until it changes
+    state (or the optional duration ends). Only sensors in a Down state can be acknowledged.
+    """
+    _require_write()
+    params: dict[str, Any] = {"id": sensor_id}
+    if message is not None:
+        params["ackmsg"] = message
+    if duration_minutes is not None:
+        params["duration"] = duration_minutes
+    how = "indefinitely" if duration_minutes is None else f"for {duration_minutes} min"
+    if preview := _confirm("acknowledge_alarm", {"endpoint": "acknowledgealarm.htm", **params},
+                           f"Acknowledge the alarm on sensor {sensor_id} {how}.", confirm):
+        return preview
+    return await _act("acknowledge_alarm", "acknowledgealarm.htm", params)
+
+
+@mcp.tool()
+async def scan_now(
+    object_id: Annotated[int, Field(description="Object id of the sensor, device, group or probe to scan.", ge=0)],
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Trigger an immediate scan of an object (WRITE — requires PRTG_ALLOW_WRITE). GETs /api/scannow.htm?id=.
+
+    On a device/group/probe every sensor below it is scanned. Results appear after the scan finishes
+    (check with get_sensor / list_sensors).
+    """
+    _require_write()
+    params = {"id": object_id}
+    if preview := _confirm("scan_now", {"endpoint": "scannow.htm", **params}, f"Scan object {object_id} now.", confirm):
+        return preview
+    return await _act("scan_now", "scannow.htm", params)
 
 
 def main() -> None:

@@ -29,6 +29,8 @@ class Settings:
 
     base_url: str
     api_key: str
+    allow_write: bool = False
+    confirm_write: bool = True
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -63,6 +65,8 @@ class Settings:
         return cls(
             base_url=env["TEMPLATE_BASE_URL"].strip().rstrip("/"),
             api_key=env["TEMPLATE_API_KEY"],
+            allow_write=_bool_env(env, "TEMPLATE_ALLOW_WRITE", False),
+            confirm_write=_bool_env(env, "TEMPLATE_CONFIRM_WRITE", True),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),

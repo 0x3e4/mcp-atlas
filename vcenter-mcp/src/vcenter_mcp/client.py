@@ -1,10 +1,11 @@
-"""Async VMware vCenter (vSphere Automation REST API, the new ``/api``) client (read-only).
+"""Async VMware vCenter (vSphere Automation REST API, the new ``/api``) client.
 
 A single ``httpx.AsyncClient`` is shared across all tools. Auth is session-based: ``POST /api/session``
 with HTTP Basic returns a session id (a JSON string), sent on subsequent calls as the
 ``vmware-api-session-id`` header. The session is re-established transparently on a 401 (retried once).
 The new ``/api`` returns objects/arrays directly (no ``{value}`` wrapper). Failures become a clean
-``VCenterError`` so tools never leak tracebacks to the model.
+``VCenterError`` so tools never leak tracebacks to the model. Writes (``post``) are only used by the
+opt-in write tools in ``server.py``.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ class VCenterError(RuntimeError):
 
 
 class VCenterClient:
-    """Minimal async client for the vSphere Automation REST API (GET only)."""
+    """Minimal async client for the vSphere Automation REST API (GET, plus POST for opt-in writes)."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -98,6 +99,14 @@ class VCenterClient:
         """GET a resource; ``path`` is relative to ``/api`` (e.g. ``vcenter/vm``)."""
         return await self._request("GET", f"{self._settings.api_base}/{path.lstrip('/')}", params=params)
 
+    async def post(
+        self, path: str, *, params: dict[str, Any] | None = None, json: Any | None = None
+    ) -> Any:
+        """POST (write); ``path`` is relative to ``/api``. Action operations return 204 -> ``None``."""
+        return await self._request(
+            "POST", f"{self._settings.api_base}/{path.lstrip('/')}", params=params, json=json
+        )
+
     async def get_raw(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
         """Escape hatch: GET an arbitrary ``/api/...`` path (or absolute URL on the same host)."""
         if path.startswith(("http://", "https://")):
@@ -113,14 +122,21 @@ class VCenterClient:
             url = f"{self._settings.api_base}/{p}"
         return await self._request("GET", url, params=params)
 
-    async def _request(self, method: str, url: str, *, params: dict[str, Any] | None = None) -> Any:
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: Any | None = None,
+    ) -> Any:
         client = await self._http()
         for attempt in (1, 2):
             if self._session_id is None:
                 await self._login()
             headers = {"vmware-api-session-id": self._session_id}
             try:
-                resp = await client.request(method, url, params=params, headers=headers)
+                resp = await client.request(method, url, params=params, json=json, headers=headers)
             except httpx.HTTPError as exc:
                 raise VCenterError(f"Network error calling vCenter {url}: {exc}") from exc
 
@@ -144,6 +160,7 @@ class VCenterClient:
 def _format_error(resp: httpx.Response) -> str:
     status = resp.status_code
     msg = ""
+    etype = None
     try:
         body = resp.json()
         if isinstance(body, dict):
@@ -153,6 +170,7 @@ def _format_error(resp: httpx.Response) -> str:
             etype = body.get("error_type")
             if etype and not msg:
                 msg = str(etype)
+                etype = None
     except ValueError:
         msg = resp.text[:200]
     if status == 401:
@@ -163,5 +181,7 @@ def _format_error(resp: httpx.Response) -> str:
         return f"vCenter 404 — not found. {msg}".rstrip()
     if status == 503:
         return f"vCenter 503 — service unavailable. {msg}".rstrip()
+    # e.g. "vCenter API 400 (ALREADY_IN_DESIRED_STATE): Virtual machine is already powered off."
+    kind = f" ({etype})" if etype else ""
     detail = f": {msg}" if msg else ""
-    return f"vCenter API {status}{detail}".rstrip()
+    return f"vCenter API {status}{kind}{detail}".rstrip()

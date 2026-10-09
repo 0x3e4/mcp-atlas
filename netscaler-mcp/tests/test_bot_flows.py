@@ -190,3 +190,32 @@ def test_enforcement_signatures_and_violations(ns):
 
     asyncio.run(scenario())
     assert ns.signature_updates == [("appfwsignatures", {"name": "sig_default", "mergedefault": True})]
+
+
+def test_confirm_flow_for_bot_detections_signatures_and_save(ns):
+    ns.use(confirm_write=True)
+
+    async def scenario():
+        args = {"enable": True, "actions": ["LOG"]}
+        first = await server.set_bot_detections("bot_app", ["device_fingerprint"], **args, dry_run=False)
+        assert first["status"] == "confirmation_required" and first["changed"] == 2
+        mismatch = await server.set_bot_detections("bot_app", ["trap"], **args, dry_run=False, confirm=first["confirm_code"])
+        assert mismatch["status"] == "confirmation_required"
+        assert ns.writes == []
+        done = await server.set_bot_detections(
+            "bot_app", ["device_fingerprint"], **args, dry_run=False, confirm=first["confirm_code"]
+        )
+        assert done["dry_run"] is False and "confirm_code" not in done
+
+        sig = await server.update_signatures("bot", "bot_sig", dry_run=False)
+        assert sig["status"] == "confirmation_required" and ns.signature_updates == []
+        assert (await server.update_signatures("bot", "bot_sig", dry_run=False, confirm=sig["confirm_code"]))["updated"] == "bot_sig"
+
+        save = await server.save_config()
+        assert save["status"] == "confirmation_required" and not ns.saved
+        assert await server.save_config(confirm=save["confirm_code"]) == {"saved": True}
+
+    asyncio.run(scenario())
+    assert ns.bot_profiles["bot_app"]["devicefingerprint"] == "ON"
+    assert ns.signature_updates == [("botsignature", {"name": "bot_sig"})]
+    assert ns.saved

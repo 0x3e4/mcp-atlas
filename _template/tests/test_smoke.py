@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
 
 from template_mcp import server
@@ -17,6 +18,7 @@ EXPECTED_TOOLS = {
     "search_items",
     "get_item",
     "api_get",
+    "update_item",
 }
 
 
@@ -71,3 +73,48 @@ def test_invalid_transport_rejected():
                 "MCP_TRANSPORT": "carrier-pigeon",
             }
         )
+
+
+def _write_env() -> dict[str, str]:
+    return {"TEMPLATE_BASE_URL": "https://api.example.com", "TEMPLATE_API_KEY": "k", "TEMPLATE_ALLOW_WRITE": "true"}
+
+
+def test_write_flags_default_to_off_and_confirm():
+    s = Settings.from_env({"TEMPLATE_BASE_URL": "https://api.example.com", "TEMPLATE_API_KEY": "k"})
+    assert s.allow_write is False and s.confirm_write is True
+    assert "confirm" in _tools()["update_item"].inputSchema["properties"]
+
+
+def test_write_refused_without_allow_write():
+    server._client = server.ApiClient(Settings.from_env({"TEMPLATE_BASE_URL": "https://api.example.com", "TEMPLATE_API_KEY": "k"}))
+    try:
+        with pytest.raises(ValueError, match="TEMPLATE_ALLOW_WRITE"):
+            asyncio.run(server.update_item("7", name="x"))
+    finally:
+        server._client = None
+
+
+def test_writes_need_a_matching_confirm_code():
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.method)
+        return httpx.Response(200, json={"id": "7", "name": "x"})
+
+    client = server.ApiClient(Settings.from_env(_write_env()))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    server._client = client
+
+    async def calls():
+        preview = await server.update_item("7", name="x")
+        assert preview["status"] == "confirmation_required" and preview["change"] == {"item_id": "7", "name": "x"}
+        code = preview["confirm_code"]
+        assert (await server.update_item("7", name="y", confirm=code))["status"] == "confirmation_required"
+        assert sent == []
+        assert (await server.update_item("7", name="x", confirm=code))["name"] == "x"
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None
+    assert sent == ["PATCH"]

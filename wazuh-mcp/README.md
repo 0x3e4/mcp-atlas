@@ -2,7 +2,8 @@
 
 A **lightweight** [MCP](https://modelcontextprotocol.io) server that lets a local agent
 (Claude Code) query your Wazuh deployment in natural language — **alerts, the full event
-archive, vulnerabilities, agents, inventory, rules, SCA, and manager status**.
+archive, vulnerabilities, agents, inventory, rules, SCA, and manager status** — and, opt-in,
+**restart agents, change agent groups, and run active-response commands**.
 
 Unlike most Wazuh MCP servers, this one queries **`wazuh-archives-*`** (every collected event,
 not just rule-triggered alerts), and it runs as a tiny stdio server rather than a heavy web service.
@@ -20,7 +21,9 @@ Wazuh data lives in two places, and this server talks to both:
 > Archives must be enabled (`logall_json` + the Filebeat `archives` module). This is assumed
 > to be already set up on your deployment.
 
-## Tools (all read-only)
+## Tools
+
+The tools below are read-only and always available.
 
 **Events (Indexer):**
 - `search_alerts` — rule-triggered alerts, with agent/level/group/time/text filters
@@ -37,14 +40,71 @@ Wazuh data lives in two places, and this server talks to both:
 - `manager_status` — daemons + info + cluster health
 - `manager_api_get` — raw GET against any Manager API endpoint (escape hatch)
 
+### Write tools (opt-in)
+
+These change your Wazuh deployment and only work when **`WAZUH_ALLOW_WRITE=true`** (otherwise they
+refuse with a clear message). They go to the **Manager API only** (never the Indexer), and the API
+user's RBAC role must allow the action (see [Credentials & RBAC](#credentials--rbac)). Agent ids are
+numeric (`1` → `001`); an empty agent list is refused, because the API would treat it as *all agents*.
+
+| Tool | API call | What it does |
+|---|---|---|
+| `restart_agents(agent_ids)` | `PUT /agents/restart?agents_list=…` | Restart the Wazuh agent service (not the host) on the given agents, e.g. after a group config change. Inactive agents come back under `failed`. |
+| `add_agent_to_group(agent_id, group_id, exclusive?)` | `PUT /agents/{agent_id}/group/{group_id}` | Assign an agent to an existing group; `exclusive=true` (`force_single_group`) removes it from its other groups first. |
+| `remove_agent_from_group(agent_id, group_id)` | `DELETE /agents/{agent_id}/group/{group_id}` | Unassign an agent from one group. Deletes nothing; an agent left without groups goes back to `default`. |
+| `run_active_response(agent_ids, command, arguments?, alert_data?)` | `PUT /active-response?agents_list=…` | **Executes an active-response script on the endpoints** — it can block an IP in the host firewall, kill processes, disable an account or restart Wazuh, depending on the command. |
+
+`run_active_response` takes a command name as listed in the manager's `ar.conf` (a configured
+`<command>` with its timeout appended, e.g. `firewall-drop0`) or `!<script>` to call an AR script
+by name (e.g. `!firewall-drop`). Since Wazuh 4.2 the scripts read their input from the alert, so pass
+e.g. `alert_data={"srcip": "10.0.0.10"}` for `firewall-drop` / `host-deny`; `arguments` become the
+script's `extra_args`. The agent must be active and have active response enabled. Stateful commands
+are undone only by their timeout or by hand.
+
+**Confirmation before every write** (`WAZUH_CONFIRM_WRITE`, default `true`): a write tool's first
+call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
+and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
+code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
+expire when the server restarts). Set `WAZUH_CONFIRM_WRITE=false` to let writes run directly.
+
 ## Configuration
 
 Copy `.env.example` to `wazuh.env` and fill in your URLs and credentials. Key variables:
 `WAZUH_MANAGER_URL`, `WAZUH_USER`, `WAZUH_PASS`, `WAZUH_INDEXER_URL`, `WAZUH_INDEXER_USER`,
-`WAZUH_INDEXER_PASS`, `WAZUH_VERIFY_SSL`, `WAZUH_CA_BUNDLE`. See `.env.example` for the rest.
+`WAZUH_INDEXER_PASS`, `WAZUH_VERIFY_SSL`, `WAZUH_CA_BUNDLE`, and for the opt-in write tools
+`WAZUH_ALLOW_WRITE` / `WAZUH_CONFIRM_WRITE`. See `.env.example` for the rest.
 
 For self-signed certs, either mount the Wazuh root CA and set `WAZUH_CA_BUNDLE`, or (lab only)
 set `WAZUH_VERIFY_SSL=false`.
+
+### Credentials & RBAC
+
+- **Indexer user** (`WAZUH_INDEXER_USER`) — only needs read access to the `wazuh-*` indices.
+- **Manager API user** (`WAZUH_USER`) — for the read tools, the built-in **`readonly`** role is enough.
+  Better than reusing `wazuh-wui` (administrator): create a dedicated API user (`POST /security/users`,
+  or the dashboard's Security section) and give it only what it needs.
+- **For the write tools** the Manager API user additionally needs these RBAC actions:
+
+  | Tool | RBAC action(s) | Resource |
+  |---|---|---|
+  | `restart_agents` | `agent:restart` | `agent:id:*` (or `agent:group:<name>`) |
+  | `add_agent_to_group`, `remove_agent_from_group` | `agent:modify_group` **and** `group:modify_assignments` | `agent:id:*` / `group:id:*` |
+  | `run_active_response` | `active-response:command` | `agent:id:*` (built-in policy `agents_commands`) |
+
+  The built-in `agents_admin` role covers the first three but also allows deleting, upgrading and
+  uninstalling agents — prefer custom policies attached to a custom role, e.g.:
+
+  ```json
+  {"name": "mcp_agents_write", "policy": {"actions": ["agent:restart", "agent:modify_group"], "resources": ["agent:id:*"], "effect": "allow"}}
+  {"name": "mcp_groups_assign", "policy": {"actions": ["group:modify_assignments"], "resources": ["group:id:*"], "effect": "allow"}}
+  ```
+
+  Create them with `POST /security/policies`, a role with `POST /security/roles`, then link them with
+  `POST /security/roles/{role_id}/policies?policy_ids=…` and
+  `POST /security/users/{user_id}/roles?role_ids=…` (keep `readonly` on the user too). Add the
+  built-in `agents_commands` policy only if you want `run_active_response`. Narrow `agent:id:*` /
+  `group:id:*` to specific agents or groups to limit what the agent can touch. See the
+  [Wazuh RBAC docs](https://documentation.wazuh.com/current/user-manual/api/rbac/index.html).
 
 ## Run with Docker + Claude Code (recommended)
 
@@ -64,6 +124,13 @@ Then in Claude Code run `/mcp` to confirm the `wazuh` server connected, and ask 
 - "Which agents are disconnected?"
 - "List critical vulnerabilities on agent 003"
 - "What packages are installed on agent 005?"
+
+With `WAZUH_ALLOW_WRITE=true` you can also:
+
+- "Restart the agents in group webservers that are active."
+- "Move agent vm-42 into the dmz group only."
+- "Remove agent 004 from the legacy group."
+- "Block 10.0.0.10 on agent 001 with firewall-drop."
 
 ## Run locally without Docker (dev)
 
@@ -131,8 +198,10 @@ gateway walkthrough and client setup.
 ### Multiple instances (one image, several env files)
 
 The same image runs as several containers side by side, each with its own env file —
-for example one container per Wazuh deployment, or a second set of credentials with other rights.
-A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+for example the shared read-only instance next to a write-enabled one that uses another
+API user, or one container per Wazuh deployment.
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys).
+Ready to copy: [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
 
 ```yaml
 x-wazuh: &wazuh
@@ -145,12 +214,12 @@ x-wazuh: &wazuh
   networks: [atlas-net]
 
 services:
-  wazuh-mcp:                    # existing shared instance
+  wazuh-mcp:                    # existing shared read-only instance
     <<: *wazuh
     container_name: wazuh-mcp
     env_file: ./wazuh.env
 
-  wazuh-mcp-instance-a:         # a second Wazuh deployment
+  wazuh-mcp-instance-a:         # write access with instance a's API user
     <<: *wazuh
     container_name: wazuh-mcp-instance-a
     env_file: ./env/instance_a.env
@@ -161,7 +230,9 @@ networks:
 ```
 
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
-  env/instance_a.env`) with instance a's Wazuh endpoints and credentials. `*.env` is gitignored, so it stays local.
+  env/instance_a.env`) with instance a's API user and `WAZUH_ALLOW_WRITE=true`. The shared instance keeps
+  the flag off. Every write still asks for confirmation first unless
+  `WAZUH_CONFIRM_WRITE=false`. `*.env` is gitignored, so it stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 
@@ -183,7 +254,11 @@ poetry run mcp dev src/wazuh_mcp/server.py    # opens the MCP Inspector
 
 ## Notes & scope
 
-- **Read-only.** No active-response/write tools (block IP, isolate host, …) in this version.
+- **Writes are opt-in.** Reads are always available; the write tools refuse unless
+  `WAZUH_ALLOW_WRITE=true` and the Manager API user's RBAC role allows the action. Leave the flag unset
+  for read-only. They go to the Manager API only, ask for confirmation first (`WAZUH_CONFIRM_WRITE`),
+  and there are no delete tools (no agent/group deletion, no config or ruleset edits).
+  `run_active_response` is the one with real-world side effects (blocked IPs, killed processes).
 - Searches default to the **last 24h** and trim results to the most useful fields; pass
   `full=true` for raw documents, and explicit `start`/`end` (ISO8601 or `now-1h`) to widen the window.
 - A single `_search` returns at most 10,000 hits (`max_result_window`).

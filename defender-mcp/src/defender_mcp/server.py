@@ -1,11 +1,22 @@
-"""FastMCP server exposing read-only Microsoft Defender XDR tools.
+"""FastMCP server exposing Microsoft Defender XDR tools (Microsoft Graph security API).
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
-always-on HTTP server. All tools are read-only: there are no response/remediation actions.
+always-on HTTP server. Read tools cover advanced hunting, incidents, alerts, devices and
+vulnerabilities. Write tools (triage incidents and alerts: status, owner, classification,
+determination, tags, comments) are **opt-in**: they refuse unless ``DEFENDER_ALLOW_WRITE=true`` and
+need the admin-consented ``SecurityIncident.ReadWrite.All`` / ``SecurityAlert.ReadWrite.All``
+application permissions. With the flag off the server is read-only. Unless
+``DEFENDER_CONFIRM_WRITE=false``, every write first returns a preview plus a confirm code and only
+runs when called again with that code, after the user has confirmed. There are no device
+response/remediation actions (isolate, AV scan): those live in the separate Defender for Endpoint API.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import secrets
 import sys
 from typing import Annotated, Any
 
@@ -16,7 +27,15 @@ from pydantic import Field
 from .config import ConfigError, Settings
 from .graph import GraphClient
 
-mcp = FastMCP("defender-mcp")
+mcp = FastMCP(
+    "defender-mcp",
+    instructions=(
+        "Write tools (update_incident/update_alert/add_incident_comment/add_alert_comment) need the user's "
+        "confirmation: the first call changes nothing and returns a preview with a confirm_code. Show the "
+        "user a short overview of what will change, end with 'Confirm it?', and only after they say yes "
+        "repeat the call with confirm=<code>."
+    ),
+)
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: GraphClient | None = None
@@ -29,10 +48,68 @@ def _get_client() -> GraphClient:
     return _client
 
 
+def _require_write() -> None:
+    """Gate write tools behind the opt-in DEFENDER_ALLOW_WRITE flag."""
+    if not _get_client().settings.allow_write:
+        raise ValueError(
+            "Write tools are disabled. Set DEFENDER_ALLOW_WRITE=true (and grant the app the admin-consented "
+            "SecurityIncident.ReadWrite.All / SecurityAlert.ReadWrite.All application permissions) to "
+            "update or comment on incidents and alerts."
+        )
+
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when DEFENDER_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not _get_client().settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
+
+
 # --- enum sets for friendly validation (escape-hatch tools bypass these) ---
 _SEVERITIES = ("informational", "low", "medium", "high")
 _ALERT_STATUS = ("new", "inProgress", "resolved")
 _INCIDENT_STATUS = ("active", "inProgress", "resolved", "redirected")
+# Settable values for the write tools. 'redirected' is set by Defender when incidents are merged and
+# 'awaitingAction' only by Defender Experts, so neither is offered; unknownFutureValue is a sentinel.
+_INCIDENT_SET_STATUS = ("active", "inProgress", "resolved")
+_ALERT_SET_STATUS = ("new", "inProgress", "resolved")
+_CLASSIFICATIONS = ("unknown", "falsePositive", "truePositive", "informationalExpectedActivity")
+# alertDetermination as in the v1.0 alert resource enum table / metadata (shared by incidents). Some
+# MS pages still list older names (compromisedUser, clean, insufficientData, confirmedUserActivity).
+_DETERMINATIONS = (
+    "unknown", "apt", "malware", "securityPersonnel", "securityTesting", "unwantedSoftware", "other",
+    "multiStagedAttack", "compromisedAccount", "phishing", "maliciousUserActivity", "notMalicious",
+    "notEnoughDataToValidate", "confirmedActivity", "lineOfBusinessApplication",
+)
 
 _INCIDENT_KEYS = (
     "id", "displayName", "severity", "status", "determination", "classification",
@@ -317,6 +394,160 @@ async def graph_hunt(
     Like advanced_hunting but with no result shaping or row cap — use when you need the raw payload.
     """
     return await _get_client().run_hunting_query(kql, timespan)
+
+
+# ---- tools: writes (opt-in, gated by DEFENDER_ALLOW_WRITE) ---------------
+
+def _triage_payload(
+    *,
+    status: str | None,
+    status_values: tuple[str, ...],
+    assigned_to: str | None,
+    classification: str | None,
+    determination: str | None,
+) -> dict[str, Any]:
+    """Validate and build the shared PATCH body fields of incidents and alerts (camelCase)."""
+    _validate(status, status_values, "status")
+    _validate(classification, _CLASSIFICATIONS, "classification")
+    _validate(determination, _DETERMINATIONS, "determination")
+    payload: dict[str, Any] = {}
+    if status is not None:
+        payload["status"] = status
+    if assigned_to is not None:
+        payload["assignedTo"] = assigned_to.strip() or None  # '' unassigns (null)
+    if classification is not None:
+        payload["classification"] = classification
+    if determination is not None:
+        payload["determination"] = determination
+    return payload
+
+
+def _path_id(value: str, name: str) -> str:
+    """Reject ids that would change the request path (a write must hit exactly the named object)."""
+    value = value.strip()
+    if not value or any(c in value for c in "/?#\\") or value in (".", ".."):
+        raise ValueError(f"{name} must be a plain id; got {value!r}.")
+    return value
+
+
+def _comments_result(key: str, ident: str, data: Any) -> dict[str, Any]:
+    """Graph answers a comment POST with the full comment list; return its size and the newest one."""
+    comments = (data or {}).get("value", []) if isinstance(data, dict) else []
+    return {key: ident, "commentCount": len(comments), "latest": comments[-1] if comments else None}
+
+
+@mcp.tool()
+async def update_incident(
+    incident_id: Annotated[str, Field(description="The incident id (a string, e.g. '29').", min_length=1)],
+    status: Annotated[str | None, Field(description="New status: active, inProgress, resolved.")] = None,
+    assigned_to: Annotated[str | None, Field(description="New owner (UPN/email, free text); '' unassigns.")] = None,
+    classification: Annotated[str | None, Field(description="unknown, falsePositive, truePositive, informationalExpectedActivity.")] = None,
+    determination: Annotated[str | None, Field(description="unknown, apt, malware, securityPersonnel, securityTesting, unwantedSoftware, other, multiStagedAttack, compromisedAccount, phishing, maliciousUserActivity, notMalicious, notEnoughDataToValidate, confirmedActivity, lineOfBusinessApplication.")] = None,
+    custom_tags: Annotated[list[str] | None, Field(description="Replaces ALL custom tags of the incident; [] clears them. Omit to keep the current tags.")] = None,
+    resolving_comment: Annotated[str | None, Field(description="Free-text explanation of the resolution and classification.", min_length=1)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Triage an incident: status, owner, classification, determination, tags (WRITE — requires DEFENDER_ALLOW_WRITE).
+
+    PATCHes /security/incidents/{id}; only the fields you give change. Needs the
+    SecurityIncident.ReadWrite.All application permission. Read the current tags with get_incident
+    first if you only want to add one (custom_tags replaces the whole list).
+    """
+    _require_write()
+    incident_id = _path_id(incident_id, "incident_id")
+    payload = _triage_payload(
+        status=status, status_values=_INCIDENT_SET_STATUS, assigned_to=assigned_to,
+        classification=classification, determination=determination,
+    )
+    if custom_tags is not None:
+        payload["customTags"] = list(dict.fromkeys(t.strip() for t in custom_tags if t.strip()))
+    if resolving_comment is not None:
+        payload["resolvingComment"] = resolving_comment
+    if not payload:
+        raise ValueError(
+            "Nothing to update: provide status, assigned_to, classification, determination, custom_tags "
+            "or resolving_comment."
+        )
+    change = {"incident_id": incident_id, **payload}
+    if preview := _confirm("update_incident", change, f"Update incident {incident_id}: {', '.join(payload)}.", confirm):
+        return preview
+    data = await _get_client().patch(f"/security/incidents/{incident_id}", json=payload)
+    out = _trim_incident(data) if isinstance(data, dict) else {"id": incident_id}
+    if isinstance(data, dict) and "resolvingComment" in data:
+        out["resolvingComment"] = data["resolvingComment"]
+    return out
+
+
+@mcp.tool()
+async def add_incident_comment(
+    incident_id: Annotated[str, Field(description="The incident id (a string, e.g. '29').", min_length=1)],
+    comment: Annotated[str, Field(description="Comment text (plain text).", min_length=1)],
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Add a comment to an incident (WRITE — requires DEFENDER_ALLOW_WRITE). POSTs /security/incidents/{id}/comments.
+
+    Needs SecurityIncident.ReadWrite.All. Comments can't be edited or deleted through Graph.
+    """
+    _require_write()
+    incident_id = _path_id(incident_id, "incident_id")
+    payload = {"@odata.type": "microsoft.graph.security.alertComment", "comment": comment}
+    if preview := _confirm("add_incident_comment", {"incident_id": incident_id, **payload}, f"Comment on incident {incident_id}.", confirm):
+        return preview
+    data = await _get_client().post(f"/security/incidents/{incident_id}/comments", json=payload)
+    return _comments_result("incidentId", incident_id, data)
+
+
+@mcp.tool()
+async def update_alert(
+    alert_id: Annotated[str, Field(description="The alert id (alerts_v2).", min_length=1)],
+    status: Annotated[str | None, Field(description="New status: new, inProgress, resolved.")] = None,
+    assigned_to: Annotated[str | None, Field(description="New owner (UPN/email, free text); '' unassigns.")] = None,
+    classification: Annotated[str | None, Field(description="unknown, falsePositive, truePositive, informationalExpectedActivity.")] = None,
+    determination: Annotated[str | None, Field(description="unknown, apt, malware, securityPersonnel, securityTesting, unwantedSoftware, other, multiStagedAttack, compromisedAccount, phishing, maliciousUserActivity, notMalicious, notEnoughDataToValidate, confirmedActivity, lineOfBusinessApplication.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Triage an alert: status, owner, classification, determination (WRITE — requires DEFENDER_ALLOW_WRITE).
+
+    PATCHes /security/alerts_v2/{id}; only the fields you give change. Needs the
+    SecurityAlert.ReadWrite.All application permission.
+    """
+    _require_write()
+    alert_id = _path_id(alert_id, "alert_id")
+    payload = _triage_payload(
+        status=status, status_values=_ALERT_SET_STATUS, assigned_to=assigned_to,
+        classification=classification, determination=determination,
+    )
+    if not payload:
+        raise ValueError("Nothing to update: provide status, assigned_to, classification or determination.")
+    change = {"alert_id": alert_id, **payload}
+    if preview := _confirm("update_alert", change, f"Update alert {alert_id}: {', '.join(payload)}.", confirm):
+        return preview
+    data = await _get_client().patch(f"/security/alerts_v2/{alert_id}", json=payload)
+    out = _trim_alert(data) if isinstance(data, dict) else {"id": alert_id}
+    if isinstance(data, dict):
+        for key in ("classification", "determination"):
+            if key in data:
+                out[key] = data[key]
+    return out
+
+
+@mcp.tool()
+async def add_alert_comment(
+    alert_id: Annotated[str, Field(description="The alert id (alerts_v2).", min_length=1)],
+    comment: Annotated[str, Field(description="Comment text (plain text).", min_length=1)],
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Add a comment to an alert (WRITE — requires DEFENDER_ALLOW_WRITE). POSTs /security/alerts_v2/{id}/comments.
+
+    Needs SecurityAlert.ReadWrite.All. Comments can't be edited or deleted through Graph.
+    """
+    _require_write()
+    alert_id = _path_id(alert_id, "alert_id")
+    payload = {"@odata.type": "microsoft.graph.security.alertComment", "comment": comment}
+    if preview := _confirm("add_alert_comment", {"alert_id": alert_id, **payload}, f"Comment on alert {alert_id}.", confirm):
+        return preview
+    data = await _get_client().post(f"/security/alerts_v2/{alert_id}/comments", json=payload)
+    return _comments_result("alertId", alert_id, data)
 
 
 def main() -> None:

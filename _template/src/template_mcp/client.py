@@ -71,6 +71,9 @@ class ApiClient:
         """POST ``json`` to ``path``."""
         return await self._request("POST", path, json=json)
 
+    async def patch(self, path: str, json: Any) -> Any:
+        return await self._request("PATCH", path, json=json)
+
     async def _request(
         self,
         method: str,

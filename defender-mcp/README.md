@@ -1,13 +1,15 @@
 # defender-mcp
 
-A **lightweight, read-only** [MCP](https://modelcontextprotocol.io) server that connects a local
-agent (e.g. Claude Code) to **Microsoft Defender XDR** through the **Microsoft Graph security API**.
-Ask about your Defender data in natural language — advanced hunting (KQL telemetry), incidents,
-alerts, devices, and vulnerabilities.
+A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
+Claude Code) to **Microsoft Defender XDR** through the **Microsoft Graph security API**. Ask about
+your Defender data in natural language — advanced hunting (KQL telemetry), incidents, alerts,
+devices, and vulnerabilities — and, opt-in, **triage incidents and alerts** (status, owner,
+classification, determination, tags, comments).
 
 - One OAuth2 client-credentials token, one `httpx.AsyncClient`.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
-- **Read-only** — no response/remediation actions (isolate device, run AV scan, etc.).
+- **Read-only by default**; write tools are **opt-in** behind `DEFENDER_ALLOW_WRITE` (see below).
+  No device response/remediation actions (isolate device, run AV scan, etc.).
 - Raw escape-hatch tools (`graph_get`, `graph_hunt`) so anything reachable via Graph stays reachable.
 
 ## Tools
@@ -27,6 +29,36 @@ alerts, devices, and vulnerabilities.
 Results are trimmed to the useful columns by default; pass `full=true` for the raw payload, and row
 counts are capped (`DEFENDER_MAX_ROWS`, default 200) unless `full`.
 
+### Write tools (opt-in)
+
+These change Defender incidents/alerts and only work when **`DEFENDER_ALLOW_WRITE=true`** (otherwise
+they refuse with a clear message). The app registration also needs the **ReadWrite** Graph
+permissions (see [section 1](#1-register-an-entra-id-application)). Only the fields you give change.
+
+| Tool | What it does |
+|---|---|
+| `update_incident(incident_id, status?, assigned_to?, classification?, determination?, custom_tags?, resolving_comment?)` | `PATCH /security/incidents/{id}` — triage an incident. |
+| `add_incident_comment(incident_id, comment)` | `POST /security/incidents/{id}/comments` — add a comment. |
+| `update_alert(alert_id, status?, assigned_to?, classification?, determination?)` | `PATCH /security/alerts_v2/{id}` — triage an alert. |
+| `add_alert_comment(alert_id, comment)` | `POST /security/alerts_v2/{id}/comments` — add a comment. |
+
+- **status** — incidents: `active`, `inProgress`, `resolved`; alerts: `new`, `inProgress`, `resolved`
+  (`redirected` is set by Defender when incidents are merged, so it isn't offered).
+- **classification** — `unknown`, `falsePositive`, `truePositive`, `informationalExpectedActivity`.
+- **determination** — `unknown`, `apt`, `malware`, `securityPersonnel`, `securityTesting`,
+  `unwantedSoftware`, `other`, `multiStagedAttack`, `compromisedAccount`, `phishing`,
+  `maliciousUserActivity`, `notMalicious`, `notEnoughDataToValidate`, `confirmedActivity`,
+  `lineOfBusinessApplication`.
+- **assigned_to** is free text (usually a UPN); `''` unassigns. **custom_tags replaces all custom
+  tags** of the incident (`[]` clears them); omit it to leave them alone.
+- Comments can't be edited or deleted through Graph — they show up in the portal as written by the app.
+
+**Confirmation before every write** (`DEFENDER_CONFIRM_WRITE`, default `true`): a write tool's first
+call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
+and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
+code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
+expire when the server restarts). Set `DEFENDER_CONFIRM_WRITE=false` to let writes run directly.
+
 ## 1. Register an Entra ID application
 
 1. **Entra admin center** → **App registrations** → **New registration**. Name it (e.g.
@@ -37,6 +69,14 @@ counts are capped (`DEFENDER_MAX_ROWS`, default 200) unless `full`.
    - `ThreatHunting.Read.All` — advanced hunting, devices, vulnerabilities
    - `SecurityAlert.Read.All` — alerts
    - `SecurityIncident.Read.All` — incidents
+
+   For the **write** tools (`DEFENDER_ALLOW_WRITE=true`) add as well:
+   - `SecurityIncident.ReadWrite.All` — `update_incident`, `add_incident_comment`
+   - `SecurityAlert.ReadWrite.All` — `update_alert`, `add_alert_comment`
+
+   Leave them out for a read-only deployment: the token then can't change anything even if the flag
+   is set. A second app registration (and env file) with the ReadWrite permissions keeps the
+   read-only instance separate.
 3. Click **Grant admin consent for &lt;tenant&gt;** (a tenant admin must do this). Without consent,
    Graph returns `403 Authorization_RequestDenied`.
 4. **Certificates & secrets** → **New client secret** → copy the **Value** immediately (you can't
@@ -51,6 +91,7 @@ counts are capped (`DEFENDER_MAX_ROWS`, default 200) unless `full`.
 ```bash
 cp .env.example defender.env
 # edit defender.env: DEFENDER_TENANT_ID, DEFENDER_CLIENT_ID, DEFENDER_CLIENT_SECRET
+#   (set DEFENDER_ALLOW_WRITE=true to enable writes)
 ```
 
 ## 3. Run & register with Claude Code
@@ -129,8 +170,10 @@ gateway walkthrough and client setup.
 #### Multiple instances (one image, several env files)
 
 The same image runs as several containers side by side, each with its own env file —
-for example one container per tenant, or a second set of credentials with other rights.
-A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+for example the shared read-only instance next to a write-enabled one that uses another
+app registration, or one container per tenant.
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys).
+Ready to copy: [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
 
 ```yaml
 x-defender: &defender
@@ -143,12 +186,12 @@ x-defender: &defender
   networks: [atlas-net]
 
 services:
-  defender-mcp:                    # existing shared instance
+  defender-mcp:                    # existing shared read-only instance
     <<: *defender
     container_name: defender-mcp
     env_file: ./defender.env
 
-  defender-mcp-instance-a:         # a second tenant (its own app registration)
+  defender-mcp-instance-a:         # write access with instance a's app registration
     <<: *defender
     container_name: defender-mcp-instance-a
     env_file: ./env/instance_a.env
@@ -159,7 +202,9 @@ networks:
 ```
 
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
-  env/instance_a.env`) with instance a's tenant and app registration. `*.env` is gitignored, so it stays local.
+  env/instance_a.env`) with instance a's app registration and `DEFENDER_ALLOW_WRITE=true`. The shared instance keeps
+  the flag off. Every write still asks for confirmation first unless
+  `DEFENDER_CONFIRM_WRITE=false`. `*.env` is gitignored, so it stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 
@@ -184,7 +229,22 @@ After registering, ask Claude Code things like:
 A trivial first check is `advanced_hunting` with `DeviceInfo | take 1` — if it returns a row, auth and
 permissions are working.
 
+With `DEFENDER_ALLOW_WRITE=true` you can also:
+
+- "Assign incident 29 to soc@app.test.corp and set it to in progress."
+- "Resolve incident 29 as a true positive, determination malware, and tag it ir-2026-10."
+- "Mark alert da123 as a false positive (not malicious) and comment that it was the admin backup script."
+- "Add a comment to incident 29: contained, vm-42 reimaged."
+
 ## Notes & limits
+
+- **Writes are opt-in.** Reads are always available; the write tools refuse unless
+  `DEFENDER_ALLOW_WRITE=true` and the app has the admin-consented ReadWrite permissions. Leave the flag
+  unset for read-only. Triage changes are reversible (set the field back); comments are permanent.
+  There are no delete tools and no raw write escape hatch.
+- **Device response actions are out of scope** — isolate device, run AV scan, collect investigation
+  package, etc. live in the separate Defender for Endpoint API (its own token audience and `Machine.*`
+  permissions), not in Microsoft Graph.
 
 - **Advanced hunting**: ~30-day data window, up to 100,000 rows, ~3-minute query timeout. Bound your
   results with `| take N`. A `429` means the tenant hit its hunting CPU/rate budget — back off.
@@ -194,9 +254,10 @@ permissions are working.
 - **`list_alerts` `category`** is filtered client-side (it isn't a documented `$filter` field); other
   filters are server-side OData. `alerts_v2` does not support `$orderby` (results are most-recent-first).
 
-## Future (not in v1)
+## Future
 
-- Response/remediation actions (isolate device, run AV scan) — would be flag-gated and explicitly opt-in.
+- Device response/remediation actions (isolate device, run AV scan) via the Defender for Endpoint API —
+  would be flag-gated and explicitly opt-in.
 - A dedicated Defender for Endpoint REST client for real-time machine state (needs a second token
   audience and heavier permissions).
 - Certificate / federated-credential auth as an alternative to the client secret.

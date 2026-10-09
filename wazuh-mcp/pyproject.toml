@@ -1,7 +1,7 @@
 [project]
 name = "wazuh-mcp"
-version = "0.1.0"
-description = "Lightweight MCP server for querying Wazuh alerts, archives, and management data"
+version = "0.2.0"
+description = "Lightweight MCP server for querying Wazuh alerts, archives, and management data, with opt-in agent write actions"
 authors = [{ name = "cai", email = "cai@nohub.lol" }]
 readme = "README.md"
 requires-python = ">=3.14"
@@ -15,6 +15,9 @@ wazuh-mcp = "wazuh_mcp.server:main"
 
 [tool.poetry]
 packages = [{ include = "wazuh_mcp", from = "src" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [build-system]
 requires = ["poetry-core>=2.0.0"]

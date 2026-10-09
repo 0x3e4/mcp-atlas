@@ -13,7 +13,8 @@ applies a profile, and what do the log lines behind a block say.
   (transparently re-logs-in on expiry), or **stateless** `X-NITRO-USER`/`X-NITRO-PASS` per request.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
 - **Read-only by default** — pair the server with a `readonlypolicy` account. The WAF and Bot write
-  tools are **opt-in** behind `NETSCALER_ALLOW_WRITE`, and every one previews first (`dry_run=true`).
+  tools are **opt-in** behind `NETSCALER_ALLOW_WRITE`, every one previews first (`dry_run=true`), and
+  none applies without your confirmation (`NETSCALER_CONFIRM_WRITE`, default on).
 - A raw escape-hatch tool (`nitro_get`) so any NITRO `config`/`stat` resource stays reachable.
 
 ## Tools
@@ -57,7 +58,8 @@ Reads (always available):
 | `list_waf_urls(profile, host?, include_learned?, limit?)` | URL inventory: hosts, allowed / denied / referenced URLs, learned URLs marked **covered** or not, and suggested global rules for the uncovered ones. |
 | `export_waf_profile(profile, host_map?, save_as?)` | Settings, learning thresholds and every rule as a portable JSON document (optionally with hostnames switched, or saved to a file). |
 
-Writes (opt-in — refuse unless `NETSCALER_ALLOW_WRITE=true`; all preview with `dry_run=true` by default):
+Writes (opt-in — refuse unless `NETSCALER_ALLOW_WRITE=true`; all preview with `dry_run=true` by default
+and apply only with the preview's `confirm` code, see [Confirmation before every write](#confirmation-before-every-write)):
 
 | Tool | What it does |
 |---|---|
@@ -68,7 +70,7 @@ Writes (opt-in — refuse unless `NETSCALER_ALLOW_WRITE=true`; all preview with 
 | `set_waf_check_actions(profile, checks, set_actions?, add_actions?, remove_actions?, dry_run)` | The learn → block switch, per check or `['all']`, with before/after. |
 | `import_waf_profile(document \| file, target_profile?, host_map?, mode?, include_settings?, dry_run)` | Apply an export to a profile (created if missing): `merge` adds missing rules, `replace` mirrors the document. |
 | `rehost_waf_profile(profile, from_host, to_host, target_profile?, dry_run)` | Switch every rule to another hostname, in place or into a copy for another environment. |
-| `save_config()` | `save ns config` — persist applied changes. |
+| `save_config(confirm?)` | `save ns config` — persist applied changes (first call returns the confirm code). |
 
 ### Bot management tools
 
@@ -80,7 +82,8 @@ Reads (always available):
 | `list_bot_detections(profile?, full?)` | Per detection: is it on, what does it do, how many entries — plus the live counters split by outcome (log / drop / redirect / reset / captcha). |
 | `export_bot_profile(profile, host_map?, save_as?)` | The profile's detection settings and every entry as a portable JSON document. |
 
-Writes (opt-in — refuse unless `NETSCALER_ALLOW_WRITE=true`; all preview with `dry_run=true` by default):
+Writes (opt-in — refuse unless `NETSCALER_ALLOW_WRITE=true`; all preview with `dry_run=true` by default
+and apply only with the preview's `confirm` code, see [Confirmation before every write](#confirmation-before-every-write)):
 
 | Tool | What it does |
 |---|---|
@@ -97,7 +100,7 @@ Writes (opt-in — refuse unless `NETSCALER_ALLOW_WRITE=true`; all preview with 
 | `waf_violations(profile?, include_zero?, full?)` | Per WAF check: violation and log counts (stat `appfwprofile` / `appfw`) — the readiness check before switching a check to block. |
 | `list_enforcement(kind?, profile?, limit?)` | Which policies select a profile and where each is bound; flags policies bound nowhere and profiles no policy selects. |
 | `list_signatures(kind?, full?)` | Signature objects (source URL, `encryptedversion`) plus the auto-update switch and the related appliance settings. |
-| `update_signatures(kind, name, merge_default?, dry_run)` | **Write:** re-fetch a signature object from its configured source URL. |
+| `update_signatures(kind, name, merge_default?, dry_run, confirm?)` | **Write:** re-fetch a signature object from its configured source URL (previews by default, applies with the confirm code). |
 | `recent_security_violations(feature?, contains?, loglevel?, limit?)` | Recent `APPFW_*` / `BOT_*` lines from `auditmessages`, with the check, profile, client IP and URL pulled out. |
 
 ## 1. Create a read-only account
@@ -129,7 +132,8 @@ cp .env.example netscaler.env
   or (lab only) `NETSCALER_VERIFY_SSL=false`.
 - **Auth** — `NETSCALER_AUTH_MODE=session` (default) is efficient; switch to `stateless` if session
   slots are scarce or the appliance sits behind a non-sticky load balancer.
-- **WAF writes / files** — `NETSCALER_ALLOW_WRITE=true` enables the WAF write tools;
+- **WAF writes / files** — `NETSCALER_ALLOW_WRITE=true` enables the WAF and Bot write tools (each
+  still asks for confirmation unless `NETSCALER_CONFIRM_WRITE=false`);
   `NETSCALER_EXPORT_DIR` lets export/import use files. See
   [WAF & Bot rollout](#waf--bot-rollout-optional-write-tools).
 
@@ -212,7 +216,8 @@ gateway walkthrough and client setup.
 The same image runs as several containers side by side, each with its own env file —
 for example the shared read-only instance next to a write-enabled one that uses another
 account, or one container per appliance or HA pair.
-A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys).
+Ready to copy: [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
 
 ```yaml
 x-netscaler: &netscaler
@@ -242,7 +247,8 @@ networks:
 
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
   env/instance_a.env`) with instance a's account and `NETSCALER_ALLOW_WRITE=true`. The shared instance keeps
-  the flag off. `*.env` is gitignored, so it stays local.
+  the flag off. Every write still asks for confirmation first unless
+  `NETSCALER_CONFIRM_WRITE=false`. `*.env` is gitignored, so it stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 
@@ -275,7 +281,8 @@ In Claude Code, run `/mcp` to confirm the `netscaler` server connected, then ask
 ### Enable writes
 
 1. Set `NETSCALER_ALLOW_WRITE=true` in `netscaler.env`. With it unset the write tools still
-   **preview** (`dry_run=true`) but refuse to apply.
+   **preview** (`dry_run=true`) but refuse to apply. Leave `NETSCALER_CONFIRM_WRITE` at its default
+   (`true`) so nothing is applied without your yes (see below).
 2. Use a system user that may change AppFw and Bot profiles. A least-privilege command policy covering
    exactly what the tools send (adjust to your change control):
 
@@ -289,6 +296,21 @@ In Claude Code, run `/mcp` to confirm the `netscaler` server connected, then ask
    (Already created it for WAF only? `set system cmdPolicy nsmcp-waf ALLOW "<spec>"` updates it.)
    Consider a separate `netscaler-waf` MCP registration (its own env file) so day-to-day
    questions keep using the read-only account.
+
+### Confirmation before every write
+
+`NETSCALER_CONFIRM_WRITE` (default `true`) sits on top of the `dry_run` previews. A preview
+(`dry_run=true`, the default) changes nothing and, besides the plan computed against the live appliance,
+returns a `confirm_code`. The agent shows you a short overview and asks *"Confirm it?"*; only after you
+say yes does it repeat the call with `dry_run=false` and `confirm=<code>`. A `dry_run=false` call
+without the matching code is answered with the same preview and code and applies nothing.
+
+The code is tied to the tool, its exact arguments **and the computed plan**, so a changed request — or
+a profile that changed on the appliance in between — needs a fresh confirmation (codes also expire when
+the server restarts). For learned-rule deploy/discard the code binds the entries, not their hit counts,
+which keep moving while learning runs. A call with nothing to change needs no confirmation.
+`save_config` has no `dry_run`: its first call returns the code, the second (`confirm=<code>`) saves. Set
+`NETSCALER_CONFIRM_WRITE=false` to let `dry_run=false` apply directly, as before.
 
 ### Export files (optional)
 
@@ -325,7 +347,8 @@ are bare (`pr_app-test.json`) — no paths.
    Or directly on one appliance: `rehost_waf_profile(profile='pr_app', from_host='app.test.corp',
    to_host='app.corp', target_profile='pr_app_prod')`.
 
-Every write call answers first with a plan; say "apply it" to re-run with `dry_run=false`.
+Every write call answers first with a plan and asks *"Confirm it?"*; say yes and the agent re-runs it
+with `dry_run=false` and the plan's `confirm` code — only then is anything applied.
 
 ### A typical bot rollout
 
@@ -340,6 +363,8 @@ Every write call answers first with a plan; say "apply it" to re-run with `dry_r
    IP reputation and the deny list each carry the action on the entry, not on the profile.
 5. **Other environments.** `export_bot_profile(save_as='bot_app-test.json')` →
    `import_bot_profile(file='bot_app-test.json', target_profile='bot_app_prod')`.
+
+As with WAF, every bot write shows its plan first and only applies after you confirm it.
 
 ### Check it is actually enforced
 
@@ -403,7 +428,8 @@ poetry run mcp dev src/netscaler_mcp/server.py  # MCP Inspector to exercise tool
   payload. (NITRO is served under a fixed `/nitro/v1` path — there is no api-version parameter.)
 - **Writes are opt-in and limited to AppFw / Bot profiles** (plus signature re-fetch and
   `save ns config`). Reads are always available. The write tools refuse unless
-  `NETSCALER_ALLOW_WRITE=true` and the account's command policy allows the change. No tool deletes a
+  `NETSCALER_ALLOW_WRITE=true` and the account's command policy allows the change, and (unless
+  `NETSCALER_CONFIRM_WRITE=false`) only apply with the confirm code from a preview you approved. No tool deletes a
   profile or a policy, no tool binds a policy to a vserver, and no other configuration is touched.
 - **Feature-gated resources** (GSLB, AppFW) return a clean "feature not enabled" error when the
   feature is off on the appliance.

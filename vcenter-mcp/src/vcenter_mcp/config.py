@@ -2,7 +2,9 @@
 
 Authentication is session-based: the client logs in with the username/password (vCenter SSO
 credentials) to obtain a session id. Secrets are never hardcoded; everything comes from the
-environment. vCenter ships a self-signed cert by default, so TLS options matter here.
+environment. vCenter ships a self-signed cert by default, so TLS options matter here. Writes (VM
+power actions) are opt-in via ``VCENTER_ALLOW_WRITE``; each write then needs the user's confirmation
+unless ``VCENTER_CONFIRM_WRITE=false``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ class Settings:
     base_url: str
     username: str
     password: str
+    allow_write: bool = False
+    confirm_write: bool = True
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -58,6 +62,8 @@ class Settings:
             base_url=env["VCENTER_BASE_URL"].strip().rstrip("/"),
             username=env["VCENTER_USERNAME"].strip(),
             password=env["VCENTER_PASSWORD"],
+            allow_write=_bool_env(env, "VCENTER_ALLOW_WRITE", False),
+            confirm_write=_bool_env(env, "VCENTER_CONFIRM_WRITE", True),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),

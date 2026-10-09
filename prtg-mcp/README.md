@@ -1,15 +1,17 @@
 # prtg-mcp
 
-A **lightweight, read-only** [MCP](https://modelcontextprotocol.io) server that connects a local
-agent (e.g. Claude Code) to a **PRTG Network Monitor** (Paessler) server through its HTTP API. Ask
-about your monitoring in natural language — sensors and their state, devices/groups/probes, channels,
-the log, server/system health, and historic data.
+A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
+Claude Code) to a **PRTG Network Monitor** (Paessler) server through its HTTP API. Ask about your
+monitoring in natural language — sensors and their state, devices/groups/probes, channels, the log,
+server/system health, and historic data — and, opt-in, **pause/resume objects, acknowledge alarms
+and trigger a scan**.
 
 - One shared `httpx.AsyncClient`; **API-token** auth (`Authorization: Bearer` + `apitoken`), with a
   legacy **username + passhash** fallback.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
-- **Read-only** — GET requests only; pair with a PRTG read-only API key/account.
-- A raw escape-hatch tool (`prtg_get`) so any `/api/...` endpoint stays reachable (incl. XML ones).
+- **Read-only by default**; write tools are **opt-in** behind `PRTG_ALLOW_WRITE` (see below).
+- A raw read-only escape-hatch tool (`prtg_get`) so any `/api/...` endpoint stays reachable (incl.
+  XML ones); it refuses state-changing endpoints.
 
 ## Tools
 
@@ -31,6 +33,28 @@ Results are trimmed to useful columns by default; pass `full=true` for PRTG's de
 lists are capped (`PRTG_MAX_ROWS`, default 200; hard cap 5000). `status` accepts `up`/`down`/
 `warning`/`paused`/`unusual`/`unknown` (mapped to the right `status_raw` codes).
 
+### Write tools (opt-in)
+
+These change PRTG and only work when **`PRTG_ALLOW_WRITE=true`** (otherwise they refuse with a clear
+message). The API key / user also needs **write access** on the objects (see section 1). They use
+PRTG's classic GET-style action calls; a failure (PRTG's `/error.htm` or login-page redirect, an
+error block in the body) is reported as an error, never as success.
+
+| Tool | What it does |
+|---|---|
+| `pause_object(object_id, message?, duration_minutes?)` | Pause a sensor/device/group/probe indefinitely (`pause.htm?action=0`) or for N minutes, then auto-resume (`pauseobjectfor.htm`). Not the root group (id 0). |
+| `resume_object(object_id)` | Resume a manually paused object (`pause.htm?action=1`). |
+| `acknowledge_alarm(sensor_id, message?, duration_minutes?)` | Acknowledge a Down sensor (`acknowledgealarm.htm`) → Down (Acknowledged), indefinitely or for N minutes. |
+| `scan_now(object_id)` | Scan a sensor now, or every sensor below a device/group/probe (`scannow.htm`). |
+
+PRTG applies these asynchronously; check the result with `get_sensor` / `list_sensors` afterwards.
+
+**Confirmation before every write** (`PRTG_CONFIRM_WRITE`, default `true`): a write tool's first
+call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
+and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
+code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
+expire when the server restarts). Set `PRTG_CONFIRM_WRITE=false` to let writes run directly.
+
 ## 1. Get credentials
 
 **Preferred — API key:** in PRTG, **Setup → Account Settings → API Keys** (PRTG 23.x+), create a key
@@ -40,11 +64,18 @@ with **read** access. That's `PRTG_API_TOKEN`.
 Passhash**, or `GET /api/getpasshash.htm?username=<u>&password=<p>`). Set `PRTG_USERNAME` +
 `PRTG_PASSHASH`.
 
+**For the write tools** the credential needs write rights: an API key with **Write access** (a key
+with **Acknowledge access** is enough for `acknowledge_alarm` only), created by a **read/write user**
+whose user group has **write access** on the objects to pause/resume/scan/acknowledge (PRTG object
+access rights). With the legacy passhash, use such a read/write user. Read-only PRTG users can at most
+acknowledge alarms, and only if their account allows it.
+
 ## 2. Configure
 
 ```bash
 cp .env.example prtg.env
 # edit prtg.env: PRTG_BASE_URL and PRTG_API_TOKEN  (or PRTG_USERNAME + PRTG_PASSHASH)
+#   (set PRTG_ALLOW_WRITE=true to enable writes)
 ```
 
 - **`PRTG_BASE_URL`** — e.g. `https://prtg.example.com` (no `/api` suffix).
@@ -128,8 +159,10 @@ gateway walkthrough and client setup.
 #### Multiple instances (one image, several env files)
 
 The same image runs as several containers side by side, each with its own env file —
-for example one container per PRTG server, or a second set of credentials with other rights.
-A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+for example the shared read-only instance next to a write-enabled one that uses another
+API key, or one container per PRTG server.
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys).
+Ready to copy: [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
 
 ```yaml
 x-prtg: &prtg
@@ -142,12 +175,12 @@ x-prtg: &prtg
   networks: [atlas-net]
 
 services:
-  prtg-mcp:                    # existing shared instance
+  prtg-mcp:                    # existing shared read-only instance
     <<: *prtg
     container_name: prtg-mcp
     env_file: ./prtg.env
 
-  prtg-mcp-instance-a:         # a second PRTG server
+  prtg-mcp-instance-a:         # write access with instance a's API key
     <<: *prtg
     container_name: prtg-mcp-instance-a
     env_file: ./env/instance_a.env
@@ -158,7 +191,9 @@ networks:
 ```
 
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
-  env/instance_a.env`) with instance a's PRTG URL and credentials. `*.env` is gitignored, so it stays local.
+  env/instance_a.env`) with instance a's API key and `PRTG_ALLOW_WRITE=true`. The shared instance keeps
+  the flag off. Every write still asks for confirmation first unless
+  `PRTG_CONFIRM_WRITE=false`. `*.env` is gitignored, so it stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 
@@ -182,10 +217,20 @@ In Claude Code, run `/mcp` to confirm the `prtg` server connected, then ask thin
 - "What's the PRTG core status and version?"
 - "Show the last 20 log messages with Warning or Down status."
 
+With `PRTG_ALLOW_WRITE=true` you can also:
+
+- "Pause device 2040 for 60 minutes with the message 'patching vm-42'."
+- "Resume device 2040."
+- "Acknowledge the alarm on sensor 2143: 'on it, disk cleanup running'."
+- "Scan sensor 2143 now and tell me whether it's back up."
+
 ## Notes & scope
 
-- **Read-only.** No write/acknowledge tools. If you add them (e.g. acknowledge alarm, pause), gate
-  behind an explicit env flag and use a key with the right access level.
+- **Writes are opt-in.** Reads are always available; the write tools refuse unless
+  `PRTG_ALLOW_WRITE=true` and the key/user has write access on the objects. Leave the flag unset for
+  read-only. All writes are reversible (pause ↔ resume; an acknowledgement ends when the sensor
+  changes state). There are no delete/edit-settings tools, and `prtg_get` refuses state-changing
+  endpoints (`pause*`, `set*`, `delete*`, `add*`, `duplicate*`, …).
 - **`status_raw` codes:** 1/2 = Unknown/Collecting, 3 = Up, 4 = Warning, 5 = Down, 7-12 = Paused
   (user/dependency/schedule/license), 10 = Unusual, 13 = DownAcknowledged, 14 = DownPartial.
 - **Large payloads:** `historic_data` (use a non-zero `avg` and a bounded date range — PRTG caps raw

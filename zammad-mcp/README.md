@@ -42,6 +42,12 @@ clear message). The token also needs **agent** (`ticket.agent`) permission.
 | `create_ticket(title, group, customer, body, internal?, state?, priority?, html?)` | Create a ticket with an initial note. `customer` is an email or user id (prefix an unknown email with `guess:`). |
 | `tag_ticket(ticket_id, add?, remove?)` | Add and/or remove tags; returns the ticket's tags afterwards. |
 
+**Confirmation before every write** (`ZAMMAD_CONFIRM_WRITE`, default `true`): a write tool's first
+call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
+and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
+code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
+expire when the server restarts). Set `ZAMMAD_CONFIRM_WRITE=false` to let writes run directly.
+
 ## 1. Create an API token
 
 In Zammad: **Profile → Token Access → Create** (an admin must enable *API Token Access* first). For
@@ -138,7 +144,8 @@ gateway walkthrough and client setup.
 The same image runs as several containers side by side, each with its own env file —
 for example the shared read-only instance next to a write-enabled one that uses another
 token, or one container per Zammad instance.
-A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys).
+Ready to copy: [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
 
 ```yaml
 x-zammad: &zammad
@@ -168,7 +175,8 @@ networks:
 
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
   env/instance_a.env`) with instance a's token and `ZAMMAD_ALLOW_WRITE=true`. The shared instance keeps
-  the flag off. `*.env` is gitignored, so it stays local.
+  the flag off. Every write still asks for confirmation first unless
+  `ZAMMAD_CONFIRM_WRITE=false`. `*.env` is gitignored, so it stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 

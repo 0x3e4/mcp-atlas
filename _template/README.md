@@ -5,12 +5,13 @@
 > "Adding a server" has the full checklist). Then delete this note and fill in the bracketed
 > `<…>` placeholders below.
 
-A **lightweight, read-only** [MCP](https://modelcontextprotocol.io) server that connects a local
+A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local
 agent (e.g. Claude Code) to **\<UPSTREAM SYSTEM\>**. Ask about your data in natural language.
 
 - One shared `httpx.AsyncClient`; auth applied per request.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
-- **Read-only** — no write/remediation actions.
+- **Read-only by default**; write tools are **opt-in** behind `TEMPLATE_ALLOW_WRITE`, and each write
+  asks for confirmation first (`TEMPLATE_CONFIRM_WRITE`).
 - A raw escape-hatch tool (`api_get`) so anything reachable via the API stays reachable.
 
 ## Tools
@@ -23,6 +24,21 @@ agent (e.g. Claude Code) to **\<UPSTREAM SYSTEM\>**. Ask about your data in natu
 
 Results are trimmed to the useful fields by default; pass `full=true` for the raw payload, and row
 counts are capped (`TEMPLATE_MAX_ROWS`, default 200) unless `full`.
+
+### Write tools (opt-in)
+
+These change \<UPSTREAM SYSTEM\> and only work when **`TEMPLATE_ALLOW_WRITE=true`** (otherwise they
+refuse with a clear message). The credential also needs write rights.
+
+| Tool | What it does |
+|---|---|
+| `update_item(item_id, name?, status?)` | Example write: change an item's name/status. |
+
+**Confirmation before every write** (`TEMPLATE_CONFIRM_WRITE`, default `true`): a write tool's first
+call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
+and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
+code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
+expire when the server restarts). Set `TEMPLATE_CONFIRM_WRITE=false` to let writes run directly.
 
 ## 1. Get credentials
 
@@ -113,8 +129,10 @@ gateway walkthrough and client setup.
 #### Multiple instances (one image, several env files)
 
 The same image runs as several containers side by side, each with its own env file —
-for example one container per upstream system, or a second set of credentials with other rights.
-A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+for example the shared read-only instance next to a write-enabled one that uses another
+credential, or one container per upstream system.
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys).
+Ready to copy: [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
 
 ```yaml
 x-template: &template
@@ -127,12 +145,12 @@ x-template: &template
   networks: [atlas-net]
 
 services:
-  template-mcp:                    # existing shared instance
+  template-mcp:                    # existing shared read-only instance
     <<: *template
     container_name: template-mcp
     env_file: ./template.env
 
-  template-mcp-instance-a:         # instance a's own URL / credentials
+  template-mcp-instance-a:         # write access with instance a's credential
     <<: *template
     container_name: template-mcp-instance-a
     env_file: ./env/instance_a.env
@@ -143,7 +161,9 @@ networks:
 ```
 
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
-  env/instance_a.env`) with instance a's URL and credentials. `*.env` is gitignored, so it stays local.
+  env/instance_a.env`) with instance a's credential and `TEMPLATE_ALLOW_WRITE=true`. The shared instance keeps
+  the flag off. Every write still asks for confirmation first unless
+  `TEMPLATE_CONFIRM_WRITE=false`. `*.env` is gitignored, so it stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 
@@ -174,6 +194,8 @@ poetry run mcp dev src/template_mcp/server.py # MCP Inspector to exercise tools
 
 ## Notes & scope
 
-- **Read-only.** No write tools in this version. If you add them, gate behind an explicit env flag
-  (e.g. `TEMPLATE_ALLOW_WRITE`) and a separate tool group.
+- **Writes are opt-in.** Reads are always available; write tools refuse unless
+  `TEMPLATE_ALLOW_WRITE=true`, and each one asks for confirmation unless `TEMPLATE_CONFIRM_WRITE=false`.
+  Keep new writes on the same pattern: `_require_write()` → validate → payload → `_confirm(...)` → request.
+  No delete tools.
 - Searches trim to the most useful fields; pass `full=true` for raw documents.

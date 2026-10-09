@@ -17,7 +17,7 @@ def short(text: str, limit: int = 300) -> str:
 
 
 def _bool(value: str | None, default: bool = False) -> bool:
-    if value is None:
+    if value is None or value.strip() == "":
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
 
@@ -46,6 +46,10 @@ class Settings:
     archives_index: str
     vulns_index: str
     request_timeout: float
+    # Writes (Manager API only) are opt-in; each one then needs the user's confirmation
+    # unless WAZUH_CONFIRM_WRITE=false.
+    allow_write: bool = False
+    confirm_write: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,6 +70,8 @@ class Settings:
             archives_index=os.getenv("WAZUH_ARCHIVES_INDEX", "wazuh-archives-*"),
             vulns_index=os.getenv("WAZUH_VULNS_INDEX", "wazuh-states-vulnerabilities-*"),
             request_timeout=float(os.getenv("WAZUH_TIMEOUT", "30")),
+            allow_write=_bool(os.getenv("WAZUH_ALLOW_WRITE"), False),
+            confirm_write=_bool(os.getenv("WAZUH_CONFIRM_WRITE"), True),
         )
 
     @property

@@ -1,7 +1,9 @@
 """Configuration for the Defender XDR MCP server, loaded from environment variables.
 
 Secrets are never hardcoded; everything comes from the process environment (typically supplied
-via ``--env-file`` for Docker or a local ``.env`` exported into the shell).
+via ``--env-file`` for Docker or a local ``.env`` exported into the shell). Writes are opt-in via
+``DEFENDER_ALLOW_WRITE``; each write then needs the user's confirmation unless
+``DEFENDER_CONFIRM_WRITE=false``.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ class Settings:
     login_base_url: str = "https://login.microsoftonline.com"
     timeout: float = 180.0
     max_rows: int = 200
+    allow_write: bool = False
+    confirm_write: bool = True
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -68,6 +72,8 @@ class Settings:
             login_base_url=env.get("LOGIN_BASE_URL", "https://login.microsoftonline.com").rstrip("/"),
             timeout=_float_env(env, "DEFENDER_TIMEOUT", 180.0),
             max_rows=_int_env(env, "DEFENDER_MAX_ROWS", 200),
+            allow_write=_bool_env(env, "DEFENDER_ALLOW_WRITE", False),
+            confirm_write=_bool_env(env, "DEFENDER_CONFIRM_WRITE", True),
         )
 
     @property
@@ -105,3 +111,10 @@ def _float_env(env: dict[str, str], name: str, default: float) -> float:
         return float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be a number; got {raw!r}.") from exc
+
+
+def _bool_env(env: dict[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")

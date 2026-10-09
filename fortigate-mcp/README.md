@@ -1,14 +1,15 @@
 # fortigate-mcp
 
-A **lightweight, read-only** [MCP](https://modelcontextprotocol.io) server that connects a local
-agent (e.g. Claude Code) to a **FortiGate** firewall through the **FortiOS REST API**. Ask about your
-firewall in natural language — policies and their hit counters, address/service objects, VIPs,
-interfaces, routing, IPsec VPN status, HA, and system/license health.
+A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
+Claude Code) to a **FortiGate** firewall through the **FortiOS REST API**. Ask about your firewall in
+natural language — policies and their hit counters, address/service objects, VIPs, interfaces,
+routing, IPsec VPN status, HA, and system/license health — and, opt-in, **create/update address
+objects, add/remove address-group members, and enable/disable firewall policies**.
 
 - One shared `httpx.AsyncClient`; static **API-token** auth (`Authorization: Bearer …`), no session.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
-- **Read-only** — GET-only against the `cmdb` (config) and `monitor` (live) trees; pair with a
-  read-only REST API admin profile.
+- **Read-only by default** — GET against the `cmdb` (config) and `monitor` (live) trees; write tools
+  are **opt-in** behind `FORTIGATE_ALLOW_WRITE` (see below).
 - A raw escape-hatch tool (`fortios_get`) so any FortiOS resource stays reachable.
 
 ## Tools
@@ -33,13 +34,40 @@ interfaces, routing, IPsec VPN status, HA, and system/license health.
 Results are trimmed to the useful fields by default; pass `full=true` for raw objects, and list
 results are capped (`FORTIGATE_MAX_ROWS`, default 200) unless `full`.
 
-## 1. Create a read-only REST API admin
+### Write tools (opt-in)
+
+These change the FortiGate configuration and only work when **`FORTIGATE_ALLOW_WRITE=true`**
+(otherwise they refuse with a clear message). The REST API admin also needs a **read-write** access
+profile for *Firewall* (see section 1). Changes take effect immediately (there is no commit step), and
+every tool takes `vdom` like the read tools. FortiOS errors come back with their numeric code and
+`cli_error` text (e.g. `error -5 (a duplicate entry already exists)`).
+
+| Tool | What it does |
+|---|---|
+| `create_address(name, subnet? \| fqdn? \| start_ip+end_ip?, comment?, vdom?)` | Create an IPv4 address object (`ipmask` / `fqdn` / `iprange`). `subnet` takes `10.0.0.10`, `10.0.0.0/24` or `10.0.0.0 255.255.255.0`. |
+| `update_address(name, subnet? \| fqdn? \| start_ip+end_ip?, comment?, vdom?)` | Change an address object's value or comment; only the given fields change. Affects every policy/group that uses it. |
+| `add_to_address_group(group, members, vdom?)` | Add existing addresses/groups to an address group, keeping the current members. |
+| `remove_from_address_group(group, members, vdom?)` | Take members out of an address group, keeping the others (never empties a group; the objects stay). |
+| `set_policy_status(policy_id, enabled, comment?, vdom?)` | Enable or disable a firewall policy. `comment` **replaces** the policy's comments. |
+
+There are no delete tools and no raw write escape hatch.
+
+**Confirmation before every write** (`FORTIGATE_CONFIRM_WRITE`, default `true`): a write tool's first
+call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
+and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
+code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
+expire when the server restarts). Set `FORTIGATE_CONFIRM_WRITE=false` to let writes run directly.
+
+## 1. Create a REST API admin
 
 In FortiOS: **System → Administrators → Create New → REST API Admin**.
 
 1. Create (or reuse) an **access profile** with **Read** permission on the groups you need
-   (e.g. *Firewall*, *System*, *Network*, *Log & Report*) — read is enough for every tool here;
-   write is never used.
+   (e.g. *Firewall*, *System*, *Network*, *Log & Report*) — read is enough for every read tool.
+   For the **write** tools (`FORTIGATE_ALLOW_WRITE=true`) the profile needs **Read/Write** on
+   *Firewall* (at least *Address* and *Policy*; `fwgrp` with `address`/`policy` set to `read-write`
+   under custom permissions) instead of read-only. Prefer a separate write admin + token over
+   upgrading the read-only one.
 2. Assign that profile to the REST API admin, set a **Trusted Host** to the IP the server runs from,
    and create the admin. FortiOS shows the **API token once** — copy it; it's `FORTIGATE_API_TOKEN`.
 
@@ -63,6 +91,7 @@ execute api-user generate-key mcp-ro
 ```bash
 cp .env.example fortigate.env
 # edit fortigate.env: FORTIGATE_BASE_URL, FORTIGATE_API_TOKEN
+#   (set FORTIGATE_ALLOW_WRITE=true to enable writes)
 ```
 
 - **`FORTIGATE_BASE_URL`** — the appliance management URL (e.g. `https://192.0.2.1`). For HA, point
@@ -148,8 +177,10 @@ gateway walkthrough and client setup.
 #### Multiple instances (one image, several env files)
 
 The same image runs as several containers side by side, each with its own env file —
-for example one container per FortiGate, or a second set of credentials with other rights.
-A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+for example the shared read-only instance next to a write-enabled one that uses another
+API token, or one container per FortiGate.
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys).
+Ready to copy: [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
 
 ```yaml
 x-fortigate: &fortigate
@@ -162,12 +193,12 @@ x-fortigate: &fortigate
   networks: [atlas-net]
 
 services:
-  fortigate-mcp:                    # existing shared instance
+  fortigate-mcp:                    # existing shared read-only instance
     <<: *fortigate
     container_name: fortigate-mcp
     env_file: ./fortigate.env
 
-  fortigate-mcp-instance-a:         # a second FortiGate (its own API token)
+  fortigate-mcp-instance-a:         # write access with instance a's API token
     <<: *fortigate
     container_name: fortigate-mcp-instance-a
     env_file: ./env/instance_a.env
@@ -178,7 +209,9 @@ networks:
 ```
 
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
-  env/instance_a.env`) with instance a's FortiGate URL and API token. `*.env` is gitignored, so it stays local.
+  env/instance_a.env`) with instance a's API token and `FORTIGATE_ALLOW_WRITE=true`. The shared instance keeps
+  the flag off. Every write still asks for confirmation first unless
+  `FORTIGATE_CONFIRM_WRITE=false`. `*.env` is gitignored, so it stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 
@@ -202,10 +235,19 @@ In Claude Code, run `/mcp` to confirm the `fortigate` server connected, then ask
 - "Are all IPsec tunnels up?"
 - "What's the HA sync status and current CPU/memory?"
 
+With `FORTIGATE_ALLOW_WRITE=true` you can also:
+
+- "Create an address object srv-app-01 for 10.0.0.10 and add it to the grp-web group."
+- "Change the address app-fqdn to point at app.test.corp."
+- "Remove srv-old from the grp-web address group."
+- "Disable policy 12 with the comment 'paused for change CHG-1', and re-enable it afterwards."
+
 ## Notes & scope
 
-- **Read-only.** No configuration/write tools. If you add them, gate behind an explicit env flag
-  (e.g. `FORTIGATE_ALLOW_WRITE`) and a separate tool group, and use a read-write API admin.
+- **Writes are opt-in.** Reads are always available; the write tools refuse unless
+  `FORTIGATE_ALLOW_WRITE=true` and the REST API admin has a read-write Firewall profile. Leave the
+  flag unset (and keep a read-only profile) for a read-only server. The writes are reversible
+  (re-enable a policy, re-add a member, set the old address value); there are no delete tools.
 - **VDOMs** — multi-VDOM boxes scope most objects per VDOM; set `FORTIGATE_VDOM` or pass `vdom` per
   tool. Global resources (system status, license, HA) ignore it.
 - **Secrets are never returned** by FortiOS (e.g. IPsec `preshared-key`), so they can't leak here.

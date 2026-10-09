@@ -1,8 +1,10 @@
 """Configuration for the NetBox MCP server, loaded from environment variables.
 
-Authentication is a NetBox API token. Use a **read-only** token (uncheck "write enabled" when
-creating it). The header scheme is auto-detected: v2 tokens (``nbt_…``, NetBox 4.5+) use ``Bearer``,
-classic v1 tokens use ``Token``. Secrets are never hardcoded; everything comes from the environment.
+Authentication is a NetBox API token. For a read-only server use a **read-only** token (uncheck
+"write enabled" when creating it). The header scheme is auto-detected: v2 tokens (``nbt_…``, NetBox
+4.5+) use ``Bearer``, classic v1 tokens use ``Token``. Secrets are never hardcoded; everything comes
+from the environment. Writes are opt-in via ``NETBOX_ALLOW_WRITE`` (and need a write-enabled token);
+each write then needs the user's confirmation unless ``NETBOX_CONFIRM_WRITE=false``.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ class Settings:
 
     base_url: str
     token: str
+    allow_write: bool = False
+    confirm_write: bool = True
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -56,6 +60,8 @@ class Settings:
         return cls(
             base_url=env["NETBOX_BASE_URL"].strip().rstrip("/"),
             token=env["NETBOX_TOKEN"].strip(),
+            allow_write=_bool_env(env, "NETBOX_ALLOW_WRITE", False),
+            confirm_write=_bool_env(env, "NETBOX_CONFIRM_WRITE", True),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),

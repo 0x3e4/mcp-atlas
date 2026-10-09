@@ -1,16 +1,24 @@
-"""FastMCP server exposing read-only VMware vCenter (vSphere Automation API) tools.
+"""FastMCP server exposing VMware vCenter (vSphere Automation API) tools.
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
-always-on HTTP server. All tools are read-only (GET). Curated tools cover VMs, hosts, clusters,
-datastores, networks and appliance health; the raw ``vcenter_get`` escape hatch reaches anything else.
+always-on HTTP server. Read tools (GET) cover VMs, hosts, clusters, datastores, networks and appliance
+health; the raw ``vcenter_get`` escape hatch reaches anything else. Write tools (VM power and guest
+power actions) are **opt-in**: they refuse unless ``VCENTER_ALLOW_WRITE=true`` and need an account
+whose role has the matching ``VirtualMachine.Interact.*`` privileges. With the flag off the server is
+read-only. Unless ``VCENTER_CONFIRM_WRITE=false``, every write first returns a preview plus a confirm
+code and only runs when called again with that code, after the user has confirmed.
 
 Note: vCenter list endpoints have a result cap and **no pagination** — narrow with filters.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import secrets
 import sys
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -19,7 +27,15 @@ from pydantic import Field
 from .client import VCenterClient
 from .config import ConfigError, Settings
 
-mcp = FastMCP("vcenter-mcp")
+mcp = FastMCP(
+    "vcenter-mcp",
+    instructions=(
+        "Write tools (vm_power/vm_guest_power) need the user's confirmation: the first call changes "
+        "nothing and returns a preview with a confirm_code. Show the user a short overview of what will "
+        "change, end with 'Confirm it?', and only after they say yes repeat the call with confirm=<code>. "
+        "Prefer vm_guest_power (clean shutdown/reboot via VMware Tools) over the hard vm_power actions."
+    ),
+)
 
 _client: VCenterClient | None = None
 
@@ -31,6 +47,51 @@ def _get_client() -> VCenterClient:
     return _client
 
 
+def _require_write() -> None:
+    """Gate write tools behind the opt-in VCENTER_ALLOW_WRITE flag."""
+    if not _get_client().settings.allow_write:
+        raise ValueError(
+            "Write tools are disabled. Set VCENTER_ALLOW_WRITE=true (and use an account whose role has "
+            "the matching VirtualMachine.Interact.* privileges) to change VM power states."
+        )
+
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when VCENTER_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not _get_client().settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
+
+
 # ---- curated field projections ------------------------------------------
 _VM_FIELDS = ("vm", "name", "power_state", "cpu_count", "memory_size_MiB")
 _VM_DETAIL_FIELDS = ("name", "power_state", "cpu.count", "memory.size_MiB", "guest_OS")
@@ -40,6 +101,19 @@ _DATASTORE_FIELDS = ("datastore", "name", "type", "free_space", "capacity")
 _NETWORK_FIELDS = ("network", "name", "type")
 _DATACENTER_FIELDS = ("datacenter", "name")
 _RESOURCE_POOL_FIELDS = ("resource_pool", "name")
+
+# action -> wording for the preview summary. "Hard" = hypervisor-level, the guest OS is not asked.
+_POWER_ACTIONS = {
+    "start": "Power on",
+    "stop": "HARD power off (no guest shutdown, like pulling the plug)",
+    "reset": "HARD reset (no guest reboot, like pressing the reset button)",
+    "suspend": "Suspend (hypervisor-level)",
+}
+_GUEST_POWER_ACTIONS = {
+    "shutdown": "clean guest OS shutdown (via VMware Tools)",
+    "reboot": "clean guest OS reboot (via VMware Tools)",
+    "standby": "guest OS standby (via VMware Tools)",
+}
 
 
 # ---- helpers ------------------------------------------------------------
@@ -66,6 +140,13 @@ def _pick(obj: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
 
 def _lst(value: str | None) -> list[str] | None:
     return [value] if value else None
+
+
+async def _vm_state(vm: str) -> tuple[Any, Any]:
+    """One GET /api/vcenter/vm/{vm} for the write preview -> (name, power_state); 404s on an unknown VM."""
+    data = await _get_client().get(f"vcenter/vm/{vm}")
+    data = data if isinstance(data, dict) else {}
+    return data.get("name"), data.get("power_state")
 
 
 async def _get_list(
@@ -221,6 +302,68 @@ async def vcenter_get(
     """Escape hatch: raw read-only GET against any vCenter ``/api/...`` resource."""
     data = await _get_client().get_raw(path, params=params)
     return data if isinstance(data, (dict, list)) else {"data": data}
+
+
+# ---- tools: writes (opt-in, gated by VCENTER_ALLOW_WRITE) ----------------
+
+@mcp.tool()
+async def vm_power(
+    vm: Annotated[str, Field(description="The VM id (e.g. 'vm-123'); resolve it with list_vms.")],
+    action: Annotated[
+        Literal["start", "stop", "reset", "suspend"],
+        Field(description="start = power on; stop / reset = HARD power off / reset (no guest shutdown); suspend."),
+    ],
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Hard VM power action (WRITE — requires VCENTER_ALLOW_WRITE). POSTs /api/vcenter/vm/{vm}/power?action=<action>.
+
+    ``stop`` and ``reset`` act at the hypervisor level, like pulling the plug / pressing the reset
+    button: the guest OS gets no chance to shut down. For a running VM prefer vm_guest_power
+    (shutdown/reboot); use these to power on, or when the guest hangs or has no VMware Tools.
+    Needs VirtualMachine.Interact.PowerOn / PowerOff / Reset / Suspend for start / stop / reset / suspend.
+    """
+    _require_write()
+    action = str(action).strip().lower()  # type: ignore[assignment]
+    if action not in _POWER_ACTIONS:
+        raise ValueError(f"action must be one of {', '.join(_POWER_ACTIONS)}; got {action!r}.")
+    name, state = await _vm_state(vm)
+    change = {"vm": vm, "action": action}
+    summary = f"{_POWER_ACTIONS[action]}: VM '{name}' ({vm}), currently {state}."
+    if preview := _confirm("vm_power", change, summary, confirm):
+        return preview
+    await _get_client().post(f"vcenter/vm/{vm}/power", params={"action": action})
+    return {"vm": vm, "name": name, "action": action, "previous_state": state, "done": True,
+            "next": "Check the new state with get_vm_power."}
+
+
+@mcp.tool()
+async def vm_guest_power(
+    vm: Annotated[str, Field(description="The VM id (e.g. 'vm-123'); resolve it with list_vms.")],
+    action: Annotated[
+        Literal["shutdown", "reboot", "standby"],
+        Field(description="Ask the guest OS (via VMware Tools) to shut down cleanly, reboot, or go to standby."),
+    ],
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Clean guest-OS power action via VMware Tools (WRITE — requires VCENTER_ALLOW_WRITE). POSTs /api/vcenter/vm/{vm}/guest/power?action=<action>.
+
+    The preferred way to shut down or reboot a running VM. Needs the VM powered on with VMware Tools
+    running (vCenter answers 503 otherwise; fall back to vm_power). Returns as soon as the guest has the
+    request; the guest finishes on its own, so check get_vm_power afterwards. Needs
+    VirtualMachine.Interact.PowerOff / Reset / Suspend for shutdown / reboot / standby.
+    """
+    _require_write()
+    action = str(action).strip().lower()  # type: ignore[assignment]
+    if action not in _GUEST_POWER_ACTIONS:
+        raise ValueError(f"action must be one of {', '.join(_GUEST_POWER_ACTIONS)}; got {action!r}.")
+    name, state = await _vm_state(vm)
+    change = {"vm": vm, "action": action}
+    summary = f"Request a {_GUEST_POWER_ACTIONS[action]}: VM '{name}' ({vm}), currently {state}."
+    if preview := _confirm("vm_guest_power", change, summary, confirm):
+        return preview
+    await _get_client().post(f"vcenter/vm/{vm}/guest/power", params={"action": action})
+    return {"vm": vm, "name": name, "action": action, "previous_state": state, "requested": True,
+            "next": "The guest completes this on its own; check the state with get_vm_power in a moment."}
 
 
 def main() -> None:

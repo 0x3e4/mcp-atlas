@@ -4,8 +4,8 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "netbox-mcp"
-version = "0.1.0"
-description = "Read-only NetBox (DCIM/IPAM) MCP server — devices, interfaces, IPs, prefixes, VMs"
+version = "0.2.0"
+description = "NetBox (DCIM/IPAM) MCP server — devices, interfaces, IPs, prefixes, VMs; opt-in writes (IPs, devices, journal) with confirm-before-write"
 readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"

@@ -146,7 +146,9 @@ def test_verify_ssl_and_ca_bundle():
 def test_allow_write_and_export_dir_default_off_and_parse():
     s = Settings.from_env(_base_env())
     assert s.allow_write is False
+    assert s.confirm_write is True  # confirmation defaults on
     assert s.export_dir == ""
+    assert Settings.from_env({**_base_env(), "NETSCALER_CONFIRM_WRITE": "false"}).confirm_write is False
 
     env = _base_env()
     env["NETSCALER_ALLOW_WRITE"] = "true"
@@ -290,6 +292,27 @@ def test_waf_tool_params_present():
     assert "host_map" in tools["import_waf_profile"].inputSchema["properties"]
     assert "from_host" in tools["rehost_waf_profile"].inputSchema["properties"]
     assert "min_hits" in tools["deploy_waf_learned_rules"].inputSchema["properties"]
+
+
+WRITE_TOOLS = {
+    "add_waf_rule", "remove_waf_rule", "deploy_waf_learned_rules", "discard_waf_learned_rules",
+    "set_waf_check_actions", "import_waf_profile", "rehost_waf_profile", "save_config",
+    "add_bot_rule", "remove_bot_rule", "set_bot_detections", "import_bot_profile", "rehost_bot_profile",
+    "update_signatures",
+}
+
+
+def test_every_write_tool_takes_a_confirm_code():
+    tools = _tools()
+    for name in WRITE_TOOLS:
+        props = tools[name].inputSchema["properties"]
+        assert "confirm" in props, f"{name} missing confirm"
+        assert "WRITE" in tools[name].description, f"{name} docstring should say WRITE"
+        if name != "save_config":
+            assert props["dry_run"]["default"] is True, f"{name} must preview by default"
+    # every tool that says WRITE is in the list above
+    assert {n for n, t in tools.items() if "(WRITE" in t.description} == WRITE_TOOLS
+    assert "Confirm it?" in (server.mcp.instructions or "")
 
 
 def test_write_tools_refuse_without_allow_write():

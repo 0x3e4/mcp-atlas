@@ -40,6 +40,12 @@ EXPECTED_TOOLS = {
 }
 
 
+WRITE_TOOLS = {
+    "create_page", "update_page", "create_chapter", "update_chapter", "create_book", "update_book",
+    "create_shelf", "update_shelf", "add_comment",
+}
+
+
 def _tools() -> dict[str, object]:
     listed = asyncio.run(server.mcp.list_tools())
     return {t.name: t for t in listed}
@@ -73,6 +79,8 @@ def test_required_params_present():
         assert p in tools["update_shelf"].inputSchema["properties"]
     for p in ("page_id", "body", "reply_to"):
         assert p in tools["add_comment"].inputSchema["properties"]
+    for name in WRITE_TOOLS:
+        assert "confirm" in tools[name].inputSchema["properties"], name
 
 
 def test_settings_requires_credentials():
@@ -123,6 +131,7 @@ def test_verify_ssl_and_ca_bundle():
 
 def test_allow_write_defaults_off_and_parses():
     assert Settings.from_env(_base_env()).allow_write is False
+    assert Settings.from_env(_base_env()).confirm_write is True
     env = _base_env()
     env["BOOKSTACK_ALLOW_WRITE"] = "true"
     assert Settings.from_env(env).allow_write is True
@@ -139,9 +148,10 @@ def test_write_tools_refuse_without_allow_write():
         server._client = None
 
 
-def _write_client(handler) -> server.BookStackClient:
+def _write_client(handler, *, confirm_write: bool = False) -> server.BookStackClient:
     env = _base_env()
     env["BOOKSTACK_ALLOW_WRITE"] = "true"
+    env["BOOKSTACK_CONFIRM_WRITE"] = "true" if confirm_write else "false"
     client = server.BookStackClient(Settings.from_env(env))
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return client
@@ -203,3 +213,32 @@ def test_validation_errors_name_the_fields():
             asyncio.run(server.create_book("x"))
     finally:
         server._client = None
+
+
+def test_writes_need_a_matching_confirm_code():
+    sent: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.method, request.url.path))
+        return httpx.Response(200, json={"id": 5, "name": "Ops", "slug": "ops"})
+
+    server._client = _write_client(handler, confirm_write=True)
+
+    async def calls():
+        preview = await server.create_book("Ops", description="Runbooks")
+        assert preview["status"] == "confirmation_required" and preview["changed"] is False
+        assert preview["change"] == {"name": "Ops", "description": "Runbooks"}
+        assert "Confirm it?" in preview["next"]
+        code = preview["confirm_code"]
+        # a code only fits the exact arguments it was issued for
+        other = await server.create_book("Ops", description="Something else", confirm=code)
+        assert other["status"] == "confirmation_required" and "did not match" in other["note"]
+        assert sent == []
+        done = await server.create_book("Ops", description="Runbooks", confirm=code)
+        assert done["id"] == 5 and done["url"] == "https://docs.example.com/books/ops"
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None
+    assert sent == [("POST", "/api/books")]

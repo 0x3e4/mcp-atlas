@@ -1,15 +1,24 @@
-"""FastMCP server exposing read-only NetBox (DCIM/IPAM) tools.
+"""FastMCP server exposing NetBox (DCIM/IPAM) tools.
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
-always-on HTTP server. All tools are read-only (GET). Curated tools cover devices, interfaces,
-IP addresses/prefixes, virtual machines and the reference catalogs; the raw ``netbox_get`` escape
-hatch reaches anything else.
+always-on HTTP server. Read tools (GET) cover devices, interfaces, IP addresses/prefixes, virtual
+machines and the reference catalogs; the raw ``netbox_get`` escape hatch reaches anything else. Write
+tools (create/update IP addresses, allocate the next free IP of a prefix, update a device, add a
+journal entry) are **opt-in**: they refuse unless ``NETBOX_ALLOW_WRITE=true`` and need a
+write-enabled token whose user has the matching object permissions. With the flag off the server is
+read-only. Unless ``NETBOX_CONFIRM_WRITE=false``, every write first returns a preview plus a confirm
+code and only runs when called again with that code, after the user has confirmed.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import re
+import secrets
 import sys
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -18,7 +27,15 @@ from pydantic import Field
 from .client import NetBoxClient
 from .config import ConfigError, Settings
 
-mcp = FastMCP("netbox-mcp")
+mcp = FastMCP(
+    "netbox-mcp",
+    instructions=(
+        "Write tools (create_ip_address/update_ip_address/assign_next_ip/update_device/add_journal_entry) "
+        "need the user's confirmation: the first call changes nothing and returns a preview with a "
+        "confirm_code. Show the user a short overview of what will change, end with 'Confirm it?', and "
+        "only after they say yes repeat the call with confirm=<code>."
+    ),
+)
 
 _client: NetBoxClient | None = None
 
@@ -28,6 +45,52 @@ def _get_client() -> NetBoxClient:
     if _client is None:
         _client = NetBoxClient(Settings.from_env())
     return _client
+
+
+def _require_write() -> None:
+    """Gate write tools behind the opt-in NETBOX_ALLOW_WRITE flag."""
+    if not _get_client().settings.allow_write:
+        raise ValueError(
+            "Write tools are disabled. Set NETBOX_ALLOW_WRITE=true (and use a write-enabled token whose "
+            "user has the matching add/change object permissions) to create or edit IP addresses, "
+            "devices and journal entries."
+        )
+
+
+# Per-process key: confirm codes are bound to one tool + its exact arguments and die with a restart.
+_CONFIRM_KEY = secrets.token_bytes(16)
+_CONFIRM_DESC = (
+    "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
+    "has seen the overview and confirmed."
+)
+
+
+def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+    """Return a preview the agent must confirm with the user, or None when the write may run.
+
+    Writes run straight away when NETBOX_CONFIRM_WRITE=false, or when ``code`` matches this exact
+    tool + change (so what runs is what the user saw).
+    """
+    if not _get_client().settings.confirm_write:
+        return None
+    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
+    if code and hmac.compare_digest(code.strip(), expected):
+        return None
+    out: dict[str, Any] = {
+        "status": "confirmation_required",
+        "changed": False,
+        "summary": summary,
+        "change": change,
+        "confirm_code": expected,
+        "next": (
+            "Show the user a short overview of this change and end with 'Confirm it?'. Only after they "
+            f"confirm, call {tool} again with the same arguments and confirm='{expected}'."
+        ),
+    }
+    if code:
+        out["note"] = "The confirm code did not match these arguments (changed, expired or restarted) — confirm again."
+    return out
 
 
 # ---- curated field projections (dotted paths reach nested {id,display} objects) --
@@ -42,6 +105,28 @@ _VM_FIELDS = (
     "id", "name", "status.value", "cluster.display", "role.display", "primary_ip.address",
     "vcpus", "memory", "disk",
 )
+
+# write responses carry full objects; keep these plus the browser URL (display_url, NetBox 4.x)
+_IP_WRITE_FIELDS = (
+    "id", "address", "status.value", "role.value", "dns_name", "vrf.display", "tenant.display",
+    "assigned_object_type", "assigned_object_id", "assigned_object.display", "description",
+)
+_DEVICE_WRITE_FIELDS = _DEVICE_FIELDS + (
+    "tenant.display", "primary_ip4.address", "primary_ip6.address", "description", "comments",
+)
+_JOURNAL_FIELDS = (
+    "id", "assigned_object_type", "assigned_object_id", "assigned_object.display", "kind.value",
+    "created", "comments",
+)
+
+# Choice values (NetBox 4.x: ipam/choices.py, dcim/choices.py, extras/choices.py)
+IpStatus = Literal["active", "reserved", "deprecated", "dhcp", "slaac"]
+IpRole = Literal["loopback", "secondary", "anycast", "vip", "vrrp", "hsrp", "glbp", "carp"]
+DeviceStatus = Literal["offline", "active", "planned", "staged", "failed", "inventory", "decommissioning"]
+JournalKind = Literal["info", "success", "warning", "danger"]
+InterfaceType = Literal["dcim.interface", "virtualization.vminterface"]
+
+_OBJECT_TYPE_RE = re.compile(r"^[a-z_]+\.[a-z_]+$")
 
 _OBJECT_KINDS = {
     "sites": ("dcim/sites", ("id", "name", "slug", "status.value", "region.display")),
@@ -101,6 +186,27 @@ async def _get_list(
     if not full:
         results = [_pick(r, fields) for r in results if isinstance(r, dict)]
     return {"count": count, "returned": len(results), "results": results}
+
+
+def _fields(**values: Any) -> dict[str, Any]:
+    """Drop unset (None) fields so a write only sends — and a PATCH only changes — what was given."""
+    return {k: v for k, v in values.items() if v is not None}
+
+
+def _assignment(interface_id: int | None, interface_type: str) -> dict[str, Any]:
+    """Interface assignment as NetBox's generic relation (assigned_object_type + assigned_object_id)."""
+    if interface_id is None:
+        return {}
+    return {"assigned_object_type": interface_type, "assigned_object_id": interface_id}
+
+
+def _written(fields: tuple[str, ...], data: Any) -> dict[str, Any]:
+    """Trim a create/update response to the key fields plus the object's browser URL."""
+    if not isinstance(data, dict):
+        return {"result": data}
+    out = _pick(data, fields)
+    out["url"] = data.get("display_url") or data.get("url")
+    return out
 
 
 # ---- tools --------------------------------------------------------------
@@ -216,6 +322,167 @@ async def netbox_get(
     """Escape hatch: raw read-only GET against any NetBox ``/api/...`` resource (trailing slash added)."""
     data = await _get_client().get_raw(path, params=params)
     return data if isinstance(data, (dict, list)) else {"data": data}
+
+
+# ---- write tools (opt-in: NETBOX_ALLOW_WRITE) -----------------------------
+
+_IFACE_ID_DESC = (
+    "Interface to assign the address to: a device interface id, or a VM interface id with "
+    "interface_type='virtualization.vminterface'."
+)
+_IFACE_TYPE_DESC = "Kind of interface assigned_interface_id refers to."
+
+
+@mcp.tool()
+async def create_ip_address(
+    address: Annotated[str, Field(description="Address with mask, e.g. '10.0.0.10/24'.", min_length=3)],
+    status: Annotated[IpStatus | None, Field(description="Status (NetBox default: active).")] = None,
+    role: Annotated[IpRole | None, Field(description="Role, e.g. 'vip', 'loopback'.")] = None,
+    dns_name: Annotated[str | None, Field(description="DNS name (FQDN), e.g. 'app.test.corp'.", max_length=255)] = None,
+    description: Annotated[str | None, Field(description="Short description.", max_length=200)] = None,
+    vrf_id: Annotated[int | None, Field(description="VRF id (omit for the global table).")] = None,
+    tenant_id: Annotated[int | None, Field(description="Tenant id.")] = None,
+    assigned_interface_id: Annotated[int | None, Field(description=_IFACE_ID_DESC)] = None,
+    interface_type: Annotated[InterfaceType, Field(description=_IFACE_TYPE_DESC)] = "dcim.interface",
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Create (document) an IP address (WRITE — requires NETBOX_ALLOW_WRITE). POSTs /api/ipam/ip-addresses/.
+
+    To take the next free address of a prefix, use assign_next_ip instead. NetBox only rejects a
+    duplicate when ENFORCE_GLOBAL_UNIQUE (or the VRF's enforce_unique) is on.
+    """
+    _require_write()
+    payload = _fields(
+        address=address.strip(), status=status, role=role, dns_name=dns_name, description=description,
+        vrf=vrf_id, tenant=tenant_id,
+    ) | _assignment(assigned_interface_id, interface_type)
+    where = f" on {interface_type} {assigned_interface_id}" if assigned_interface_id is not None else ""
+    if preview := _confirm("create_ip_address", payload, f"Create IP address {payload['address']}{where}.", confirm):
+        return preview
+    return _written(_IP_WRITE_FIELDS, await _get_client().post("ipam/ip-addresses", json=payload))
+
+
+@mcp.tool()
+async def update_ip_address(
+    id: Annotated[int, Field(description="IP address id.")],
+    status: Annotated[IpStatus | None, Field(description="New status.")] = None,
+    role: Annotated[IpRole | None, Field(description="New role.")] = None,
+    dns_name: Annotated[str | None, Field(description="New DNS name ('' clears it).", max_length=255)] = None,
+    description: Annotated[str | None, Field(description="New description ('' clears it).", max_length=200)] = None,
+    tenant_id: Annotated[int | None, Field(description="New tenant id.")] = None,
+    assigned_interface_id: Annotated[int | None, Field(description=_IFACE_ID_DESC)] = None,
+    interface_type: Annotated[InterfaceType, Field(description=_IFACE_TYPE_DESC)] = "dcim.interface",
+    unassign: Annotated[bool, Field(description="Detach the address from its interface.")] = False,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Update an IP address's status, role, DNS name, description, tenant or interface (WRITE — requires NETBOX_ALLOW_WRITE).
+
+    PATCHes /api/ipam/ip-addresses/{id}/; only the fields you give change. NetBox refuses to move or
+    unassign an address that is the primary IP of its device/VM.
+    """
+    _require_write()
+    if unassign and assigned_interface_id is not None:
+        raise ValueError("Give assigned_interface_id or unassign, not both.")
+    payload = _fields(
+        status=status, role=role, dns_name=dns_name, description=description, tenant=tenant_id,
+    ) | _assignment(assigned_interface_id, interface_type)
+    if unassign:
+        payload |= {"assigned_object_type": None, "assigned_object_id": None}
+    if not payload:
+        raise ValueError(
+            "Nothing to update: provide status, role, dns_name, description, tenant_id or an interface change."
+        )
+    if preview := _confirm("update_ip_address", {"id": id, **payload}, f"Update IP address {id}: {', '.join(payload)}.", confirm):
+        return preview
+    return _written(_IP_WRITE_FIELDS, await _get_client().patch(f"ipam/ip-addresses/{id}", json=payload))
+
+
+@mcp.tool()
+async def assign_next_ip(
+    prefix_id: Annotated[int, Field(description="Prefix to allocate from (see list_prefixes).")],
+    status: Annotated[IpStatus | None, Field(description="Status (NetBox default: active).")] = None,
+    dns_name: Annotated[str | None, Field(description="DNS name (FQDN), e.g. 'vm-42.test.corp'.", max_length=255)] = None,
+    description: Annotated[str | None, Field(description="Short description.", max_length=200)] = None,
+    tenant_id: Annotated[int | None, Field(description="Tenant id.")] = None,
+    assigned_interface_id: Annotated[int | None, Field(description=_IFACE_ID_DESC)] = None,
+    interface_type: Annotated[InterfaceType, Field(description=_IFACE_TYPE_DESC)] = "dcim.interface",
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Allocate the next free IP address of a prefix (WRITE — requires NETBOX_ALLOW_WRITE).
+
+    POSTs /api/ipam/prefixes/{id}/available-ips/. NetBox picks the address under a lock (mask and VRF
+    come from the prefix), so it is only known once applied; a full prefix answers 409.
+    """
+    _require_write()
+    payload = _fields(
+        status=status, dns_name=dns_name, description=description, tenant=tenant_id,
+    ) | _assignment(assigned_interface_id, interface_type)
+    where = f" on {interface_type} {assigned_interface_id}" if assigned_interface_id is not None else ""
+    summary = (
+        f"Allocate the next free address in prefix {prefix_id}{where} "
+        "(NetBox chooses the address when this is applied)."
+    )
+    if preview := _confirm("assign_next_ip", {"prefix_id": prefix_id, **payload}, summary, confirm):
+        return preview
+    data = await _get_client().post(f"ipam/prefixes/{prefix_id}/available-ips", json=payload)
+    if isinstance(data, list):  # a list request returns a list; a single object returns one object
+        data = data[0] if data else {}
+    return _written(_IP_WRITE_FIELDS, data)
+
+
+@mcp.tool()
+async def update_device(
+    id: Annotated[int, Field(description="Device id.")],
+    status: Annotated[DeviceStatus | None, Field(description="New status, e.g. 'offline', 'failed', 'decommissioning'.")] = None,
+    description: Annotated[str | None, Field(description="New description ('' clears it).", max_length=200)] = None,
+    comments: Annotated[str | None, Field(description="New comments (markdown) — replaces the whole field ('' clears it).")] = None,
+    serial: Annotated[str | None, Field(description="New serial number.", max_length=50)] = None,
+    tenant_id: Annotated[int | None, Field(description="New tenant id.")] = None,
+    primary_ip4_id: Annotated[int | None, Field(description="IP address id to make the primary IPv4 (must be assigned to one of the device's interfaces).")] = None,
+    primary_ip6_id: Annotated[int | None, Field(description="IP address id to make the primary IPv6 (must be assigned to one of the device's interfaces).")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Update a device's status, description, comments, serial, tenant or primary IP (WRITE — requires NETBOX_ALLOW_WRITE).
+
+    PATCHes /api/dcim/devices/{id}/; only the fields you give change. For a running log of what
+    happened, prefer add_journal_entry over rewriting comments.
+    """
+    _require_write()
+    payload = _fields(
+        status=status, description=description, comments=comments, serial=serial, tenant=tenant_id,
+        primary_ip4=primary_ip4_id, primary_ip6=primary_ip6_id,
+    )
+    if not payload:
+        raise ValueError(
+            "Nothing to update: provide status, description, comments, serial, tenant_id or a primary IP."
+        )
+    if preview := _confirm("update_device", {"id": id, **payload}, f"Update device {id}: {', '.join(payload)}.", confirm):
+        return preview
+    return _written(_DEVICE_WRITE_FIELDS, await _get_client().patch(f"dcim/devices/{id}", json=payload))
+
+
+@mcp.tool()
+async def add_journal_entry(
+    object_type: Annotated[str, Field(description="Object type as app_label.model, e.g. 'dcim.device', 'ipam.prefix', 'virtualization.virtualmachine', 'dcim.site'.")],
+    object_id: Annotated[int, Field(description="Id of that object.")],
+    comments: Annotated[str, Field(description="Entry text (markdown).", min_length=1)],
+    kind: Annotated[JournalKind | None, Field(description="Kind (NetBox default: info).")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Add a journal entry to any object (WRITE — requires NETBOX_ALLOW_WRITE). POSTs /api/extras/journal-entries/.
+
+    Journal entries are the human change log of an object (maintenance, incidents, checks); the
+    object itself is left untouched.
+    """
+    _require_write()
+    object_type = object_type.strip().lower()
+    if not _OBJECT_TYPE_RE.match(object_type):
+        raise ValueError(f"object_type must look like 'app_label.model' (e.g. 'dcim.device'); got {object_type!r}.")
+    payload = _fields(assigned_object_type=object_type, assigned_object_id=object_id, kind=kind, comments=comments)
+    summary = f"Add a {kind or 'info'} journal entry to {object_type} {object_id}."
+    if preview := _confirm("add_journal_entry", payload, summary, confirm):
+        return preview
+    return _written(_JOURNAL_FIELDS, await _get_client().post("extras/journal-entries", json=payload))
 
 
 def main() -> None:

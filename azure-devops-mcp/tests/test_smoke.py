@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
 
 from azure_devops_mcp import server
@@ -118,3 +119,48 @@ def test_allow_write_flag_defaults_off_and_parses():
     env = _base_env()
     env["AZDO_ALLOW_WRITE"] = "true"
     assert Settings.from_env(env).allow_write is True
+
+
+CONFIRM_TOOLS = {'update_work_item', 'create_work_item', 'create_or_update_wiki_page'}
+
+
+def test_write_tools_take_a_confirm_code_and_confirm_defaults_on():
+    tools = _tools()
+    for name in CONFIRM_TOOLS:
+        assert "confirm" in tools[name].inputSchema["properties"], name
+    assert Settings.from_env(_base_env()).confirm_write is True
+    env = _base_env()
+    env["AZDO_CONFIRM_WRITE"] = "false"
+    assert Settings.from_env(env).confirm_write is False
+
+
+def test_writes_need_a_matching_confirm_code():
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.method)
+        return httpx.Response(200, json={"id": 7, "rev": 3})
+
+    env = _base_env()
+    env["AZDO_ALLOW_WRITE"] = "true"
+    client = server.AzdoClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    server._client = client
+
+    async def calls():
+        preview = await server.update_work_item(7, state="Resolved")
+        assert preview["status"] == "confirmation_required" and preview["changed"] is False
+        assert "Confirm it?" in preview["next"]
+        code = preview["confirm_code"]
+        # a code only fits the exact arguments it was issued for
+        other = await server.update_work_item(7, state="Closed", confirm=code)
+        assert other["status"] == "confirmation_required" and "did not match" in other["note"]
+        assert sent == []
+        done = await server.update_work_item(7, state="Resolved", confirm=code)
+        assert done.get("status") != "confirmation_required"
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None
+    assert sent == ["PATCH"]

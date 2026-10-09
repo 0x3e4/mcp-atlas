@@ -179,3 +179,87 @@ def test_tools_through_the_mcp_protocol_layer(ns):
     added, imported = asyncio.run(scenario())
     assert "would add" in added and "(css|js)" in added
     assert "exists" in imported
+
+
+# ---- confirm-before-write (NETSCALER_CONFIRM_WRITE, on by default) ---------
+
+def test_confirm_flow_applies_only_with_the_matching_code(ns):
+    ns.use(confirm_write=True)
+    rule = {"host": "app.test.corp", "path": "/portal/"}
+
+    async def scenario():
+        preview = await server.add_waf_rule("pr_app", "allow_url", **rule)
+        assert preview["results"] == [{"profile": "pr_app", "status": "would add"}]
+        code = preview["confirm_code"]
+        assert "Confirm it?" in preview["next"] and f"confirm='{code}'" in preview["next"]
+
+        # dry_run=false without a code is just the preview again: same code, nothing sent
+        first = await server.add_waf_rule("pr_app", "allow_url", **rule, dry_run=False)
+        assert (first["status"], first["dry_run"], first["confirm_code"]) == ("confirmation_required", True, code)
+        assert first["results"][0]["status"] == "would add"
+        wrong = await server.add_waf_rule("pr_app", "allow_url", **rule, dry_run=False, confirm="000000000000")
+        assert wrong["confirm_code"] == code and "did not match" in wrong["note"]
+        # the code is bound to the arguments: another path needs its own confirmation
+        other = await server.add_waf_rule("pr_app", "allow_url", host="app.test.corp", path="/x/", dry_run=False, confirm=code)
+        assert other["status"] == "confirmation_required" and other["confirm_code"] != code
+        assert ns.writes == []
+
+        done = await server.add_waf_rule("pr_app", "allow_url", **rule, dry_run=False, confirm=code)
+        assert done["results"] == [{"profile": "pr_app", "status": "added"}]
+        assert len(ns.writes) == 1
+        # nothing left to write: no confirmation needed, nothing sent
+        again = await server.add_waf_rule("pr_app", "allow_url", **rule, dry_run=False)
+        assert again["results"][0]["status"] == "exists" and "confirm_code" not in again
+        assert len(ns.writes) == 1
+
+    asyncio.run(scenario())
+
+
+def test_confirm_code_is_bound_to_the_live_plan(ns):
+    ns.use(confirm_write=True)
+
+    async def scenario():
+        preview = await server.set_waf_check_actions("pr_app", ["start_url"], remove_actions=["learn"])
+        code = preview["confirm_code"]
+        assert preview["checks"]["start_url"]["after"] == ["log", "stats"]
+
+        ns.use(confirm_write=False)  # someone else changes the profile in between
+        await server.set_waf_check_actions("pr_app", ["start_url"], add_actions=["block"], dry_run=False)
+        ns.use(confirm_write=True)
+        writes = len(ns.writes)
+
+        stale = await server.set_waf_check_actions("pr_app", ["start_url"], remove_actions=["learn"], dry_run=False, confirm=code)
+        assert stale["status"] == "confirmation_required" and "note" in stale
+        assert stale["checks"]["start_url"]["after"] == ["block", "log", "stats"]
+        assert len(ns.writes) == writes
+        done = await server.set_waf_check_actions(
+            "pr_app", ["start_url"], remove_actions=["learn"], dry_run=False, confirm=stale["confirm_code"]
+        )
+        assert done["dry_run"] is False and done["changed"] == 1
+
+    asyncio.run(scenario())
+    assert ns.profiles["pr_app"]["starturlaction"] == ["block", "log", "stats"]
+
+
+def test_confirm_flow_for_learned_rules_and_import(ns):
+    ns.use(confirm_write=True)
+
+    async def scenario():
+        deploy = await server.deploy_waf_learned_rules("pr_app", "start_url", contains="c,d", dry_run=False)
+        assert deploy["summary"] == {"would add": 1} and deploy["results"][0]["learned"] == "would remove"
+        assert ns.writes == []
+        deployed = await server.deploy_waf_learned_rules(
+            "pr_app", "start_url", contains="c,d", dry_run=False, confirm=deploy["confirm_code"]
+        )
+        assert (deployed["summary"], deployed["results"][0]["learned"]) == ({"added": 1}, "removed")
+
+        doc = await server.export_waf_profile("pr_app")
+        plan = await server.import_waf_profile(document=doc, target_profile="pr_app_prod", dry_run=False)
+        assert (plan["profile"], plan["status"]) == ("would create", "confirmation_required")
+        assert "pr_app_prod" not in ns.profiles
+        applied = await server.import_waf_profile(
+            document=doc, target_profile="pr_app_prod", dry_run=False, confirm=plan["confirm_code"]
+        )
+        assert (applied["profile"], applied["errors"]) == ("created", [])
+
+    asyncio.run(scenario())

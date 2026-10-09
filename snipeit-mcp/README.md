@@ -40,6 +40,12 @@ clear message). The token's **user** must also hold the matching Snipe-IT permis
 Use `list_objects` to resolve the ids these tools need (e.g. `statuslabels` → `status_id`,
 `models` → `model_id`, `locations` → `location_id`).
 
+**Confirmation before every write** (`SNIPEIT_CONFIRM_WRITE`, default `true`): a write tool's first
+call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
+and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
+code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
+expire when the server restarts). Set `SNIPEIT_CONFIRM_WRITE=false` to let writes run directly.
+
 ## 1. Create an API token
 
 In Snipe-IT: **account menu → Manage API Keys → Create New Token** (the token is shown once). The
@@ -137,7 +143,8 @@ gateway walkthrough and client setup.
 The same image runs as several containers side by side, each with its own env file —
 for example the shared read-only instance next to a write-enabled one that uses another
 token, or one container per Snipe-IT instance.
-A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys):
+A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys).
+Ready to copy: [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
 
 ```yaml
 x-snipeit: &snipeit
@@ -167,7 +174,8 @@ networks:
 
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
   env/instance_a.env`) with instance a's token and `SNIPEIT_ALLOW_WRITE=true`. The shared instance keeps
-  the flag off. `*.env` is gitignored, so it stays local.
+  the flag off. Every write still asks for confirmation first unless
+  `SNIPEIT_CONFIRM_WRITE=false`. `*.env` is gitignored, so it stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 
