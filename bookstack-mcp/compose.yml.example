@@ -18,6 +18,14 @@ services:
     restart: unless-stopped
     # --- MCP gateway (e.g. mcpjungle): remove the ports: above and join a shared network ---
     # networks: [atlas-net]
+
+  # Optional: draw.io export server for create_drawing / update_drawing.
+  # Set BOOKSTACK_DRAWIO_EXPORT_URL=http://drawio-export:8000/ in bookstack.env.
+  # drawio-export:
+  #   image: jgraph/export-server:latest
+  #   container_name: drawio-export
+  #   restart: unless-stopped
+  #   # no ports: only bookstack-mcp talks to it (put both on the same network)
 # networks:
 #   atlas-net:
 #     external: true

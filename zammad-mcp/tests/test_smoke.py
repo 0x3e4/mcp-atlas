@@ -30,6 +30,7 @@ EXPECTED_TOOLS = {
     "update_ticket",
     "create_ticket",
     "tag_ticket",
+    "reply_email",
 }
 
 
@@ -167,7 +168,7 @@ def test_tag_and_pending_payloads_match_the_zammad_api():
     ]
 
 
-CONFIRM_TOOLS = {'create_ticket', 'update_ticket', 'add_note', 'tag_ticket'}
+CONFIRM_TOOLS = {'create_ticket', 'update_ticket', 'add_note', 'tag_ticket', 'reply_email'}
 
 
 def test_write_tools_take_a_confirm_code_and_confirm_defaults_on():
@@ -210,3 +211,82 @@ def test_writes_need_a_matching_confirm_code():
     finally:
         server._client = None
     assert sent == ["POST"]
+
+
+def _reply_env_client(handler) -> None:
+    env = _base_env()
+    env["ZAMMAD_ALLOW_WRITE"] = "true"
+    env["ZAMMAD_CONFIRM_WRITE"] = "false"
+    client = server.ZammadClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    server._client = client
+
+
+_ARTICLES = [
+    {"id": 1, "ticket_id": 42, "type": "email", "sender": "Customer", "internal": False,
+     "from": "Jane Doe <jane@customer.test>", "to": "support@helpdesk.test",
+     "cc": "boss@customer.test, Support <support@helpdesk.test>", "subject": "VPN down",
+     "message_id": "<m1@customer.test>", "created_by_id": 7},
+    {"id": 2, "ticket_id": 42, "type": "note", "sender": "Agent", "internal": True, "body": "checking"},
+    {"id": 3, "ticket_id": 42, "type": "email", "sender": "Customer", "internal": False,
+     "from": "Bob <bob@customer.test>", "reply_to": None,
+     "to": "support@helpdesk.test, jane@customer.test", "cc": "agent@helpdesk.test, ops@customer.test",
+     "subject": "RE: [Ticket#1001] VPN down", "message_id": "<m3@customer.test>", "created_by_id": 8},
+]
+
+
+def _reply_handler(posted: list):
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST":
+            posted.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": 99, **posted[-1]})
+        if path == "/api/v1/tickets/42":
+            return httpx.Response(200, json={"id": 42, "title": "VPN down", "customer_id": 7})
+        if path == "/api/v1/ticket_articles/by_ticket/42":
+            return httpx.Response(200, json=_ARTICLES)
+        if path == "/api/v1/email_addresses":
+            return httpx.Response(200, json=[{"id": 1, "email": "Support@helpdesk.test"}])
+        if path == "/api/v1/users/me":
+            return httpx.Response(200, json={"id": 3, "email": "agent@helpdesk.test"})
+        if path == "/api/v1/users/7":
+            return httpx.Response(200, json={"id": 7, "email": "Jane@customer.test"})
+        return httpx.Response(404, json={"error": "not found"})
+    return handler
+
+
+def test_reply_email_to_customer_threads_on_the_last_email():
+    posted: list = []
+    _reply_env_client(_reply_handler(posted))
+    try:
+        asyncio.run(server.reply_email(42, "Fixed, please retry.", cc=["lead@customer.test"]))
+    finally:
+        server._client = None
+    assert posted == [{
+        "ticket_id": 42, "type": "email", "internal": False, "sender": "Agent",
+        "to": "jane@customer.test", "cc": "lead@customer.test",
+        "subject": "RE: [Ticket#1001] VPN down", "body": "Fixed, please retry.",
+        "content_type": "text/plain", "subtype": "reply", "in_reply_to": "<m3@customer.test>",
+    }]
+
+
+def test_reply_email_all_drops_zammad_and_own_addresses():
+    posted: list = []
+    _reply_env_client(_reply_handler(posted))
+    try:
+        asyncio.run(server.reply_email(42, "Fixed.", recipients="all"))
+        with pytest.raises(ValueError, match="'customer' or 'all'"):
+            asyncio.run(server.reply_email(42, "x", recipients="everyone"))
+    finally:
+        server._client = None
+    assert posted[0]["to"] == "bob@customer.test, jane@customer.test"
+    assert posted[0]["cc"] == "ops@customer.test"
+    assert posted[0]["in_reply_to"] == "<m3@customer.test>"
+
+
+def test_reply_email_all_on_an_agent_email_goes_to_its_recipients():
+    article = {"id": 5, "ticket_id": 42, "type": "email", "sender": "Agent", "internal": False,
+               "from": "Agent A via Support <support@helpdesk.test>", "to": "jane@customer.test",
+               "cc": "", "subject": "VPN down", "message_id": "<m5@helpdesk.test>", "created_by_id": 3}
+    to, cc = asyncio.run(server._reply_all_recipients(None, article, {"support@helpdesk.test"}))
+    assert (to, cc) == (["jane@customer.test"], [])

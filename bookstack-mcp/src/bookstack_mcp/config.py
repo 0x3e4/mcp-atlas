@@ -3,7 +3,8 @@
 Secrets are never hardcoded; everything comes from the process environment (typically supplied
 via ``--env-file`` for Docker, or a local ``.env`` exported into the shell). Writes are opt-in via
 ``BOOKSTACK_ALLOW_WRITE``; each write then needs the user's confirmation unless
-``BOOKSTACK_CONFIRM_WRITE=false``.
+``BOOKSTACK_CONFIRM_WRITE=false``. Drawing tools also need a draw.io export server
+(``BOOKSTACK_DRAWIO_EXPORT_URL``) to render diagrams to PNG.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ class Settings:
     max_rows: int = 100
     verify_ssl: bool = True
     ca_bundle: str = ""
+    drawio_export_url: str = ""
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -74,6 +76,7 @@ class Settings:
             max_rows=_int_env(env, "BOOKSTACK_MAX_ROWS", 100),
             verify_ssl=_bool_env(env, "BOOKSTACK_VERIFY_SSL", True),
             ca_bundle=env.get("BOOKSTACK_CA_BUNDLE", "").strip(),
+            drawio_export_url=env.get("BOOKSTACK_DRAWIO_EXPORT_URL", "").strip(),
         )
 
     @property

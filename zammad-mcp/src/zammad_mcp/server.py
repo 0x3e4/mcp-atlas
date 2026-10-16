@@ -3,7 +3,7 @@
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
 always-on HTTP server. Read tools (tickets, articles, users, organizations, reference data) are GET;
 the raw ``zammad_get`` escape hatch reaches anything else. Write tools (add a note/comment, update
-a ticket, create a ticket, tag a ticket) are **opt-in**: they refuse unless ``ZAMMAD_ALLOW_WRITE=true`` and need a
+a ticket, create a ticket, tag a ticket, reply by email) are **opt-in**: they refuse unless ``ZAMMAD_ALLOW_WRITE=true`` and need a
 token with agent (ticket.agent) permission. With the flag off the server is effectively read-only.
 
 Reads pass ``expand=true`` so *_id fields come back as human-readable names.
@@ -16,13 +16,14 @@ import hmac
 import json
 import secrets
 import sys
+from email.utils import getaddresses
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
-from .client import ZammadClient
+from .client import ZammadClient, ZammadError
 from .config import ConfigError, Settings
 
 mcp = FastMCP(
@@ -386,6 +387,131 @@ async def tag_ticket(
         await client.delete("tags/remove", json={"item": tag, "object": "Ticket", "o_id": ticket_id})
     data = await client.get("tags", params={"object": "Ticket", "o_id": ticket_id})
     return {"ticket_id": ticket_id, "tags": data.get("tags", []) if isinstance(data, dict) else data}
+
+
+def _addresses(line: str | None) -> list[str]:
+    """``'"Name" <a@b>, c@d'`` → ``['a@b', 'c@d']`` (lowercased, only entries with an @)."""
+    return [addr.strip().strip("'").lower() for _, addr in getaddresses([line or ""]) if "@" in addr]
+
+
+async def _local_addresses(client: ZammadClient) -> set[str]:
+    """Zammad's own sending addresses plus the token user's — never reply to those."""
+    local: set[str] = set()
+    try:
+        for row in await client.get("email_addresses") or []:
+            if isinstance(row, dict) and row.get("email"):
+                local.add(str(row["email"]).lower())
+    except ZammadError:
+        pass  # older instances / unusual roles: fall back to the token user's address only
+    me = await client.get("users/me")
+    if isinstance(me, dict) and me.get("email"):
+        local.add(str(me["email"]).lower())
+    return local
+
+
+async def _reply_all_recipients(
+    client: ZammadClient, article: dict[str, Any], local: set[str]
+) -> tuple[list[str], list[str]]:
+    """Zammad's own reply-all recipients for ``article`` (port of App.Utils.getRecipientArticle)."""
+    sender_is_local = any(a in local for a in _addresses(article.get("from")))
+    recipient_is_local = any(a in local for a in _addresses(article.get("to")))
+    if sender_is_local:
+        line = article.get("reply_to") or article.get("to")
+    else:
+        line = None
+        if article.get("sender") == "Agent" and not recipient_is_local and article.get("created_by_id"):
+            author = await client.get(f"users/{article['created_by_id']}")
+            email = str(author.get("email") or "").lower() if isinstance(author, dict) else ""
+            if email and email in str(article.get("from") or "").lower():
+                line = article.get("to")  # an agent's email sent via Zammad: reply goes to its recipients
+        if line is None:
+            line = article.get("reply_to") or article.get("from")
+
+    seen: set[str] = set()
+
+    def add(text: str | None) -> list[str]:
+        out = [a for a in dict.fromkeys(_addresses(text)) if a not in local and a not in seen]
+        seen.update(out)
+        return out
+
+    to = add(line) + add(article.get("from")) + add(article.get("to"))
+    return to, add(article.get("cc"))
+
+
+@mcp.tool()
+async def reply_email(
+    ticket_id: Annotated[int, Field(description="The ticket to reply on.")],
+    body: Annotated[str, Field(description="The email text (plain text unless html=true). Zammad does not add the group signature for API articles — include a greeting/signature if wanted.", min_length=1)],
+    recipients: Annotated[str, Field(description="'customer' = email only the ticket's customer (the creator); 'all' = reply to all on the last email (its sender, To and Cc, minus Zammad's own addresses).")] = "customer",
+    article_id: Annotated[int | None, Field(description="Reply to this article instead of the ticket's last email (threading, and the recipient source for 'all').")] = None,
+    cc: Annotated[list[str] | None, Field(description="Extra Cc addresses.")] = None,
+    subject: Annotated[str | None, Field(description="Subject override. Default: the replied-to email's subject, else the ticket title (Zammad adds 'RE:' and the ticket number).")] = None,
+    html: Annotated[bool, Field(description="Treat body as HTML (content_type text/html) instead of plain text.")] = False,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Send an email reply on a ticket (WRITE — requires ZAMMAD_ALLOW_WRITE). This sends a real email.
+
+    POSTs a ``type=email`` article (never internal) that Zammad sends through the group's email
+    channel, threaded to the replied-to email. recipients='customer' writes to the ticket's
+    customer; recipients='all' works like the "reply all" button on the last email. The preview
+    shows the resolved To/Cc/subject before anything is sent.
+    """
+    _require_write()
+    mode = (recipients or "").strip().lower()
+    if mode not in ("customer", "all"):
+        raise ValueError("recipients must be 'customer' or 'all'.")
+    client = _get_client()
+    ticket = await client.get(f"tickets/{ticket_id}")
+
+    if article_id is not None:
+        source = await client.get(f"ticket_articles/{article_id}", params={"expand": "true"})
+        if not isinstance(source, dict) or source.get("ticket_id") != ticket_id:
+            raise ValueError(f"Article {article_id} does not belong to ticket {ticket_id}.")
+    else:
+        articles = await client.get(f"ticket_articles/by_ticket/{ticket_id}", params={"expand": "true"})
+        emails = [
+            a for a in articles or []
+            if isinstance(a, dict) and a.get("type") in ("email", "web") and not a.get("internal")
+        ]
+        source = max(emails, key=lambda a: a.get("id") or 0) if emails else None
+
+    local = await _local_addresses(client)
+    if mode == "all":
+        if source is None:
+            raise ValueError(f"Ticket {ticket_id} has no email to reply to all on — use recipients='customer'.")
+        to, cc_list = await _reply_all_recipients(client, source, local)
+    else:
+        customer = await client.get(f"users/{ticket.get('customer_id')}")
+        email = str(customer.get("email") or "").strip() if isinstance(customer, dict) else ""
+        if "@" not in email:
+            raise ValueError(f"The customer of ticket {ticket_id} has no email address.")
+        to, cc_list = [email.lower()], []
+    cc_list += [a for a in dict.fromkeys(_addresses(", ".join(cc or ()))) if a not in to and a not in cc_list]
+    if not to:
+        raise ValueError("No recipients left after removing Zammad's own addresses — give article_id or use recipients='customer'.")
+
+    payload: dict[str, Any] = {
+        "ticket_id": ticket_id,
+        "type": "email",
+        "internal": False,  # internal=true on an email article would still send it
+        "sender": "Agent",
+        "to": ", ".join(to),
+        "subject": subject or (source or {}).get("subject") or ticket.get("title") or "",
+        "body": body,
+        "content_type": "text/html" if html else "text/plain",
+        "subtype": "reply",
+    }
+    if cc_list:
+        payload["cc"] = ", ".join(cc_list)
+    if source and source.get("message_id"):
+        payload["in_reply_to"] = source["message_id"]
+    summary = f"Send an email on ticket {ticket_id} to {payload['to']}"
+    summary += f" (cc {payload['cc']})" if cc_list else ""
+    summary += f", subject '{payload['subject']}'."
+    if preview := _confirm("reply_email", payload, summary, confirm):
+        return preview
+    data = await client.post("ticket_articles", json=payload)
+    return _pick(data, ("id", "ticket_id", "type", "internal", "to", "cc", "subject", "created_at"))
 
 
 def main() -> None:

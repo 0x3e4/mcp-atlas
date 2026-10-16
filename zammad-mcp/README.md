@@ -3,7 +3,7 @@
 A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
 Claude Code) to a **[Zammad](https://zammad.org)** helpdesk through its REST API. Ask about your
 tickets in natural language — browse/search tickets, read the conversation (articles), look up users
-and organizations — and, opt-in, **add notes/comments, update, create and tag tickets**.
+and organizations — and, opt-in, **add notes/comments, reply by email, update, create and tag tickets**.
 
 - One shared `httpx.AsyncClient`; **token** auth (`Authorization: Token token=<token>`).
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
@@ -41,6 +41,7 @@ clear message). The token also needs **agent** (`ticket.agent`) permission.
 | `update_ticket(ticket_id, state?, priority?, group?, owner_id?, title?, pending_time?)` | Update a ticket's fields (state/priority/group by name). Pending states take a `pending_time` (ISO 8601). |
 | `create_ticket(title, group, customer, body, internal?, state?, priority?, html?)` | Create a ticket with an initial note. `customer` is an email or user id (prefix an unknown email with `guess:`). |
 | `tag_ticket(ticket_id, add?, remove?)` | Add and/or remove tags; returns the ticket's tags afterwards. |
+| `reply_email(ticket_id, body, recipients='customer'\|'all', article_id?, cc?, subject?, html?)` | **Sends a real email** through the group's email channel, threaded to the last email (or `article_id`). `customer` writes only to the ticket's customer; `all` works like *Reply all* on that email (sender, To, Cc — minus Zammad's own addresses and yours). The preview shows the resolved To/Cc/subject. Zammad adds `RE:` and the ticket number; it does not add the group signature for API articles. |
 
 **Confirmation before every write** (`ZAMMAD_CONFIRM_WRITE`, default `true`): a write tool's first
 call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
@@ -203,6 +204,8 @@ With `ZAMMAD_ALLOW_WRITE=true` you can also:
 - "Add an internal note to ticket 4521: 'Called the user, awaiting logs.'"
 - "Set ticket 4521 to pending reminder for Monday 9:00 and assign it to agent 8."
 - "Tag ticket 4521 with vpn and escalated."
+- "Reply to the customer on ticket 4521 by email: the VPN is fixed, please retry."
+- "Reply all on ticket 4521's last email and say we'll patch tonight."
 - "Create a ticket in group Support for alice@example.com titled 'Laptop won't boot'."
 
 ## Notes & scope
@@ -211,6 +214,8 @@ With `ZAMMAD_ALLOW_WRITE=true` you can also:
   `ZAMMAD_ALLOW_WRITE=true` and the token has agent permission. Leave the flag unset for read-only.
 - **No email is sent** by `add_note` (it posts `type=note`). Zammad's quirk where an `internal=true`
   *email* article still sends does **not** apply here — these are notes, not emails. No delete tools.
+- **`reply_email` does send email** (`type=email`, always `internal=false`). The group needs an
+  outgoing email address, otherwise Zammad answers 422.
 - **`expand=true`** is always sent on reads so the agent sees names, not just ids. Use `list_reference`
   to map state/priority/group names ↔ ids.
 - **`zammad_get`** reaches everything else (roles, tags, overviews, mentions, …).

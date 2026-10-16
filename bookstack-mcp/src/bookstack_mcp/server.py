@@ -4,7 +4,7 @@ Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamabl
 always-on HTTP server. Read tools (GET) cover the content hierarchy (shelves → books → chapters →
 pages), search, export and attachments; the raw ``bookstack_get`` escape hatch reaches anything else
 (users, roles, comments, image-gallery, audit-log, …). Write tools (create/update pages, chapters,
-books and shelves, comment on a page) are **opt-in**: they refuse unless ``BOOKSTACK_ALLOW_WRITE=true``
+books and shelves, comment on a page, draw.io drawings) are **opt-in**: they refuse unless ``BOOKSTACK_ALLOW_WRITE=true``
 and need a token whose user has the matching permissions. With the flag off the server is read-only.
 Unless ``BOOKSTACK_CONFIRM_WRITE=false``, every write first returns a preview plus a confirm code and
 only runs when called again with that code, after the user has confirmed.
@@ -24,8 +24,9 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
-from .client import BookStackClient
+from .client import BookStackClient, BookStackError
 from .config import ConfigError, Settings
+from .drawio import embed_xml, extract_xml, normalize_xml
 
 mcp = FastMCP(
     "bookstack-mcp",
@@ -603,6 +604,147 @@ async def add_comment(
     out = _pick(data, _COMMENT_FIELDS) if isinstance(data, dict) else {"result": data}
     out["url"] = f"{_get_client().settings.base_url}/link/{page_id}"
     return out
+
+
+# ---- tools: draw.io drawings --------------------------------------------
+
+_DIAGRAM_DESC = (
+    "draw.io diagram XML: an <mxfile> or a bare <mxGraphModel><root><mxCell id=\"0\"/>"
+    "<mxCell id=\"1\" parent=\"0\"/>…</root></mxGraphModel>. Shapes are vertex cells "
+    "(style e.g. 'rounded=1;whiteSpace=wrap;html=1;') with an <mxGeometry x y width height as=\"geometry\"/>; "
+    "connectors are edge cells with source/target ids and <mxGeometry relative=\"1\" as=\"geometry\"/>."
+)
+_DRAWING_FIELDS = ("id", "name", "uploaded_to", "url", "created_at", "updated_at")
+
+
+def _require_renderer() -> None:
+    if not _get_client().settings.drawio_export_url:
+        raise ValueError(
+            "Drawing tools need a draw.io export server to render the PNG. Set BOOKSTACK_DRAWIO_EXPORT_URL "
+            "(e.g. http://drawio-export:8000/ for a jgraph/export-server sidecar)."
+        )
+
+
+def _diagram_change(xml: str, cells: int) -> dict[str, Any]:
+    """The diagram's part of a confirm binding: a digest instead of the whole XML (keeps previews short)."""
+    return {"diagram_sha256": hashlib.sha256(xml.encode()).hexdigest()[:16], "cells": cells}
+
+
+async def _render(xml: str) -> bytes:
+    return embed_xml(await _get_client().render_drawio(xml), xml)
+
+
+async def _get_drawing_meta(image_id: int) -> dict[str, Any]:
+    data = await _get_client().get(f"image-gallery/{image_id}")
+    if not isinstance(data, dict) or data.get("type") != "drawio":
+        raise ValueError(f"Image {image_id} is not a draw.io drawing (type {data.get('type') if isinstance(data, dict) else None!r}).")
+    return data
+
+
+@mcp.tool()
+async def get_drawing(
+    image_id: Annotated[int, Field(description="The drawing's image id — the number in <div drawio-diagram=\"…\"> in a page's HTML.")],
+) -> dict[str, Any]:
+    """Get a draw.io drawing with its diagram XML (GET /api/image-gallery/{id} + its PNG data).
+
+    The XML is what create_drawing/update_drawing take, so read it, change it and write it back with
+    update_drawing. List a page's drawings with bookstack_get('image-gallery',
+    {"filter[type]": "drawio", "filter[uploaded_to]": <page id>}).
+    """
+    meta = await _get_drawing_meta(image_id)
+    out = _pick(meta, _DRAWING_FIELDS)
+    out["xml"] = extract_xml(await _get_client().get_bytes(f"image-gallery/{image_id}/data"))
+    if out["xml"] is None:
+        out["note"] = "This PNG carries no diagram XML (not saved by draw.io); it can only be redrawn from scratch."
+    return out
+
+
+@mcp.tool()
+async def create_drawing(
+    page_id: Annotated[int, Field(description="The page the drawing belongs to (and is inserted into).")],
+    xml: Annotated[str, Field(description=_DIAGRAM_DESC, min_length=1)],
+    name: Annotated[str, Field(description="Drawing name shown in the image gallery.", min_length=1, max_length=180)] = "drawing.png",
+    position: Annotated[str, Field(description="Where to put it on the page: 'end', 'start', or 'none' (upload only; place the returned snippet yourself with update_page).")] = "end",
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Draw a draw.io diagram and add it to a page (WRITE — requires BOOKSTACK_ALLOW_WRITE).
+
+    Renders the XML to PNG on the draw.io export server, uploads it as a BookStack drawing
+    (POST /api/image-gallery, type=drawio) and inserts BookStack's drawing snippet at the start or end
+    of the page (a new page revision). The PNG carries the XML, so the drawing stays editable in
+    BookStack's own draw.io editor and via get_drawing/update_drawing.
+    """
+    _require_write()
+    _require_renderer()
+    if position not in ("end", "start", "none"):
+        raise ValueError("position must be one of: end, start, none.")
+    diagram, cells = normalize_xml(xml)
+    change = {"page_id": page_id, "name": name, "position": position, **_diagram_change(diagram, cells)}
+    where = "upload only, not placed on the page" if position == "none" else f"inserted at the {position} of page {page_id}"
+    if preview := _confirm("create_drawing", change, f"Create drawing '{name}' ({cells} cells), {where}.", confirm):
+        return preview
+
+    client = _get_client()
+    png = await _render(diagram)
+    image = await client.post_form(
+        "image-gallery",
+        data={"type": "drawio", "uploaded_to": str(page_id), "name": name},
+        files={"image": ("drawing.png", png, "image/png")},
+    )
+    snippet = (image.get("content") or {}).get("html") or (
+        f'<div drawio-diagram="{image.get("id")}"><img src="{escape(str(image.get("url")))}"></div>'
+    )
+    out: dict[str, Any] = {"drawing": _pick(image, _DRAWING_FIELDS), "snippet": snippet}
+    if position == "none":
+        return out
+    try:
+        page = await client.get(f"pages/{page_id}")
+        if page.get("markdown"):
+            body = {"markdown": _place(page["markdown"], snippet, position, "\n\n")}
+        else:
+            body = {"html": _place(page.get("raw_html") or page.get("html") or "", snippet, position, "\n")}
+        out["page"] = _written("page", await client.put(f"pages/{page_id}", json={**body, "changelog": f"Added drawing {name}"[:180]}))
+    except (BookStackError, ValueError) as exc:
+        out["page_error"] = f"Drawing uploaded, but adding it to page {page_id} failed: {exc}. Insert the snippet with update_page."
+    return out
+
+
+def _place(content: str, snippet: str, position: str, gap: str) -> str:
+    content = content.strip()
+    if not content:
+        return snippet
+    return f"{snippet}{gap}{content}" if position == "start" else f"{content}{gap}{snippet}"
+
+
+@mcp.tool()
+async def update_drawing(
+    image_id: Annotated[int, Field(description="The drawing's image id (see get_drawing).")],
+    xml: Annotated[str, Field(description="The new diagram — replaces the whole drawing. " + _DIAGRAM_DESC, min_length=1)],
+    name: Annotated[str | None, Field(description="New drawing name.", min_length=1, max_length=180)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Redraw an existing draw.io drawing in place (WRITE — requires BOOKSTACK_ALLOW_WRITE).
+
+    Renders the new XML and replaces the drawing's PNG (POST /api/image-gallery/{id} with
+    _method=PUT). The URL stays the same, so every page showing it shows the new version (browsers may
+    cache the old image briefly). The old image is not kept: read it with get_drawing first if needed.
+    """
+    _require_write()
+    _require_renderer()
+    meta = await _get_drawing_meta(image_id)
+    if not str(meta.get("path") or meta.get("url") or "").lower().endswith(".png"):
+        raise ValueError(f"Drawing {image_id} is not stored as PNG; BookStack only replaces a file with the same type.")
+    diagram, cells = normalize_xml(xml)
+    change = {"image_id": image_id, "name": name, **_diagram_change(diagram, cells)}
+    summary = f"Redraw drawing {image_id} '{meta.get('name')}' (page {meta.get('uploaded_to')}, {cells} cells)"
+    summary += f", rename to '{name}'." if name else "."
+    if preview := _confirm("update_drawing", change, summary, confirm):
+        return preview
+    data = _fields(_method="PUT", name=name)
+    image = await _get_client().post_form(
+        f"image-gallery/{image_id}", data=data, files={"image": ("drawing.png", await _render(diagram), "image/png")}
+    )
+    return _pick(image, _DRAWING_FIELDS)
 
 
 def main() -> None:

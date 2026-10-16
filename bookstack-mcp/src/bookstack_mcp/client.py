@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from .config import Settings
+from .drawio import PNG_SIGNATURE
 
 
 class BookStackError(RuntimeError):
@@ -77,6 +78,37 @@ class BookStackClient:
         """PUT ``json`` (write)."""
         return await self._request("PUT", self._url(path), json=json)
 
+    async def get_bytes(self, path: str) -> bytes:
+        """GET a binary resource (e.g. ``image-gallery/{id}/data``)."""
+        return await self._request("GET", self._url(path), as_bytes=True)
+
+    async def post_form(self, path: str, *, data: dict[str, Any], files: dict[str, Any]) -> Any:
+        """POST multipart form data with files (write). For an update, put ``_method=PUT`` in ``data``:
+        PHP only parses multipart bodies on POST."""
+        return await self._request("POST", self._url(path), data=data, files=files)
+
+    async def render_drawio(self, xml: str) -> bytes:
+        """Render diagram XML to PNG on the draw.io export server (BOOKSTACK_DRAWIO_EXPORT_URL).
+
+        Speaks the draw-image-export2 protocol (``jgraph/export-server``): a form POST with
+        ``format=png`` and ``xml``. No BookStack credentials are sent there.
+        """
+        url = self._settings.drawio_export_url
+        client = await self._http()
+        try:
+            resp = await client.post(url, data={"format": "png", "xml": xml, "border": "10"})
+        except httpx.HTTPError as exc:
+            raise BookStackError(f"Network error calling the draw.io export server {url}: {exc}") from exc
+        if resp.status_code >= 400:
+            raise BookStackError(
+                f"draw.io export server answered HTTP {resp.status_code}: {resp.text[:200]}".rstrip(),
+                status=resp.status_code,
+            )
+        if not resp.content.startswith(PNG_SIGNATURE):
+            ctype = resp.headers.get("content-type", "")
+            raise BookStackError(f"draw.io export server did not return a PNG (content-type {ctype!r}).")
+        return resp.content
+
     async def get_raw(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
         """Escape hatch: GET an arbitrary ``/api/...`` path (or absolute URL on the same host)."""
         if path.startswith(("http://", "https://")):
@@ -99,11 +131,16 @@ class BookStackClient:
         *,
         params: dict[str, Any] | None = None,
         json: Any | None = None,
+        data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
         as_text: bool = False,
+        as_bytes: bool = False,
     ) -> Any:
         client = await self._http()
         try:
-            resp = await client.request(method, url, params=params, json=json, headers=self._auth_headers())
+            resp = await client.request(
+                method, url, params=params, json=json, data=data, files=files, headers=self._auth_headers()
+            )
         except httpx.HTTPError as exc:
             raise BookStackError(f"Network error calling BookStack {url}: {exc}") from exc
 
@@ -116,6 +153,8 @@ class BookStackClient:
             )
         if as_text:
             return resp.text
+        if as_bytes:
+            return resp.content
         data = _try_json(resp)
         if data is None:
             ctype = resp.headers.get("content-type", "")

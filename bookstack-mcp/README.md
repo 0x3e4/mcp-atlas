@@ -26,6 +26,7 @@ and edit pages, chapters, books and shelves, and comment on pages**.
 | `export_content(kind, id, format?)` | Export a page/chapter/book as `markdown`/`html`/`plaintext`. |
 | `list_attachments(page_id?, limit?, offset?, full?)` | List attachments & links (metadata). |
 | `system_info()` | Instance version / name / base URL. |
+| `get_drawing(image_id)` | A draw.io drawing with its diagram XML (to change it with `update_drawing`). |
 | `bookstack_get(path, params?)` | Escape hatch: raw read-only GET against any `/api/...` path. |
 
 Results are trimmed to the useful fields by default; pass `full=true` for raw objects, and lists are
@@ -49,6 +50,8 @@ the item type; moving needs delete). Results are trimmed to ids, names, tags and
 | `create_shelf(name, description?, book_ids?, tags?)` | Create a shelf, optionally with books on it. |
 | `update_shelf(id, name?, description?, add_book_ids?, remove_book_ids?, tags?)` | Rename/describe/tag a shelf, or add/remove books without retyping the rest. |
 | `add_comment(page_id, body, html?, reply_to?)` | Comment on a page (plain text by default). Needs a BookStack release with the comments API. |
+| `create_drawing(page_id, xml, name?, position='end'\|'start'\|'none')` | Draw a **draw.io diagram** from its XML: rendered to PNG, uploaded as a BookStack drawing and inserted at the end/start of the page (`none` = upload only and return the snippet). Stays editable in BookStack's draw.io editor. Needs `BOOKSTACK_DRAWIO_EXPORT_URL`. |
+| `update_drawing(image_id, xml, name?)` | Redraw an existing drawing in place; every page showing it gets the new version. |
 
 `tags` is `{name: value}` (`''` for a tag without a value). On the `update_*` tools it **replaces all
 tags** of the item; omit it to leave them alone.
@@ -58,6 +61,20 @@ call changes nothing and returns a preview with a `confirm_code`. The agent show
 and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
 code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
 expire when the server restarts). Set `BOOKSTACK_CONFIRM_WRITE=false` to let writes run directly.
+
+### draw.io drawings
+
+The agent writes the diagram as draw.io XML (`<mxGraphModel>` or `<mxfile>`). The server renders it
+to PNG, embeds the XML in the PNG the way draw.io does and uploads it through the image-gallery API
+as `type=drawio`. On the page it is the same `<div drawio-diagram="…">` block BookStack's own editor
+writes, so you can open and change the drawing in BookStack as usual, and the agent can read it back
+with `get_drawing`.
+
+Rendering needs a **draw.io export server** that speaks the `draw-image-export2` protocol, e.g. the
+`jgraph/export-server` image as a sidecar (see `compose.yml.example`). Set
+`BOOKSTACK_DRAWIO_EXPORT_URL` to it, e.g. `http://drawio-export:8000/`. Without it the drawing tools
+refuse. Don't point it at a public export service: the diagram content is sent there. To edit
+drawings in the BookStack UI, BookStack's `DRAWIO` setting must be enabled; showing them works either way.
 
 ## 1. Create an API token
 
@@ -220,13 +237,15 @@ With `BOOKSTACK_ALLOW_WRITE=true` you can also:
 - "Fix the typo in the second step of page 134."
 - "Create a book 'Network' with chapters 'Firewalls' and 'DNS', and put it on the Infrastructure shelf."
 - "Tag page 134 with reviewed=2026-10 and comment that the steps were tested."
+- "Draw the network diagram for page 134 (firewall → DMZ → web servers) and add it at the end."
+- "In the drawing on page 134, add a second web server behind the load balancer."
 
 ## Notes & scope
 
 - **Writes are opt-in.** Reads are always available; the write tools refuse unless
   `BOOKSTACK_ALLOW_WRITE=true` and the token's user has the permissions. Leave the flag unset for
-  read-only. Page edits are recoverable from the page's revisions. There are no delete tools, and
-  attachments/images (multipart uploads) are not covered.
+  read-only. Page edits are recoverable from the page's revisions. There are no delete tools. Uploads are limited
+  to draw.io drawings; attachments and gallery images are not covered.
 - **Permissions** follow the token's user: content it can't see won't appear, and `users` / `roles` /
   `audit-log` / `recycle-bin` (via `bookstack_get`) need elevated permissions.
 - **Large payloads** — page bodies, exports and book `contents` can be big; tools trim by default and

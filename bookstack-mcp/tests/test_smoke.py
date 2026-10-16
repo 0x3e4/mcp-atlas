@@ -13,6 +13,7 @@ import pytest
 
 from bookstack_mcp import server
 from bookstack_mcp.client import BookStackError
+from bookstack_mcp import drawio
 from bookstack_mcp.config import ConfigError, Settings
 
 EXPECTED_TOOLS = {
@@ -37,12 +38,15 @@ EXPECTED_TOOLS = {
     "create_shelf",
     "update_shelf",
     "add_comment",
+    "get_drawing",
+    "create_drawing",
+    "update_drawing",
 }
 
 
 WRITE_TOOLS = {
     "create_page", "update_page", "create_chapter", "update_chapter", "create_book", "update_book",
-    "create_shelf", "update_shelf", "add_comment",
+    "create_shelf", "update_shelf", "add_comment", "create_drawing", "update_drawing",
 }
 
 
@@ -242,3 +246,163 @@ def test_writes_need_a_matching_confirm_code():
     finally:
         server._client = None
     assert sent == [("POST", "/api/books")]
+
+
+# ---- draw.io drawings ---------------------------------------------------
+
+_DIAGRAM = (
+    '<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>'
+    '<mxCell id="a" value="Firewall &amp; VPN" style="rounded=1;" vertex="1" parent="1">'
+    '<mxGeometry x="20" y="20" width="120" height="60" as="geometry"/></mxCell>'
+    '</root></mxGraphModel>'
+)
+
+
+def _tiny_png() -> bytes:
+    import struct
+    import zlib
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+    return (drawio.PNG_SIGNATURE + drawio._chunk(b"IHDR", ihdr)
+            + drawio._chunk(b"IDAT", zlib.compress(b"\0\0\0\0\0")) + drawio._chunk(b"IEND", b""))
+
+
+def test_drawio_xml_round_trips_through_the_png():
+    xml, cells = drawio.normalize_xml('<?xml version="1.0"?>' + _DIAGRAM)
+    assert xml.startswith("<mxfile") and "<diagram" in xml and cells == 3
+    png = drawio.embed_xml(_tiny_png(), xml)
+    kinds = [k for k, *_ in drawio._chunks(png)]
+    assert kinds == [b"IHDR", b"tEXt", b"IDAT", b"IEND"]  # draw.io stops reading at IDAT
+    assert drawio.extract_xml(png) == xml
+    # re-embedding replaces the old diagram instead of stacking a second one
+    again = drawio.embed_xml(png, xml.replace("Firewall", "Router"))
+    assert [k for k, *_ in drawio._chunks(again)].count(b"tEXt") == 1
+    assert "Router &amp; VPN" in drawio.extract_xml(again)
+    assert drawio.extract_xml(_tiny_png()) is None
+
+
+def test_drawio_reads_compressed_chunks_and_rejects_junk():
+    import zlib
+    ztxt = drawio._chunk(b"zTXt", b"mxfile\0\0" + zlib.compress(b"<mxfile><diagram>x+y</diagram></mxfile>"))
+    png = _tiny_png()
+    png = png[:33] + ztxt + png[33:]
+    assert drawio.extract_xml(png) == "<mxfile><diagram>x y</diagram></mxfile>"
+    for bad in ("not xml", "<svg/>", "<mxfile/>"):
+        with pytest.raises(ValueError):
+            drawio.normalize_xml(bad)
+
+
+def _drawing_client(handler, *, export_url: str = "http://drawio-export:8000/") -> server.BookStackClient:
+    env = _base_env()
+    env.update({"BOOKSTACK_ALLOW_WRITE": "true", "BOOKSTACK_CONFIRM_WRITE": "false",
+                "BOOKSTACK_DRAWIO_EXPORT_URL": export_url})
+    client = server.BookStackClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client
+
+
+_IMAGE = {
+    "id": 77, "name": "net.png", "type": "drawio", "uploaded_to": 12,
+    "path": "/uploads/images/drawio/2026-10/net.png",
+    "url": "https://docs.example.com/uploads/images/drawio/2026-10/net.png",
+    "content": {"html": '<div drawio-diagram="77"><img src="https://docs.example.com/uploads/images/drawio/2026-10/net.png"></div>'},
+}
+
+
+def _drawing_handler(seen: list, page: dict):
+    def handler(request: httpx.Request) -> httpx.Response:
+        url, body = request.url, request.content.decode("latin-1")
+        seen.append((request.method, url.host, url.path, body, request.headers.get("authorization")))
+        if url.host == "drawio-export":
+            return httpx.Response(200, content=_tiny_png(), headers={"content-type": "image/png"})
+        if url.path in ("/api/image-gallery", "/api/image-gallery/77"):
+            return httpx.Response(200, json=_IMAGE)
+        if url.path == "/api/pages/12" and request.method == "GET":
+            return httpx.Response(200, json=page)
+        if url.path == "/api/pages/12":
+            return httpx.Response(200, json={"id": 12, "name": "Net", **json.loads(request.content)})
+        return httpx.Response(404, json={"error": {"message": "nope"}})
+    return handler
+
+
+def test_create_drawing_renders_uploads_and_appends_to_the_page():
+    seen: list = []
+    page = {"id": 12, "markdown": "", "html": "<p>rendered</p>", "raw_html": '<p id="bkmrk-x">Intro</p>'}
+    server._client = _drawing_client(_drawing_handler(seen, page))
+    try:
+        out = asyncio.run(server.create_drawing(12, _DIAGRAM, name="net.png"))
+    finally:
+        server._client = None
+    export, upload, get_page, put_page = seen
+    assert export[:3] == ("POST", "drawio-export", "/") and export[4] is None  # no BookStack token leaks
+    assert "format=png" in export[3] and "mxGraphModel" in export[3]
+    assert upload[:3] == ("POST", "docs.example.com", "/api/image-gallery")
+    assert 'name="type"\r\n\r\ndrawio' in upload[3] and 'name="uploaded_to"\r\n\r\n12' in upload[3]
+    assert "tEXtmxfile" in upload[3]  # the uploaded PNG carries the diagram
+    assert get_page[:3] == ("GET", "docs.example.com", "/api/pages/12")
+    sent = json.loads(put_page[3])
+    assert sent["html"] == '<p id="bkmrk-x">Intro</p>\n' + out["snippet"]  # raw_html, not the rendered html
+    assert sent["changelog"] == "Added drawing net.png"
+    assert out["drawing"]["id"] == 77 and out["page"]["url"] == "https://docs.example.com/link/12"
+
+
+def test_create_drawing_on_a_markdown_page_and_without_insert():
+    seen: list = []
+    server._client = _drawing_client(_drawing_handler(seen, {"id": 12, "markdown": "# Net\n", "raw_html": "<h1>Net</h1>"}))
+    try:
+        out = asyncio.run(server.create_drawing(12, _DIAGRAM, position="start"))
+        assert json.loads(seen[-1][3])["markdown"] == out["snippet"] + "\n\n# Net"
+        seen.clear()
+        out = asyncio.run(server.create_drawing(12, _DIAGRAM, position="none"))
+        assert [s[2] for s in seen] == ["/", "/api/image-gallery"] and "page" not in out
+    finally:
+        server._client = None
+
+
+def test_update_and_get_drawing():
+    seen: list = []
+    stored = drawio.embed_xml(_tiny_png(), drawio.normalize_xml(_DIAGRAM)[0])
+    inner = _drawing_handler(seen, {})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/image-gallery/77/data":
+            return httpx.Response(200, content=stored, headers={"content-type": "image/png"})
+        return inner(request)
+
+    server._client = _drawing_client(handler)
+    try:
+        got = asyncio.run(server.get_drawing(77))
+        assert got["xml"] == drawio.normalize_xml(_DIAGRAM)[0] and got["uploaded_to"] == 12
+        seen.clear()
+        asyncio.run(server.update_drawing(77, got["xml"], name="net-v2.png"))
+    finally:
+        server._client = None
+    meta, export, upload = seen
+    assert meta[:3] == ("GET", "docs.example.com", "/api/image-gallery/77")
+    assert export[1] == "drawio-export"
+    assert upload[:3] == ("POST", "docs.example.com", "/api/image-gallery/77")
+    assert 'name="_method"\r\n\r\nPUT' in upload[3] and 'name="name"\r\n\r\nnet-v2.png' in upload[3]
+
+
+def test_drawing_tools_need_an_export_server():
+    server._client = _drawing_client(lambda r: httpx.Response(500), export_url="")
+    try:
+        with pytest.raises(ValueError, match="BOOKSTACK_DRAWIO_EXPORT_URL"):
+            asyncio.run(server.create_drawing(12, _DIAGRAM))
+    finally:
+        server._client = None
+
+
+def test_create_drawing_confirm_code_is_stable_for_the_same_diagram():
+    seen: list = []
+    env = _base_env()
+    env.update({"BOOKSTACK_ALLOW_WRITE": "true", "BOOKSTACK_DRAWIO_EXPORT_URL": "http://drawio-export:8000/"})
+    client = server.BookStackClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(_drawing_handler(seen, {"id": 12, "raw_html": ""})))
+    server._client = client
+    try:
+        first = asyncio.run(server.create_drawing(12, _DIAGRAM))
+        assert first["status"] == "confirmation_required" and seen == []  # nothing rendered or sent yet
+        done = asyncio.run(server.create_drawing(12, _DIAGRAM, confirm=first["confirm_code"]))
+    finally:
+        server._client = None
+    assert done["drawing"]["id"] == 77
