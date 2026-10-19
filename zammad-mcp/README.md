@@ -26,7 +26,7 @@ and organizations — and, opt-in, **add notes/comments, reply by email, update,
 | `whoami()` | The user behind the token (connectivity/permission check). |
 | `list_organizations(limit?, page?, full?)` | List organizations. |
 | `list_reference(kind)` | Reference data: `groups`, `states` or `priorities`. |
-| `zammad_get(path, params?)` | Escape hatch: raw read-only GET against any `/api/v1/...` path. |
+| `zammad_get(path, params?)` | Escape hatch: raw read-only GET against any `/api/v1/...` path. Non-JSON answers (e.g. an image link `ticket_attachment/…?view=inline` copied from an article body) are read like `get_attachment` instead of failing. |
 
 Results are trimmed to useful fields by default (with names from `expand=true`); pass `full=true` for
 raw objects, and lists are capped (`ZAMMAD_MAX_ROWS`, default 50; hard cap 200).

@@ -10,7 +10,7 @@ layer by ``ZAMMAD_ALLOW_WRITE``.
 from __future__ import annotations
 
 from email.message import Message
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 
@@ -71,7 +71,11 @@ class ZammadClient:
         return await self._request("DELETE", self._url(path), json=json)
 
     async def get_raw(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
-        """Escape hatch: GET an arbitrary ``/api/v1/...`` path (or absolute URL on the same host)."""
+        """Escape hatch: GET an arbitrary ``/api/v1/...`` path (or absolute URL on the same host).
+
+        Returns the parsed JSON, or a ``File`` when Zammad answers with something else (attachment
+        downloads such as ``ticket_attachment/...`` are images, PDFs, mails …).
+        """
         if path.startswith(("http://", "https://")):
             if not path.startswith(self._settings.base_origin):
                 raise ValueError(
@@ -83,14 +87,17 @@ class ZammadClient:
             if p.startswith("api/v1/"):
                 p = p[len("api/v1/") :]
             url = self._url(p)
-        return await self._request("GET", url, params=params)
+        resp = await self._send("GET", url, params=params)
+        if resp.status_code == 204 or not resp.content:
+            return {}
+        try:
+            return resp.json()
+        except ValueError:
+            return _file(resp)
 
-    async def get_file(self, path: str) -> tuple[bytes, str, str]:
-        """GET a binary resource (e.g. ``ticket_attachment/...``) → ``(bytes, content type, filename)``."""
-        resp = await self._send("GET", self._url(path))
-        disposition = Message()
-        disposition["content-disposition"] = resp.headers.get("content-disposition", "")
-        return resp.content, resp.headers.get("content-type", "application/octet-stream"), disposition.get_filename() or ""
+    async def get_file(self, path: str) -> File:
+        """GET a binary resource (e.g. ``ticket_attachment/...``) → ``File(data, content_type, filename)``."""
+        return _file(await self._send("GET", self._url(path)))
 
     async def _send(
         self, method: str, url: str, *, params: dict[str, Any] | None = None, json: Any | None = None
@@ -120,6 +127,20 @@ class ZammadClient:
             raise ZammadError(
                 f"Expected JSON from Zammad but got content-type {ctype!r} (HTTP {resp.status_code})."
             )
+
+
+class File(NamedTuple):
+    """A non-JSON response body (attachment download)."""
+
+    data: bytes
+    content_type: str
+    filename: str
+
+
+def _file(resp: httpx.Response) -> File:
+    disposition = Message()
+    disposition["content-disposition"] = resp.headers.get("content-disposition", "")
+    return File(resp.content, resp.headers.get("content-type", "application/octet-stream"), disposition.get_filename() or "")
 
 
 def _format_error(status: int, resp: httpx.Response) -> str:

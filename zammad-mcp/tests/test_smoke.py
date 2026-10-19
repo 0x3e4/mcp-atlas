@@ -462,3 +462,21 @@ def test_msg_properties_body_and_attachments():
     assert s["attachments"][1]["size"] is None and "embedded" in s["attachments"][1]["note"]
     with pytest.raises(ValueError, match="no OLE header"):
         attachments.parse_msg(b"not an ole file")
+
+
+def test_zammad_get_reads_attachment_links_instead_of_failing_on_non_json():
+    _attachment_client()
+    try:
+        # the agent copies the image link straight out of an article body
+        result = asyncio.run(server.mcp.call_tool(
+            "zammad_get", {"path": "/api/v1/ticket_attachment/42/9/5?view=inline"}))
+        blocks = result[0] if isinstance(result, tuple) else result
+        assert [b.type for b in blocks] == ["text", "image"] and blocks[1].mimeType == "image/png"
+        assert json.loads(blocks[0].text)["path"] == "/api/v1/ticket_attachment/42/9/5?view=inline"
+
+        pdf = asyncio.run(server.zammad_get("ticket_attachment/42/9/7"))
+        assert pdf[0]["kind"] == "pdf" and "Fehler 809" in pdf[0]["content"][0]["text"]
+        articles = asyncio.run(server.zammad_get("ticket_articles/by_ticket/42"))
+        assert isinstance(articles, list) and articles[0]["id"] == 9  # JSON stays JSON
+    finally:
+        server._client = None

@@ -24,7 +24,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from . import attachments
-from .client import ZammadClient, ZammadError
+from .client import File, ZammadClient, ZammadError
 from .config import ConfigError, Settings
 
 mcp = FastMCP(
@@ -307,9 +307,18 @@ async def list_reference(
 async def zammad_get(
     path: Annotated[str, Field(description="API path relative to /api/v1, e.g. 'tickets/12', 'roles', 'tags'.")],
     params: Annotated[dict[str, Any] | None, Field(description="Query params, e.g. {\"expand\": \"true\", \"per_page\": 10}.")] = None,
-) -> Any:
-    """Escape hatch: raw read-only GET against any Zammad ``/api/v1/...`` resource."""
+):
+    """Escape hatch: raw read-only GET against any Zammad ``/api/v1/...`` resource.
+
+    JSON comes back as is. Non-JSON answers (e.g. an image link from an article body such as
+    ``/api/v1/ticket_attachment/{ticket}/{article}/{id}?view=inline``) are read like get_attachment:
+    images as images, PDFs/mails/text as text. Prefer get_attachment for attachments.
+    """
     data = await _get_client().get_raw(path, params=params)
+    if isinstance(data, File):
+        content = attachments.read(data.data, data.content_type, data.filename)
+        content[0] = {"path": path, **content[0]}
+        return content
     return data if isinstance(data, (dict, list)) else {"data": data}
 
 
