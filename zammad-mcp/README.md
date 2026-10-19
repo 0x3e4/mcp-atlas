@@ -20,7 +20,7 @@ and organizations — and, opt-in, **add notes/comments, reply by email, update,
 | `search_tickets(query, limit?, page?, full?)` | Search tickets (title/number/body + field filters). |
 | `get_ticket_articles(ticket_id, limit?, full?)` | A ticket's articles (the conversation/notes), each with its attachment list. |
 | `get_article(article_id, full?)` | One article by id, with its attachment list. |
-| `get_attachment(ticket_id, article_id, attachment_id)` | View an attachment: **images** (PNG/JPEG/GIF/WebP, incl. screenshots pasted into a mail) come back as an image the agent can look at; text files (logs, CSV, JSON, .eml …) as text. Other files only return their metadata. |
+| `get_attachment(ticket_id, article_id, attachment_id, part?, pages?)` | Read an attachment. **Images** (PNG/JPEG/GIF/WebP, incl. screenshots pasted into a mail) come back as an image the agent can look at. **PDF**: text per page; scanned pages without a text layer are rendered as images (up to 5 per call, 30 pages per call, `pages='31-60'` for more). **E-mails** (`.eml`, Outlook `.msg`): headers, body and a numbered list of the mail's own attachments; `part=N` opens one through the same pipeline. **Text files** (logs, CSV, JSON, XML …) as text. Office files and archives only return their metadata. |
 | `list_users(limit?, page?, full?)` | List users. |
 | `search_users(query, limit?, full?)` | Search users by name/login/email. |
 | `whoami()` | The user behind the token (connectivity/permission check). |
@@ -200,6 +200,7 @@ In Claude Code, run `/mcp` to confirm the `zammad` server connected, then ask th
 - "Show the conversation on ticket 4521."
 - "Who is the customer on ticket 4521?"
 - "Look at the screenshot on ticket 4521 and tell me what error it shows."
+- "Read the PDF attached to ticket 4521 and the forwarded .msg, and summarise both."
 
 With `ZAMMAD_ALLOW_WRITE=true` you can also:
 

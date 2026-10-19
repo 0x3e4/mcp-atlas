@@ -9,6 +9,7 @@ layer by ``ZAMMAD_ALLOW_WRITE``.
 
 from __future__ import annotations
 
+from email.message import Message
 from typing import Any
 
 import httpx
@@ -84,10 +85,12 @@ class ZammadClient:
             url = self._url(p)
         return await self._request("GET", url, params=params)
 
-    async def get_file(self, path: str) -> tuple[bytes, str]:
-        """GET a binary resource (e.g. ``ticket_attachment/...``) → ``(bytes, content-type header)``."""
+    async def get_file(self, path: str) -> tuple[bytes, str, str]:
+        """GET a binary resource (e.g. ``ticket_attachment/...``) → ``(bytes, content type, filename)``."""
         resp = await self._send("GET", self._url(path))
-        return resp.content, resp.headers.get("content-type", "application/octet-stream")
+        disposition = Message()
+        disposition["content-disposition"] = resp.headers.get("content-disposition", "")
+        return resp.content, resp.headers.get("content-type", "application/octet-stream"), disposition.get_filename() or ""
 
     async def _send(
         self, method: str, url: str, *, params: dict[str, Any] | None = None, json: Any | None = None

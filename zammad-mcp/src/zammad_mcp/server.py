@@ -19,10 +19,11 @@ import sys
 from email.utils import getaddresses
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
+from . import attachments
 from .client import ZammadClient, ZammadError
 from .config import ConfigError, Settings
 
@@ -225,55 +226,27 @@ def _int(value: Any) -> int | None:
         return None
 
 
-# Images go back as MCP image content so the agent can look at them; the API rejects much larger ones.
-_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
-_MAX_IMAGE_BYTES = 3_750_000  # ≈ 5 MB once base64-encoded
-_TEXT_TYPES = ("text/", "application/json", "application/xml", "application/x-yaml", "image/svg+xml", "message/rfc822")
-_MAX_TEXT_CHARS = 100_000
-
-
 @mcp.tool()
 async def get_attachment(
     ticket_id: Annotated[int, Field(description="The ticket id.")],
     article_id: Annotated[int, Field(description="The article the attachment belongs to.")],
     attachment_id: Annotated[int, Field(description="The attachment id (from get_ticket_articles / get_article → attachments).")],
+    part: Annotated[int | None, Field(description="For an e-mail attachment (.eml/.msg): open its N-th own attachment (1-based, see 'attachments' in the first call).", ge=1)] = None,
+    pages: Annotated[str | None, Field(description="For a PDF: page range to read, e.g. '3' or '31-60'. Default: the first 30 pages.")] = None,
 ):
-    """View a ticket attachment (GET /ticket_attachment/{ticket}/{article}/{id}).
+    """Read a ticket attachment (GET /ticket_attachment/{ticket}/{article}/{id}).
 
-    Images (PNG, JPEG, GIF, WebP — incl. screenshots pasted into an email or note) come back as an
-    image you can look at; text files (logs, CSV, JSON, XML, .eml …) as text. Other files (PDF,
-    Office, archives) return only their metadata.
+    - Images (PNG, JPEG, GIF, WebP, incl. screenshots pasted into a mail) → an image you can look at.
+    - PDF → text per page; scanned pages without text are rendered as images (up to 5 per call).
+    - E-mails (.eml, Outlook .msg) → headers, body and the mail's own attachments; open one with part=N
+      (it goes through the same pipeline, so a PDF or screenshot inside a forwarded mail works too).
+    - Text files (logs, CSV, JSON, XML …) → text.
+    - Anything else (Office, archives) → metadata only.
     """
-    data, content_type = await _get_client().get_file(f"ticket_attachment/{ticket_id}/{article_id}/{attachment_id}")
-    ctype = content_type.split(";", 1)[0].strip().lower()
-    meta: dict[str, Any] = {
-        "ticket_id": ticket_id, "article_id": article_id, "attachment_id": attachment_id,
-        "content_type": ctype, "size": len(data),
-    }
-    if ctype in _IMAGE_TYPES:
-        if len(data) > _MAX_IMAGE_BYTES:
-            meta["note"] = f"Image too large to pass on ({len(data)} bytes, limit {_MAX_IMAGE_BYTES})."
-            return meta
-        return [meta, Image(data=data, format=ctype.split("/", 1)[1])]
-    if ctype.startswith(_TEXT_TYPES):
-        text = data.decode(_charset(content_type), errors="replace")
-        meta["truncated"] = len(text) > _MAX_TEXT_CHARS
-        meta["text"] = text[:_MAX_TEXT_CHARS]
-        return meta
-    meta["note"] = "Binary file type that can't be shown here (only images and text files are)."
-    return meta
-
-
-def _charset(content_type: str) -> str:
-    for part in content_type.split(";")[1:]:
-        key, _, value = part.strip().partition("=")
-        if key.lower() == "charset" and value:
-            try:
-                "".encode(value.strip('"'))
-                return value.strip('"')
-            except LookupError:
-                break
-    return "utf-8"
+    data, content_type, filename = await _get_client().get_file(f"ticket_attachment/{ticket_id}/{article_id}/{attachment_id}")
+    content = attachments.read(data, content_type, filename, part=part, pages=pages)
+    content[0] = {"ticket_id": ticket_id, "article_id": article_id, "attachment_id": attachment_id, **content[0]}
+    return content
 
 
 # ---- tools: users & orgs ------------------------------------------------

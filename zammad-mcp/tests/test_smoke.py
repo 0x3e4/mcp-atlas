@@ -8,11 +8,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from email.message import EmailMessage
 
 import httpx
 import pytest
 
-from zammad_mcp import server
+from zammad_mcp import attachments, server
 from zammad_mcp.config import ConfigError, Settings
 
 EXPECTED_TOOLS = {
@@ -316,7 +317,8 @@ def _attachment_client() -> None:
         if path == "/api/v1/ticket_attachment/42/9/6":
             return httpx.Response(200, content="fehler: ä".encode("latin-1"), headers={"content-type": "text/plain; charset=ISO-8859-1"})
         if path == "/api/v1/ticket_attachment/42/9/7":
-            return httpx.Response(200, content=b"%PDF-1.7", headers={"content-type": "application/pdf"})
+            return httpx.Response(200, content=_pdf("Hallo VPN Fehler 809 beim Verbinden"), headers={
+                "content-type": "application/octet-stream", "content-disposition": 'attachment; filename="report.pdf"'})
         return httpx.Response(403, json={"error": "The file does not belong to the specified article."})
 
     client = server.ZammadClient(Settings.from_env(_base_env()))
@@ -346,11 +348,117 @@ def test_get_attachment_returns_images_as_image_content():
         assert blocks[1].mimeType == "image/png"
         assert base64.b64decode(blocks[1].data) == _PNG
 
-        text = asyncio.run(server.get_attachment(42, 9, 6))
+        text = asyncio.run(server.get_attachment(42, 9, 6))[0]
         assert text["text"] == "fehler: ä" and text["truncated"] is False
         pdf = asyncio.run(server.get_attachment(42, 9, 7))
-        assert pdf["content_type"] == "application/pdf" and "can't be shown" in pdf["note"]
+        assert pdf[0]["filename"] == "report.pdf" and pdf[0]["kind"] == "pdf" and pdf[0]["pages"] == 1
+        assert "Fehler 809" in pdf[0]["content"][0]["text"] and len(pdf) == 1
         with pytest.raises(server.ZammadError, match="403"):
             asyncio.run(server.get_attachment(42, 9, 8))
     finally:
         server._client = None
+
+
+def _pdf(text: str | None) -> bytes:
+    """A minimal one-page PDF; text=None gives a page without a text layer (like a scan)."""
+    stream = f"BT /F1 18 Tf 40 700 Td ({text}) Tj ET".encode() if text else b"0 0 1 rg 40 600 200 100 re f"
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    return bytes(out)
+
+
+def test_scanned_pdf_pages_come_back_as_images():
+    blocks = attachments.read(_pdf(None), "application/pdf", "scan.pdf")
+    meta, image = blocks
+    assert meta["content"] == [{"page": 1, "image": 1}]
+    png = image.data
+    assert png.startswith(b"\x89PNG") and image._mime_type == "image/png"
+    import struct
+    assert struct.unpack(">IIBB", png[16:26]) == (893, 1263, 8, 2)  # A4 at 1.5x, 8-bit RGB
+    import zlib
+    raw = zlib.decompress(png[png.index(b"IDAT") + 4 : png.index(b"IEND") - 8])
+    assert len(raw) == 1263 * (1 + 893 * 3)
+    row = raw[288 * (1 + 893 * 3) + 1 :][: 893 * 3]  # through the blue box (PDF y 600-700 = image rows 213-363)
+    assert row[180 * 3 : 180 * 3 + 3] == b"\x00\x00\xff" and row[:3] == b"\xff\xff\xff"
+
+
+def test_eml_lists_its_attachments_and_opens_them():
+    msg = EmailMessage()
+    msg["From"], msg["To"], msg["Subject"] = "Jane <jane@customer.test>", "support@helpdesk.test", "Fehlerbericht"
+    msg.set_content("Hallo,\nim Anhang der Bericht.")
+    msg.add_alternative("<p>Hallo,<br>im Anhang <b>der</b> Bericht.</p>", subtype="html")
+    msg.add_attachment(_pdf("Fehler 809 beim VPN Verbindungsaufbau"), maintype="application", subtype="pdf", filename="bericht.pdf")
+    msg.add_attachment(b"\x89PNG\r\n\x1a\n" + b"\0" * 8, maintype="image", subtype="png", filename="shot.png")
+    raw = msg.as_bytes()
+
+    summary = attachments.read(raw, "message/rfc822", "mail.eml")
+    assert len(summary) == 1
+    s = summary[0]
+    assert s["subject"] == "Fehlerbericht" and s["from"] == "Jane <jane@customer.test>"
+    assert s["body"] == "Hallo,\nim Anhang der Bericht."
+    assert [(a["part"], a["filename"], a["content_type"]) for a in s["attachments"]] == [
+        (1, "bericht.pdf", "application/pdf"), (2, "shot.png", "image/png")]
+
+    pdf = attachments.read(raw, "message/rfc822", "mail.eml", part=1)
+    assert pdf[0]["from_mail_part"] == 1 and "Fehler 809" in pdf[0]["content"][0]["text"]
+    shot = attachments.read(raw, "application/octet-stream", "Weiterleitung.eml", part=2)
+    assert shot[0]["kind"] == "image" and len(shot) == 2
+    with pytest.raises(ValueError, match="part must be 1..2"):
+        attachments.read(raw, "message/rfc822", "mail.eml", part=3)
+    with pytest.raises(ValueError, match="only applies to e-mail"):
+        attachments.read(b"x", "text/plain", "a.txt", part=1)
+
+
+class _FakeOle:
+    """Stand-in for olefile.OleFileIO with the stream layout of an Outlook .msg."""
+
+    def __init__(self, streams: dict[str, bytes]) -> None:
+        self.streams = streams
+
+    def exists(self, path: str) -> bool:
+        return path in self.streams
+
+    def openstream(self, path: str):
+        import io
+        return io.BytesIO(self.streams[path])
+
+    def listdir(self, streams: bool = True, storages: bool = False):
+        return [path.split("/") for path in self.streams]
+
+
+def test_msg_properties_body_and_attachments():
+    u = lambda s: s.encode("utf-16-le")  # noqa: E731
+    ole = _FakeOle({
+        "__substg1.0_0037001F": u("Druckerproblem"),
+        "__substg1.0_0C1A001F": u("Jane Doe"),
+        "__substg1.0_5D01001F": u("jane@customer.test"),
+        "__substg1.0_0E04001F": u("Support"),
+        "__substg1.0_007D001F": u("Date: Mon, 19 Oct 2026 08:15:00 +0200\r\nSubject: Druckerproblem\r\n"),
+        "__substg1.0_10130102": b"<html><body><p>Drucker <b>druckt</b> nicht.</p><style>p{}</style></body></html>",
+        "__attach_version1.0_#00000000/__substg1.0_3707001F": u("fehler.png"),
+        "__attach_version1.0_#00000000/__substg1.0_370E001F": u("image/png"),
+        "__attach_version1.0_#00000000/__substg1.0_37010102": b"\x89PNG\r\n\x1a\n",
+        "__attach_version1.0_#00000001/__substg1.0_3707001F": u("weitergeleitet.msg"),
+    })
+    mail = attachments.parse_msg(b"", ole=ole)
+    s = mail.summary()
+    assert s["from"] == "Jane Doe <jane@customer.test>" and s["subject"] == "Druckerproblem"
+    assert s["date"] == "Mon, 19 Oct 2026 08:15:00 +0200" and s["cc"] is None
+    assert s["body"] == "Drucker druckt nicht."
+    assert s["attachments"][0] == {"part": 1, "filename": "fehler.png", "content_type": "image/png", "size": 8}
+    assert s["attachments"][1]["size"] is None and "embedded" in s["attachments"][1]["note"]
+    with pytest.raises(ValueError, match="no OLE header"):
+        attachments.parse_msg(b"not an ole file")
