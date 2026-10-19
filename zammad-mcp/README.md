@@ -18,8 +18,9 @@ and organizations — and, opt-in, **add notes/comments, reply by email, update,
 | `list_tickets(limit?, page?, full?)` | List tickets. |
 | `get_ticket(ticket_id, full?)` | One ticket with resolved names. |
 | `search_tickets(query, limit?, page?, full?)` | Search tickets (title/number/body + field filters). |
-| `get_ticket_articles(ticket_id, limit?, full?)` | A ticket's articles (the conversation/notes). |
-| `get_article(article_id, full?)` | One article by id. |
+| `get_ticket_articles(ticket_id, limit?, full?)` | A ticket's articles (the conversation/notes), each with its attachment list. |
+| `get_article(article_id, full?)` | One article by id, with its attachment list. |
+| `get_attachment(ticket_id, article_id, attachment_id)` | View an attachment: **images** (PNG/JPEG/GIF/WebP, incl. screenshots pasted into a mail) come back as an image the agent can look at; text files (logs, CSV, JSON, .eml …) as text. Other files only return their metadata. |
 | `list_users(limit?, page?, full?)` | List users. |
 | `search_users(query, limit?, full?)` | Search users by name/login/email. |
 | `whoami()` | The user behind the token (connectivity/permission check). |
@@ -198,6 +199,7 @@ In Claude Code, run `/mcp` to confirm the `zammad` server connected, then ask th
 - "Search open tickets about VPN and summarise the latest one."
 - "Show the conversation on ticket 4521."
 - "Who is the customer on ticket 4521?"
+- "Look at the screenshot on ticket 4521 and tell me what error it shows."
 
 With `ZAMMAD_ALLOW_WRITE=true` you can also:
 

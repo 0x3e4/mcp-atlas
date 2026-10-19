@@ -6,6 +6,7 @@ These run with no credentials and make no network calls.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 
 import httpx
@@ -31,6 +32,7 @@ EXPECTED_TOOLS = {
     "create_ticket",
     "tag_ticket",
     "reply_email",
+    "get_attachment",
 }
 
 
@@ -290,3 +292,65 @@ def test_reply_email_all_on_an_agent_email_goes_to_its_recipients():
                "cc": "", "subject": "VPN down", "message_id": "<m5@helpdesk.test>", "created_by_id": 3}
     to, cc = asyncio.run(server._reply_all_recipients(None, article, {"support@helpdesk.test"}))
     assert (to, cc) == (["jane@customer.test"], [])
+
+
+# ---- attachments --------------------------------------------------------
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 24
+
+
+def _attachment_client() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/ticket_articles/by_ticket/42":
+            return httpx.Response(200, json=[{
+                "id": 9, "ticket_id": 42, "type": "email", "body": '<img src="/api/v1/ticket_attachment/42/9/5?view=inline">',
+                "attachments": [
+                    {"id": 5, "filename": "image001.png", "size": "32",
+                     "preferences": {"Content-Type": "image/png", "Content-ID": "image001@01DA", "Content-Disposition": "inline"}},
+                    {"id": 6, "filename": "vpn.log", "size": "11", "preferences": {"Content-Type": "text/plain"}},
+                ],
+            }])
+        if path == "/api/v1/ticket_attachment/42/9/5":
+            return httpx.Response(200, content=_PNG, headers={"content-type": "image/png"})
+        if path == "/api/v1/ticket_attachment/42/9/6":
+            return httpx.Response(200, content="fehler: ä".encode("latin-1"), headers={"content-type": "text/plain; charset=ISO-8859-1"})
+        if path == "/api/v1/ticket_attachment/42/9/7":
+            return httpx.Response(200, content=b"%PDF-1.7", headers={"content-type": "application/pdf"})
+        return httpx.Response(403, json={"error": "The file does not belong to the specified article."})
+
+    client = server.ZammadClient(Settings.from_env(_base_env()))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    server._client = client
+
+
+def test_articles_list_their_attachments():
+    _attachment_client()
+    try:
+        out = asyncio.run(server.get_ticket_articles(42))
+    finally:
+        server._client = None
+    assert out["items"][0]["attachments"] == [
+        {"id": 5, "filename": "image001.png", "size": 32, "content_type": "image/png", "inline": True},
+        {"id": 6, "filename": "vpn.log", "size": 11, "content_type": "text/plain", "inline": False},
+    ]
+
+
+def test_get_attachment_returns_images_as_image_content():
+    _attachment_client()
+    try:
+        result = asyncio.run(server.mcp.call_tool("get_attachment", {"ticket_id": 42, "article_id": 9, "attachment_id": 5}))
+        blocks = result[0] if isinstance(result, tuple) else result
+        kinds = [b.type for b in blocks]
+        assert kinds == ["text", "image"]
+        assert blocks[1].mimeType == "image/png"
+        assert base64.b64decode(blocks[1].data) == _PNG
+
+        text = asyncio.run(server.get_attachment(42, 9, 6))
+        assert text["text"] == "fehler: ä" and text["truncated"] is False
+        pdf = asyncio.run(server.get_attachment(42, 9, 7))
+        assert pdf["content_type"] == "application/pdf" and "can't be shown" in pdf["note"]
+        with pytest.raises(server.ZammadError, match="403"):
+            asyncio.run(server.get_attachment(42, 9, 8))
+    finally:
+        server._client = None

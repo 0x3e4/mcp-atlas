@@ -19,7 +19,7 @@ import sys
 from email.utils import getaddresses
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
@@ -181,9 +181,13 @@ async def get_ticket_articles(
 ) -> dict[str, Any]:
     """Get a ticket's articles — the conversation/notes (GET /ticket_articles/by_ticket/{id}).
 
-    Each article has 'internal' (agent-only vs customer-visible), 'sender', 'type' and 'body'.
+    Each article has 'internal' (agent-only vs customer-visible), 'sender', 'type', 'body' and its
+    'attachments' (incl. inline screenshots) — view one with get_attachment.
     """
-    return await _get_list(f"ticket_articles/by_ticket/{ticket_id}", _ARTICLE_FIELDS, limit=limit, full=full)
+    out = await _get_list(f"ticket_articles/by_ticket/{ticket_id}", (), limit=limit, full=True)
+    if not full:
+        out["items"] = [_article(a) for a in out["items"] if isinstance(a, dict)]
+    return out
 
 
 @mcp.tool()
@@ -191,9 +195,85 @@ async def get_article(
     article_id: Annotated[int, Field(description="The article id.")],
     full: Annotated[bool, Field(description="Return the full object instead of a trimmed summary.")] = False,
 ) -> dict[str, Any]:
-    """Get one ticket article by id (GET /ticket_articles/{id})."""
+    """Get one ticket article by id (GET /ticket_articles/{id}), with its attachment list."""
     data = await _get_client().get(f"ticket_articles/{article_id}", params={"expand": "true"})
-    return data if full else _pick(data, _ARTICLE_FIELDS)
+    return data if full else _article(data)
+
+
+def _article(data: dict[str, Any]) -> dict[str, Any]:
+    """Trim an article and list its attachments compactly (inline = an image embedded in the body)."""
+    out = _pick(data, _ARTICLE_FIELDS)
+    out["attachments"] = [
+        {
+            "id": att.get("id"),
+            "filename": att.get("filename"),
+            "size": _int(att.get("size")),
+            "content_type": (att.get("preferences") or {}).get("Content-Type") or (att.get("preferences") or {}).get("Mime-Type"),
+            "inline": bool((att.get("preferences") or {}).get("Content-ID"))
+            or "inline" in str((att.get("preferences") or {}).get("Content-Disposition") or "").lower(),
+        }
+        for att in data.get("attachments") or []
+        if isinstance(att, dict)
+    ]
+    return out
+
+
+def _int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# Images go back as MCP image content so the agent can look at them; the API rejects much larger ones.
+_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_MAX_IMAGE_BYTES = 3_750_000  # ≈ 5 MB once base64-encoded
+_TEXT_TYPES = ("text/", "application/json", "application/xml", "application/x-yaml", "image/svg+xml", "message/rfc822")
+_MAX_TEXT_CHARS = 100_000
+
+
+@mcp.tool()
+async def get_attachment(
+    ticket_id: Annotated[int, Field(description="The ticket id.")],
+    article_id: Annotated[int, Field(description="The article the attachment belongs to.")],
+    attachment_id: Annotated[int, Field(description="The attachment id (from get_ticket_articles / get_article → attachments).")],
+):
+    """View a ticket attachment (GET /ticket_attachment/{ticket}/{article}/{id}).
+
+    Images (PNG, JPEG, GIF, WebP — incl. screenshots pasted into an email or note) come back as an
+    image you can look at; text files (logs, CSV, JSON, XML, .eml …) as text. Other files (PDF,
+    Office, archives) return only their metadata.
+    """
+    data, content_type = await _get_client().get_file(f"ticket_attachment/{ticket_id}/{article_id}/{attachment_id}")
+    ctype = content_type.split(";", 1)[0].strip().lower()
+    meta: dict[str, Any] = {
+        "ticket_id": ticket_id, "article_id": article_id, "attachment_id": attachment_id,
+        "content_type": ctype, "size": len(data),
+    }
+    if ctype in _IMAGE_TYPES:
+        if len(data) > _MAX_IMAGE_BYTES:
+            meta["note"] = f"Image too large to pass on ({len(data)} bytes, limit {_MAX_IMAGE_BYTES})."
+            return meta
+        return [meta, Image(data=data, format=ctype.split("/", 1)[1])]
+    if ctype.startswith(_TEXT_TYPES):
+        text = data.decode(_charset(content_type), errors="replace")
+        meta["truncated"] = len(text) > _MAX_TEXT_CHARS
+        meta["text"] = text[:_MAX_TEXT_CHARS]
+        return meta
+    meta["note"] = "Binary file type that can't be shown here (only images and text files are)."
+    return meta
+
+
+def _charset(content_type: str) -> str:
+    for part in content_type.split(";")[1:]:
+        key, _, value = part.strip().partition("=")
+        if key.lower() == "charset" and value:
+            try:
+                "".encode(value.strip('"'))
+                return value.strip('"')
+            except LookupError:
+                break
+    return "utf-8"
 
 
 # ---- tools: users & orgs ------------------------------------------------

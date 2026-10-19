@@ -84,9 +84,14 @@ class ZammadClient:
             url = self._url(p)
         return await self._request("GET", url, params=params)
 
-    async def _request(
+    async def get_file(self, path: str) -> tuple[bytes, str]:
+        """GET a binary resource (e.g. ``ticket_attachment/...``) → ``(bytes, content-type header)``."""
+        resp = await self._send("GET", self._url(path))
+        return resp.content, resp.headers.get("content-type", "application/octet-stream")
+
+    async def _send(
         self, method: str, url: str, *, params: dict[str, Any] | None = None, json: Any | None = None
-    ) -> Any:
+    ) -> httpx.Response:
         client = await self._http()
         try:
             resp = await client.request(
@@ -97,6 +102,12 @@ class ZammadClient:
 
         if resp.status_code >= 400:
             raise ZammadError(_format_error(resp.status_code, resp), status=resp.status_code)
+        return resp
+
+    async def _request(
+        self, method: str, url: str, *, params: dict[str, Any] | None = None, json: Any | None = None
+    ) -> Any:
+        resp = await self._send(method, url, params=params, json=json)
         if resp.status_code == 204 or not resp.content:
             return {}
         try:
