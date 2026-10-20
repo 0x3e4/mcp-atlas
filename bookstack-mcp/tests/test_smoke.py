@@ -41,12 +41,20 @@ EXPECTED_TOOLS = {
     "get_drawing",
     "create_drawing",
     "update_drawing",
+    "get_attachment",
+    "list_images",
+    "get_image",
+    "upload_attachment",
+    "update_attachment",
+    "upload_image",
+    "update_image",
 }
 
 
 WRITE_TOOLS = {
     "create_page", "update_page", "create_chapter", "update_chapter", "create_book", "update_book",
     "create_shelf", "update_shelf", "add_comment", "create_drawing", "update_drawing",
+    "upload_attachment", "update_attachment", "upload_image", "update_image",
 }
 
 
@@ -406,3 +414,212 @@ def test_create_drawing_confirm_code_is_stable_for_the_same_diagram():
     finally:
         server._client = None
     assert done["drawing"]["id"] == 77
+
+
+# ---- attachments & images -------------------------------------------------
+
+import base64  # noqa: E402
+
+from mcp.server.fastmcp import Image  # noqa: E402
+
+
+def _upload_client(handler, tmp_path=None, *, confirm_write: bool = False) -> server.BookStackClient:
+    env = _base_env()
+    env.update(BOOKSTACK_ALLOW_WRITE="true", BOOKSTACK_CONFIRM_WRITE="true" if confirm_write else "false")
+    if tmp_path is not None:
+        env["BOOKSTACK_UPLOAD_DIR"] = str(tmp_path)
+    client = server.BookStackClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client
+
+
+def test_get_attachment_reads_text_images_and_links():
+    files = {
+        5: {"id": 5, "name": "backup", "extension": "sh", "uploaded_to": 12, "external": False,
+            "content": base64.b64encode(b"#!/bin/sh\necho hi\n").decode(), "links": {"html": "<a>", "markdown": "[x](y)"}},
+        6: {"id": 6, "name": "rack.png", "extension": "png", "uploaded_to": 12, "external": False,
+            "content": base64.b64encode(_tiny_png()).decode()},
+        7: {"id": 7, "name": "Vendor docs", "extension": "", "uploaded_to": 12, "external": True,
+            "content": "https://vendor.example.com/docs"},
+    }
+    server._client = _upload_client(lambda r: httpx.Response(200, json=files[int(r.url.path.rsplit("/", 1)[1])]))
+    try:
+        text = asyncio.run(server.get_attachment(5))
+        assert text[0]["kind"] == "text" and text[0]["text"].startswith("#!/bin/sh") and text[0]["filename"] == "backup.sh"
+        assert text[0]["links"]["markdown"] == "[x](y)"
+        image = asyncio.run(server.get_attachment(6))
+        assert image[0]["kind"] == "image" and isinstance(image[1], Image)
+        link = asyncio.run(server.get_attachment(7))
+        assert link["link"] == "https://vendor.example.com/docs"
+    finally:
+        server._client = None
+
+
+def test_get_image_returns_the_picture_or_explains_an_old_bookstack():
+    meta = {"id": 9, "name": "rack", "type": "gallery", "uploaded_to": 12, "path": "/uploads/images/gallery/rack.png",
+            "url": "https://docs.example.com/uploads/images/gallery/rack.png", "content": {"html": "<a>", "markdown": "![rack](u)"}}
+    has_data = {"v": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/data"):
+            if has_data["v"]:
+                return httpx.Response(200, content=_tiny_png(), headers={"content-type": "image/png"})
+            return httpx.Response(404, json={"error": {"message": "Not found"}})
+        return httpx.Response(200, json=meta)
+
+    server._client = _upload_client(handler)
+    try:
+        out = asyncio.run(server.get_image(9))
+        assert out[0]["id"] == 9 and out[0]["content"]["markdown"] == "![rack](u)" and isinstance(out[1], Image)
+        has_data["v"] = False
+        out = asyncio.run(server.get_image(9))
+        assert "v25.11" in out["note"]
+    finally:
+        server._client = None
+
+
+def test_upload_attachment_text_file_and_link_into_the_page():
+    seen: list = []
+    page = {"id": 12, "markdown": "# Runbook\n", "raw_html": "<h1>Runbook</h1>"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.content.decode("latin-1"), request.headers.get("content-type", "")))
+        if request.url.path == "/api/attachments":
+            return httpx.Response(200, json={"id": 41, "name": "backup.sh", "extension": "sh", "uploaded_to": 12, "external": False})
+        if request.method == "GET":
+            return httpx.Response(200, json=page)
+        return httpx.Response(200, json={"id": 12, **json.loads(request.content)})
+
+    server._client = _upload_client(handler)
+    try:
+        out = asyncio.run(server.upload_attachment(12, text="#!/bin/sh\necho hi\n", filename="backup.sh", insert="end"))
+    finally:
+        server._client = None
+    post, get_page, put_page = seen
+    assert post[0] == "POST" and post[3].startswith("multipart/form-data")
+    assert 'name="name"\r\n\r\nbackup.sh' in post[2] and 'name="uploaded_to"\r\n\r\n12' in post[2]
+    assert 'name="file"; filename="backup.sh"' in post[2] and "echo hi" in post[2]
+    assert out["url"] == "https://docs.example.com/attachments/41"
+    assert json.loads(put_page[2])["markdown"] == "# Runbook\n\n[backup.sh](https://docs.example.com/attachments/41)"
+
+
+def test_upload_attachment_link_is_json_and_upload_dir_is_sandboxed(tmp_path):
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.headers.get("content-type", ""), request.content))
+        return httpx.Response(200, json={"id": 42, "name": "Vendor docs", "uploaded_to": 12, "external": True})
+
+    (tmp_path / "manuals").mkdir()
+    (tmp_path / "manuals" / "switch.pdf").write_bytes(b"%PDF-1.4 tiny")
+    (tmp_path.parent / "secret.txt").write_text("nope")
+    server._client = _upload_client(handler, tmp_path)
+    try:
+        asyncio.run(server.upload_attachment(12, name="Vendor docs", link="https://vendor.example.com/docs"))
+        assert seen[-1][1] == "application/json"
+        assert json.loads(seen[-1][2]) == {"name": "Vendor docs", "uploaded_to": 12, "link": "https://vendor.example.com/docs"}
+        asyncio.run(server.upload_attachment(12, path="manuals/switch.pdf"))
+        assert b'filename="switch.pdf"' in seen[-1][2] and b"%PDF-1.4 tiny" in seen[-1][2]
+        with pytest.raises(ValueError, match="inside BOOKSTACK_UPLOAD_DIR"):
+            asyncio.run(server.upload_attachment(12, path="../secret.txt"))
+        with pytest.raises(ValueError, match="exactly one"):
+            asyncio.run(server.upload_attachment(12, text="a", content_base64="YQ==", filename="a.txt"))
+        with pytest.raises(ValueError, match="extension"):
+            asyncio.run(server.upload_attachment(12, text="a", filename="notes"))
+        with pytest.raises(ValueError, match="not both"):
+            asyncio.run(server.upload_attachment(12, text="a", filename="a.txt", link="https://x.example.com"))
+    finally:
+        server._client = None
+
+
+def test_path_needs_an_upload_dir():
+    server._client = _upload_client(lambda r: httpx.Response(200, json={}))
+    try:
+        with pytest.raises(ValueError, match="BOOKSTACK_UPLOAD_DIR"):
+            asyncio.run(server.upload_attachment(12, path="a.pdf"))
+    finally:
+        server._client = None
+
+
+def test_update_attachment_replaces_the_file_keeping_its_name():
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, dict(request.url.params), request.content.decode("latin-1")))
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": 41, "name": "Backup script", "uploaded_to": 12}], "total": 1})
+        return httpx.Response(200, json={"id": 41, "name": "Backup script", "extension": "sh", "uploaded_to": 12})
+
+    server._client = _upload_client(handler)
+    try:
+        asyncio.run(server.update_attachment(41, text="echo v2\n", filename="backup.sh"))
+        asyncio.run(server.update_attachment(41, name="Old script", move_to_page_id=13))
+    finally:
+        server._client = None
+    assert seen[0][2] == {"filter[id]": "41", "count": "1"}
+    method, path, _, body = seen[1]
+    assert (method, path) == ("POST", "/api/attachments/41")
+    assert 'name="_method"\r\n\r\nPUT' in body and 'name="name"\r\n\r\nBackup script' in body and "echo v2" in body
+    assert seen[3][0] == "PUT" and json.loads(seen[3][3]) == {"name": "Old script", "uploaded_to": 13}
+
+
+def test_upload_image_inserts_bookstacks_snippet():
+    seen: list = []
+    image = {"id": 90, "name": "rack", "type": "gallery", "uploaded_to": 12,
+             "url": "https://docs.example.com/uploads/images/gallery/rack.png",
+             "content": {"html": '<a href="u" target="_blank"><img src="d" alt="rack"></a>', "markdown": "![rack](d)"}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.content.decode("latin-1")))
+        if request.url.path == "/api/image-gallery":
+            return httpx.Response(200, json=image)
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": 12, "markdown": "", "raw_html": "<p>Intro</p>"})
+        return httpx.Response(200, json={"id": 12, **json.loads(request.content)})
+
+    png = base64.b64encode(_tiny_png()).decode()
+    server._client = _upload_client(handler)
+    try:
+        out = asyncio.run(server.upload_image(12, content_base64=f"data:image/png;base64,{png}", filename="rack.png", name="rack"))
+        with pytest.raises(ValueError, match="must be one of jpg"):
+            asyncio.run(server.upload_image(12, content_base64=png, filename="rack.svg"))
+    finally:
+        server._client = None
+    upload = seen[0][2]
+    assert 'name="type"\r\n\r\ngallery' in upload and 'name="image"; filename="rack.png"' in upload
+    assert json.loads(seen[2][2])["html"] == '<p>Intro</p>\n<p><a href="u" target="_blank"><img src="d" alt="rack"></a></p>'
+    assert out["image"]["id"] == 90 and out["snippet"]["markdown"] == "![rack](d)"
+
+
+def test_update_image_checks_type_and_drawings():
+    meta = {"id": 90, "name": "rack", "type": "gallery", "uploaded_to": 12, "path": "/uploads/images/gallery/rack.png"}
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.content.decode("latin-1")))
+        return httpx.Response(200, json=meta)
+
+    png = base64.b64encode(_tiny_png()).decode()
+    server._client = _upload_client(handler)
+    try:
+        with pytest.raises(ValueError, match="only replaces it with another .png"):
+            asyncio.run(server.update_image(90, content_base64=png, filename="rack.jpg"))
+        asyncio.run(server.update_image(90, content_base64=png, filename="rack-v2.png"))
+        assert seen[-1][0] == "POST" and 'name="_method"\r\n\r\nPUT' in seen[-1][2]
+        meta["type"] = "drawio"
+        with pytest.raises(ValueError, match="update_drawing"):
+            asyncio.run(server.update_image(90, name="x"))
+    finally:
+        server._client = None
+
+
+def test_upload_confirm_code_binds_the_file_content():
+    sent: list = []
+    server._client = _upload_client(lambda r: sent.append(r) or httpx.Response(200, json={"id": 1}), confirm_write=True)
+    try:
+        preview = asyncio.run(server.upload_attachment(12, text="v1", filename="a.txt"))
+        assert preview["change"]["size"] == 2 and "text" not in preview["change"]
+        other = asyncio.run(server.upload_attachment(12, text="v2", filename="a.txt", confirm=preview["confirm_code"]))
+        assert other["status"] == "confirmation_required" and sent == []
+    finally:
+        server._client = None

@@ -16,6 +16,10 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    # Optional drop folder for upload_attachment / upload_image (path='...'); set
+    # BOOKSTACK_UPLOAD_DIR=/upload in bookstack.env.
+    # volumes:
+    #   - ./upload:/upload:ro
     # --- MCP gateway (e.g. mcpjungle): remove the ports: above and join a shared network ---
     # networks: [atlas-net]
 

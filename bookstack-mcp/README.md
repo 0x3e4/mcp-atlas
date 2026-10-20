@@ -3,8 +3,10 @@
 A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
 Claude Code) to a **[BookStack](https://www.bookstackapp.com)** instance through its REST API. Ask
 about your documentation in natural language — browse the shelves → books → chapters → pages
-hierarchy, read and search page content, and export pages/books to markdown — and, opt-in, **create
-and edit pages, chapters, books and shelves, and comment on pages**.
+hierarchy, read and search page content, read attachments (PDF, mails, text, images) and gallery
+images, and export pages/books to markdown — and, opt-in, **create and edit pages, chapters, books and
+shelves, comment on pages, attach files and links, upload images onto pages, and draw draw.io
+diagrams**.
 
 - One shared `httpx.AsyncClient`; **API-token** auth (`Authorization: Token <id>:<secret>`).
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
@@ -25,6 +27,9 @@ and edit pages, chapters, books and shelves, and comment on pages**.
 | `search(query, count?, page?)` | Cross-content search (shelves/books/chapters/pages). |
 | `export_content(kind, id, format?)` | Export a page/chapter/book as `markdown`/`html`/`plaintext`. |
 | `list_attachments(page_id?, limit?, offset?, full?)` | List attachments & links (metadata). |
+| `get_attachment(id, pages?, part?)` | Read an attachment: images come back as images, PDFs as text per page (scanned pages as images), `.eml`/`.msg` mails with their own attachments (`part=N`), text files (scripts, configs, logs, CSV …) as text; links return their URL. Also returns the html/markdown link for a page body. |
+| `list_images(page_id?, type?, name_contains?, limit?, offset?, full?)` | List gallery images and drawings, e.g. the ones on a page. |
+| `get_image(id)` | A gallery image's details, page snippet and the picture itself (the picture needs BookStack v25.11+). |
 | `system_info()` | Instance version / name / base URL. |
 | `get_drawing(image_id)` | A draw.io drawing with its diagram XML (to change it with `update_drawing`). |
 | `bookstack_get(path, params?)` | Escape hatch: raw read-only GET against any `/api/...` path. |
@@ -52,6 +57,10 @@ the item type; moving needs delete). Results are trimmed to ids, names, tags and
 | `add_comment(page_id, body, html?, reply_to?)` | Comment on a page (plain text by default). Needs a BookStack release with the comments API. |
 | `create_drawing(page_id, xml, name?, position='end'\|'start'\|'none')` | Draw a **draw.io diagram** from its XML: rendered to PNG, uploaded as a BookStack drawing and inserted at the end/start of the page (`none` = upload only and return the snippet). Stays editable in BookStack's draw.io editor. Needs `BOOKSTACK_DRAWIO_EXPORT_URL`. |
 | `update_drawing(image_id, xml, name?)` | Redraw an existing drawing in place; every page showing it gets the new version. |
+| `upload_attachment(page_id, text? \| content_base64? \| path? \| link?, filename?, name?, insert='none'\|'end'\|'start')` | Attach a file or a link to a page (sidebar). `insert` also links it in the page body. |
+| `update_attachment(id, name?, text? \| content_base64? \| path?, filename?, link?, move_to_page_id?)` | Rename, replace the file, change the link or move an attachment to another page. A replaced file is gone for good (attachments have no history). |
+| `upload_image(page_id, content_base64? \| path?, filename?, name?, insert='end'\|'start'\|'none')` | Upload a picture (png, jpg, gif, webp, avif) to the page's gallery and show it on the page with BookStack's own snippet (scaled display image linking to the original). |
+| `update_image(id, content_base64? \| path?, filename?, name?)` | Rename a gallery image or replace its picture in place (same file type only); every page showing it shows the new one. |
 
 `tags` is `{name: value}` (`''` for a tag without a value). On the `update_*` tools it **replaces all
 tags** of the item; omit it to leave them alone.
@@ -61,6 +70,34 @@ call changes nothing and returns a preview with a `confirm_code`. The agent show
 and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
 code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
 expire when the server restarts). Set `BOOKSTACK_CONFIRM_WRITE=false` to let writes run directly.
+
+### Files: attachments and images
+
+Upload tools take the file from exactly one source:
+
+- **`text`** — the content as text (scripts, configs, CSV, markdown …), with a `filename` like
+  `backup.sh`. Cheap and the normal case for files the agent writes itself.
+- **`content_base64`** — the file as base64 (or a `data:` URL), with a `filename`. Fine for small
+  files, but the whole file passes through the conversation: a 500 KB screenshot is ~700,000
+  characters of context. Use `path` for anything bigger.
+- **`path`** — a file in the server's **drop folder** `BOOKSTACK_UPLOAD_DIR`. Mount a folder into the
+  container and put files there; the agent then only passes the relative path, so no file bytes go
+  through the conversation. Paths can't leave the folder.
+
+  ```bash
+  claude mcp add bookstack -- docker run -i --rm --env-file ./bookstack.env \
+    -v "$HOME/bookstack-upload:/upload:ro" -e BOOKSTACK_UPLOAD_DIR=/upload bookstack-mcp
+  ```
+
+  For the always-on HTTP server add the same `volumes:` entry in `compose.yml` (see
+  `compose.yml.example`); the folder then lives on the server host, e.g. a share people drop files into.
+
+Attachments show in the page's sidebar; `insert` also adds a link in the body. Uploaded images are
+placed on the page by default (`insert='end'`). Each placement is a normal page edit, so it shows up as
+a page revision. The size limit is BookStack's `FILE_UPLOAD_SIZE_LIMIT` (50 MB by default; your web
+server / PHP limits may be lower). Images need the token user's role to have **"Create all images"**
+(`image-create-all`; the "own" variant is not enough over the API) plus edit rights on the page;
+attachments need **"Create all attachments"**.
 
 ### draw.io drawings
 
@@ -239,16 +276,20 @@ With `BOOKSTACK_ALLOW_WRITE=true` you can also:
 - "Tag page 134 with reviewed=2026-10 and comment that the steps were tested."
 - "Draw the network diagram for page 134 (firewall → DMZ → web servers) and add it at the end."
 - "In the drawing on page 134, add a second web server behind the load balancer."
+- "Attach this backup script to page 134 as backup.sh and link it at the end of the page."
+- "Upload `screens/rack-a.png` from the drop folder to page 134 under the rack section."
+- "Replace attachment 41 with `manuals/switch-v2.pdf` from the drop folder."
+- "Read the PDF attached to page 134 and summarise the maintenance steps."
 
 ## Notes & scope
 
 - **Writes are opt-in.** Reads are always available; the write tools refuse unless
   `BOOKSTACK_ALLOW_WRITE=true` and the token's user has the permissions. Leave the flag unset for
-  read-only. Page edits are recoverable from the page's revisions. There are no delete tools. Uploads are limited
-  to draw.io drawings; attachments and gallery images are not covered.
+  read-only. Page edits are recoverable from the page's revisions; replaced attachment files and
+  images are not (BookStack keeps no history for them). There are no delete tools.
 - **Permissions** follow the token's user: content it can't see won't appear, and `users` / `roles` /
   `audit-log` / `recycle-bin` (via `bookstack_get`) need elevated permissions.
 - **Large payloads** — page bodies, exports and book `contents` can be big; tools trim by default and
   cap list sizes. Use `content='none'`, `name_contains`, filters and `limit`/`offset` to stay small.
 - **`bookstack_get`** reaches everything else: `users`, `roles`, `comments`, `image-gallery`, `tags`,
-  `audit-log`, `recycle-bin`, single attachment content (`attachments/{id}`), etc.
+  `audit-log`, `recycle-bin`, etc.

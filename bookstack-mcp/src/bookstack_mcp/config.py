@@ -39,6 +39,7 @@ class Settings:
     verify_ssl: bool = True
     ca_bundle: str = ""
     drawio_export_url: str = ""
+    upload_dir: str = ""
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -77,6 +78,7 @@ class Settings:
             verify_ssl=_bool_env(env, "BOOKSTACK_VERIFY_SSL", True),
             ca_bundle=env.get("BOOKSTACK_CA_BUNDLE", "").strip(),
             drawio_export_url=env.get("BOOKSTACK_DRAWIO_EXPORT_URL", "").strip(),
+            upload_dir=env.get("BOOKSTACK_UPLOAD_DIR", "").strip(),
         )
 
     @property

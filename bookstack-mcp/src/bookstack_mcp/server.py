@@ -2,9 +2,10 @@
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
 always-on HTTP server. Read tools (GET) cover the content hierarchy (shelves → books → chapters →
-pages), search, export and attachments; the raw ``bookstack_get`` escape hatch reaches anything else
-(users, roles, comments, image-gallery, audit-log, …). Write tools (create/update pages, chapters,
-books and shelves, comment on a page, draw.io drawings) are **opt-in**: they refuse unless ``BOOKSTACK_ALLOW_WRITE=true``
+pages), search, export, attachments and images (incl. their content); the raw ``bookstack_get``
+escape hatch reaches anything else (users, roles, comments, audit-log, …). Write tools (create/update
+pages, chapters, books and shelves, comment on a page, upload/replace attachments and images, draw.io
+drawings) are **opt-in**: they refuse unless ``BOOKSTACK_ALLOW_WRITE=true``
 and need a token whose user has the matching permissions. With the flag off the server is read-only.
 Unless ``BOOKSTACK_CONFIRM_WRITE=false``, every write first returns a preview plus a confirm code and
 only runs when called again with that code, after the user has confirmed.
@@ -12,18 +13,23 @@ only runs when called again with that code, after the user has confirmed.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
+import mimetypes
 import secrets
 import sys
 from html import escape
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
+from . import attachments
 from .client import BookStackClient, BookStackError
 from .config import ConfigError, Settings
 from .drawio import embed_xml, extract_xml, normalize_xml
@@ -31,7 +37,7 @@ from .drawio import embed_xml, extract_xml, normalize_xml
 mcp = FastMCP(
     "bookstack-mcp",
     instructions=(
-        "Write tools (create_*/update_*/add_comment) need the user's confirmation: the first call changes "
+        "Write tools (create_*/update_*/upload_*/add_comment) need the user's confirmation: the first call changes "
         "nothing and returns a preview with a confirm_code. Show the user a short overview of what will "
         "change, end with 'Confirm it?', and only after they say yes repeat the call with confirm=<code>."
     ),
@@ -53,7 +59,8 @@ def _require_write() -> None:
     if not _get_client().settings.allow_write:
         raise ValueError(
             "Write tools are disabled. Set BOOKSTACK_ALLOW_WRITE=true (and use a token whose user has "
-            "the matching create/update permissions) to create or edit pages, chapters, books and shelves."
+            "the matching create/update permissions) to create or edit pages, chapters, books, shelves, "
+            "attachments and images."
         )
 
 
@@ -365,7 +372,7 @@ async def list_attachments(
 ) -> dict[str, Any]:
     """List attachments and links (GET /api/attachments). 'external'=true means a link, not a file.
 
-    Metadata only — fetch a single attachment's content via bookstack_get('attachments/{id}').
+    Metadata only — read one with get_attachment.
     """
     return await _get_list(
         "attachments", _ATTACHMENT_FIELDS, limit=limit, offset=offset,
@@ -695,18 +702,23 @@ async def create_drawing(
         f'<div drawio-diagram="{image.get("id")}"><img src="{escape(str(image.get("url")))}"></div>'
     )
     out: dict[str, Any] = {"drawing": _pick(image, _DRAWING_FIELDS), "snippet": snippet}
-    if position == "none":
-        return out
+    if position != "none":
+        out.update(await _insert(page_id, snippet, snippet, position, f"Added drawing {name}", "Drawing"))
+    return out
+
+
+async def _insert(page_id: int, html: str, markdown: str, position: str, changelog: str, what: str) -> dict[str, Any]:
+    """Put a snippet at the start or end of a page (a new revision); report a failure instead of raising."""
+    client = _get_client()
     try:
         page = await client.get(f"pages/{page_id}")
         if page.get("markdown"):
-            body = {"markdown": _place(page["markdown"], snippet, position, "\n\n")}
+            body = {"markdown": _place(page["markdown"], markdown, position, "\n\n")}
         else:
-            body = {"html": _place(page.get("raw_html") or page.get("html") or "", snippet, position, "\n")}
-        out["page"] = _written("page", await client.put(f"pages/{page_id}", json={**body, "changelog": f"Added drawing {name}"[:180]}))
+            body = {"html": _place(page.get("raw_html") or page.get("html") or "", html, position, "\n")}
+        return {"page": _written("page", await client.put(f"pages/{page_id}", json={**body, "changelog": changelog[:180]}))}
     except (BookStackError, ValueError) as exc:
-        out["page_error"] = f"Drawing uploaded, but adding it to page {page_id} failed: {exc}. Insert the snippet with update_page."
-    return out
+        return {"page_error": f"{what} uploaded, but adding it to page {page_id} failed: {exc}. Insert the snippet with update_page."}
 
 
 def _place(content: str, snippet: str, position: str, gap: str) -> str:
@@ -745,6 +757,350 @@ async def update_drawing(
         f"image-gallery/{image_id}", data=data, files={"image": ("drawing.png", await _render(diagram), "image/png")}
     )
     return _pick(image, _DRAWING_FIELDS)
+
+
+# ---- tools: attachments & images (content) ------------------------------
+
+_IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "gif", "webp", "avif")  # BookStack's ImageService list
+_IMAGE_FIELDS = ("id", "name", "type", "uploaded_to", "url", "created_at", "updated_at")
+_ATTACHMENT_WRITE_FIELDS = ("id", "name", "extension", "uploaded_to", "external", "updated_at")
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # BookStack's default FILE_UPLOAD_SIZE_LIMIT (50 MB)
+_SOURCE_DESC = (
+    "File source — give exactly one of text, content_base64 or path. "
+)
+
+
+def _ext(filename: str) -> str:
+    suffix = PurePosixPath(filename).suffix
+    return suffix[1:].lower() if suffix else ""
+
+
+def _ctype(filename: str) -> str:
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+def _read_upload_dir(path: str) -> bytes:
+    """Read ``path`` from BOOKSTACK_UPLOAD_DIR, refusing anything outside it."""
+    upload_dir = _get_client().settings.upload_dir
+    if not upload_dir:
+        raise ValueError(
+            "path needs BOOKSTACK_UPLOAD_DIR: mount a folder into the container (e.g. -v ~/bookstack-upload:/upload:ro) "
+            "and set BOOKSTACK_UPLOAD_DIR=/upload. Otherwise pass text or content_base64."
+        )
+    base = Path(upload_dir).resolve()
+    target = (base / path.lstrip("/\\")).resolve()
+    if not target.is_relative_to(base):
+        raise ValueError(f"path must stay inside BOOKSTACK_UPLOAD_DIR; {path!r} does not.")
+    if not target.is_file():
+        raise ValueError(f"No file {path!r} in BOOKSTACK_UPLOAD_DIR.")
+    if target.stat().st_size > _MAX_UPLOAD_BYTES:
+        raise ValueError(f"{path!r} is larger than {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
+    return target.read_bytes()
+
+
+def _file_source(text: str | None, content_base64: str | None, path: str | None, filename: str | None) -> tuple[bytes, str]:
+    """Resolve the one given file source into (bytes, filename-with-extension)."""
+    if sum(x is not None for x in (text, content_base64, path)) != 1:
+        raise ValueError("Give exactly one file source: text, content_base64 or path.")
+    if text is not None:
+        data = text.encode("utf-8")
+    elif content_base64 is not None:
+        raw = content_base64.split(",", 1)[1] if content_base64.startswith("data:") else content_base64
+        try:
+            data = base64.b64decode("".join(raw.split()), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("content_base64 is not valid base64.") from exc
+    else:
+        data = _read_upload_dir(path)
+    name = (filename or (PurePosixPath(path.replace("\\", "/")).name if path else "")).strip()
+    if not name or not _ext(name):
+        raise ValueError("Give filename with an extension (e.g. 'backup.sh', 'diagram.png'); BookStack takes the type from it.")
+    if not data:
+        raise ValueError("The file is empty.")
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise ValueError(f"The file is larger than {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
+    return data, name
+
+
+def _file_change(data: bytes, filename: str) -> dict[str, Any]:
+    """The file's part of a confirm binding: name, size and a digest (not the bytes)."""
+    return {"filename": filename, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()[:16]}
+
+
+def _check_position(position: str) -> None:
+    if position not in ("end", "start", "none"):
+        raise ValueError("insert must be one of: end, start, none.")
+
+
+@mcp.tool()
+async def get_attachment(
+    id: Annotated[int, Field(description="Attachment id (see list_attachments).")],
+    pages: Annotated[str | None, Field(description="For a PDF: page range to read, e.g. '3' or '31-60'. Default: the first 30 pages.")] = None,
+    part: Annotated[int | None, Field(description="For an e-mail attachment (.eml/.msg): open its N-th own attachment (1-based).", ge=1)] = None,
+):
+    """Read an attachment (GET /api/attachments/{id}) — the file's content, or the target of a link.
+
+    - Images (PNG, JPEG, GIF, WebP) → an image you can look at.
+    - PDF → text per page; scanned pages without text are rendered as images (up to 5 per call).
+    - E-mails (.eml, Outlook .msg) → headers, body and the mail's own attachments (open one with part=N).
+    - Text files (logs, configs, scripts, CSV, JSON, XML …) → text.
+    - Anything else (Office, archives) → metadata only.
+    Also returns the html/markdown link to put the attachment into a page body.
+    """
+    data = await _get_client().get(f"attachments/{id}")
+    meta = _pick(data, _ATTACHMENT_WRITE_FIELDS)
+    meta["links"] = data.get("links")
+    if data.get("external"):
+        return {**meta, "link": data.get("content")}
+    try:
+        raw = base64.b64decode(data.get("content") or "")
+    except (binascii.Error, ValueError) as exc:
+        raise BookStackError(f"Attachment {id}: BookStack's content was not valid base64.") from exc
+    name, ext = str(data.get("name") or f"attachment-{id}"), str(data.get("extension") or "")
+    filename = name if not ext or name.lower().endswith(f".{ext.lower()}") else f"{name}.{ext}"
+    content = attachments.read(raw, _ctype(filename), filename, part=part, pages=pages)
+    content[0] = {**meta, **content[0]}
+    return content
+
+
+@mcp.tool()
+async def list_images(
+    page_id: Annotated[int | None, Field(description="Only images uploaded to this page id.")] = None,
+    type: Annotated[str | None, Field(description="'gallery' (normal images) or 'drawio' (drawings).")] = None,
+    name_contains: Annotated[str | None, Field(description="Only images whose name contains this text.")] = None,
+    limit: Annotated[int, Field(description="Max images to return.", ge=1, le=500)] = 50,
+    offset: Annotated[int, Field(description="Pagination offset.", ge=0)] = 0,
+    full: Annotated[bool, Field(description="Return full objects instead of a trimmed summary.")] = False,
+) -> dict[str, Any]:
+    """List images in the image gallery (GET /api/image-gallery), e.g. the images on one page."""
+    if type is not None and type not in ("gallery", "drawio"):
+        raise ValueError("type must be one of: gallery, drawio.")
+    return await _get_list(
+        "image-gallery", _IMAGE_FIELDS, limit=limit, offset=offset, name_contains=name_contains,
+        extra_filters={"uploaded_to": page_id, "type": type}, full=full,
+    )
+
+
+@mcp.tool()
+async def get_image(
+    id: Annotated[int, Field(description="Image id (see list_images).")],
+):
+    """Look at a gallery image (GET /api/image-gallery/{id} + /data): its details and the picture itself.
+
+    Also returns the html/markdown snippet BookStack uses to show it on a page. Reading the picture
+    needs BookStack v25.11 or newer (the /data endpoint).
+    """
+    client = _get_client()
+    meta = await client.get(f"image-gallery/{id}")
+    info = _pick(meta, _IMAGE_FIELDS)
+    info["content"] = meta.get("content")
+    try:
+        raw = await client.get_bytes(f"image-gallery/{id}/data")
+    except BookStackError as exc:
+        if exc.status == 404:
+            info["note"] = "This BookStack has no image data endpoint (added in v25.11); only the details are shown."
+            return info
+        raise
+    filename = PurePosixPath(str(meta.get("path") or meta.get("url") or "image.png")).name
+    content = attachments.read(raw, _ctype(filename), filename)
+    content[0] = {**info, **content[0]}
+    return content
+
+
+@mcp.tool()
+async def upload_attachment(
+    page_id: Annotated[int, Field(description="The page to attach the file or link to.")],
+    name: Annotated[str | None, Field(description="Display name. Defaults to the file name (or the link).", min_length=1, max_length=255)] = None,
+    text: Annotated[str | None, Field(description=_SOURCE_DESC + "text: the file's content as UTF-8 text (configs, scripts, CSV, logs …).")] = None,
+    content_base64: Annotated[str | None, Field(description=_SOURCE_DESC + "content_base64: the file as base64 (or a data: URL). Only for small binaries — large ones cost a lot of context; use path.")] = None,
+    path: Annotated[str | None, Field(description=_SOURCE_DESC + "path: a file in the server's BOOKSTACK_UPLOAD_DIR drop folder, e.g. 'manuals/switch.pdf'.")] = None,
+    filename: Annotated[str | None, Field(description="File name with extension, e.g. 'backup.sh'. Required for text/content_base64; defaults to the file's name for path.", max_length=255)] = None,
+    link: Annotated[str | None, Field(description="Attach a link (URL) instead of a file.", min_length=1, max_length=2000)] = None,
+    insert: Annotated[str, Field(description="Also link it in the page body: 'none' (only the attachments sidebar), 'end' or 'start'.")] = "none",
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Attach a file or a link to a page (WRITE — requires BOOKSTACK_ALLOW_WRITE). POSTs /api/attachments.
+
+    Attachments show in the page's sidebar; insert='end'/'start' also adds a link to it in the page
+    body (a new page revision). Max 50 MB (BookStack's default upload limit).
+    """
+    _require_write()
+    _check_position(insert)
+    client = _get_client()
+    if link is not None:
+        if any(x is not None for x in (text, content_base64, path)):
+            raise ValueError("Give a link or a file source (text, content_base64, path), not both.")
+        payload = {"name": (name or link).strip(), "uploaded_to": page_id, "link": link.strip()}
+        change: dict[str, Any] = {**payload, "insert": insert}
+        what = f"link {link.strip()}"
+    else:
+        data, fname = _file_source(text, content_base64, path, filename)
+        payload = {"name": (name or fname).strip(), "uploaded_to": page_id}
+        change = {**payload, **_file_change(data, fname), "insert": insert}
+        what = f"file {fname} ({len(data)} bytes)"
+    where = "" if insert == "none" else f", linked at the {insert} of the page"
+    if preview := _confirm("upload_attachment", change, f"Attach {what} as '{payload['name']}' to page {page_id}{where}.", confirm):
+        return preview
+    if link is not None:
+        att = await client.post("attachments", json=payload)
+    else:
+        att = await client.post_form(
+            "attachments", data={k: str(v) for k, v in payload.items()}, files={"file": (fname, data, _ctype(fname))}
+        )
+    out = _pick(att, _ATTACHMENT_WRITE_FIELDS)
+    url = f"{client.settings.base_url}/attachments/{att.get('id')}"
+    out["url"] = url
+    label = escape(str(att.get("name") or payload["name"]))
+    snippet_html = f'<p><a target="_blank" href="{escape(url)}">{label}</a></p>'
+    snippet_md = f"[{str(att.get('name') or payload['name']).replace('[', '').replace(']', '')}]({url})"
+    out["snippet"] = {"html": snippet_html, "markdown": snippet_md}
+    if insert != "none":
+        out.update(await _insert(page_id, snippet_html, snippet_md, insert, f"Attached {payload['name']}", "Attachment"))
+    return out
+
+
+@mcp.tool()
+async def update_attachment(
+    id: Annotated[int, Field(description="Attachment id.")],
+    name: Annotated[str | None, Field(description="New display name.", min_length=1, max_length=255)] = None,
+    text: Annotated[str | None, Field(description="Replace the file — " + _SOURCE_DESC + "text: new content as UTF-8 text.")] = None,
+    content_base64: Annotated[str | None, Field(description="Replace the file — content_base64: new file as base64 (small files only).")] = None,
+    path: Annotated[str | None, Field(description="Replace the file — path: a file in BOOKSTACK_UPLOAD_DIR.")] = None,
+    filename: Annotated[str | None, Field(description="File name with extension for text/content_base64 (defaults to the file's name for path).", max_length=255)] = None,
+    link: Annotated[str | None, Field(description="Turn it into (or change) a link attachment with this URL.", min_length=1, max_length=2000)] = None,
+    move_to_page_id: Annotated[int | None, Field(description="Move the attachment to another page.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Rename, replace, re-link or move an attachment (WRITE — requires BOOKSTACK_ALLOW_WRITE).
+
+    PUTs /api/attachments/{id} (a new file goes as multipart POST with _method=PUT). A new file
+    replaces the old one for good (BookStack keeps no attachment history); the name stays unless you
+    give one.
+    """
+    _require_write()
+    client = _get_client()
+    has_file = any(x is not None for x in (text, content_base64, path))
+    if has_file and link is not None:
+        raise ValueError("Give a new file or a new link, not both.")
+    listed = await client.get("attachments", params={"filter[id]": id, "count": 1})
+    rows = listed.get("data") if isinstance(listed, dict) else None
+    if not rows:
+        raise ValueError(f"No attachment {id} (or no permission to see it).")
+    current = rows[0]
+    payload = _fields(name=name, link=link.strip() if link else None, uploaded_to=move_to_page_id)
+    change: dict[str, Any] = {"id": id, **payload}
+    if has_file:
+        data, fname = _file_source(text, content_base64, path, filename)
+        payload.setdefault("name", current.get("name"))  # BookStack would rename it to the file name
+        change.update(_file_change(data, fname))
+    if not has_file and not payload:
+        raise ValueError("Nothing to update: give name, a new file, link or move_to_page_id.")
+    parts = [f"{k}={v}" for k, v in _fields(name=name, link=payload.get("link"), page=move_to_page_id).items()]
+    if has_file:
+        parts.append(f"new file {fname} ({len(data)} bytes)")
+    summary = f"Update attachment {id} '{current.get('name')}' on page {current.get('uploaded_to')}: {', '.join(parts)}."
+    if preview := _confirm("update_attachment", change, summary, confirm):
+        return preview
+    if has_file:
+        att = await client.post_form(
+            f"attachments/{id}", data={"_method": "PUT", **{k: str(v) for k, v in payload.items()}},
+            files={"file": (fname, data, _ctype(fname))},
+        )
+    else:
+        att = await client.put(f"attachments/{id}", json=payload)
+    out = _pick(att, _ATTACHMENT_WRITE_FIELDS)
+    out["url"] = f"{client.settings.base_url}/attachments/{id}"
+    return out
+
+
+def _image_source(content_base64: str | None, path: str | None, filename: str | None) -> tuple[bytes, str]:
+    data, fname = _file_source(None, content_base64, path, filename)
+    if _ext(fname) not in _IMAGE_EXTENSIONS:
+        raise ValueError(f"BookStack images must be one of {', '.join(_IMAGE_EXTENSIONS)}; {fname!r} is not (attach it with upload_attachment instead).")
+    return data, fname
+
+
+@mcp.tool()
+async def upload_image(
+    page_id: Annotated[int, Field(description="The page the image belongs to (and is shown on).")],
+    content_base64: Annotated[str | None, Field(description="Image source — give content_base64 or path. content_base64: the image as base64 (or a data: URL). Only for small images — large ones cost a lot of context; use path.")] = None,
+    path: Annotated[str | None, Field(description="Image source: a file in the server's BOOKSTACK_UPLOAD_DIR drop folder, e.g. 'screens/rack.png'.")] = None,
+    filename: Annotated[str | None, Field(description="File name with extension (png, jpg, jpeg, gif, webp, avif). Required for content_base64.", max_length=255)] = None,
+    name: Annotated[str | None, Field(description="Image name / alt text. Defaults to the file name.", min_length=1, max_length=180)] = None,
+    insert: Annotated[str, Field(description="Where to show it on the page: 'end', 'start', or 'none' (gallery upload only; place the returned snippet yourself with update_page).")] = "end",
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Upload an image to a page's gallery and show it on the page (WRITE — requires BOOKSTACK_ALLOW_WRITE).
+
+    POSTs /api/image-gallery (type=gallery) and inserts BookStack's own snippet (a linked, scaled
+    display image) at the start or end of the page — a new page revision. Needs the 'image-create-all'
+    role permission plus edit rights on the page.
+    """
+    _require_write()
+    _check_position(insert)
+    data, fname = _image_source(content_base64, path, filename)
+    label = (name or fname).strip()
+    change = {"page_id": page_id, "name": label, "insert": insert, **_file_change(data, fname)}
+    where = "gallery only, not placed on the page" if insert == "none" else f"shown at the {insert} of page {page_id}"
+    if preview := _confirm("upload_image", change, f"Upload image {fname} ({len(data)} bytes) as '{label}', {where}.", confirm):
+        return preview
+    image = await _get_client().post_form(
+        "image-gallery",
+        data={"type": "gallery", "uploaded_to": str(page_id), "name": label},
+        files={"image": (fname, data, _ctype(fname))},
+    )
+    snippet = image.get("content") or {}
+    url = escape(str(image.get("url")))
+    snippet_html = snippet.get("html") or f'<a href="{url}" target="_blank"><img src="{url}" alt="{escape(label)}"></a>'
+    snippet_md = snippet.get("markdown") or f"![{label.replace('[', '').replace(']', '')}]({image.get('url')})"
+    out: dict[str, Any] = {"image": _pick(image, _IMAGE_FIELDS), "snippet": {"html": snippet_html, "markdown": snippet_md}}
+    if insert != "none":
+        out.update(await _insert(page_id, f"<p>{snippet_html}</p>", snippet_md, insert, f"Added image {label}", "Image"))
+    return out
+
+
+@mcp.tool()
+async def update_image(
+    id: Annotated[int, Field(description="Image id (see list_images).")],
+    content_base64: Annotated[str | None, Field(description="Replace the picture — content_base64: the new image as base64 (small images only).")] = None,
+    path: Annotated[str | None, Field(description="Replace the picture — path: a file in BOOKSTACK_UPLOAD_DIR.")] = None,
+    filename: Annotated[str | None, Field(description="File name with extension for content_base64; must have the same type as the current image.", max_length=255)] = None,
+    name: Annotated[str | None, Field(description="New image name.", min_length=1, max_length=180)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Rename a gallery image or replace its picture in place (WRITE — requires BOOKSTACK_ALLOW_WRITE).
+
+    PUTs /api/image-gallery/{id} (a new picture goes as multipart POST with _method=PUT). The URL
+    stays the same, so every page showing it shows the new picture; the old one is not kept.
+    BookStack only accepts a replacement of the same type (png for png, …). Drawings: update_drawing.
+    """
+    _require_write()
+    client = _get_client()
+    meta = await client.get(f"image-gallery/{id}")
+    if meta.get("type") == "drawio":
+        raise ValueError(f"Image {id} is a draw.io drawing; use update_drawing to change it.")
+    has_file = content_base64 is not None or path is not None
+    if not has_file and name is None:
+        raise ValueError("Nothing to update: give a new picture (content_base64 or path) and/or name.")
+    change: dict[str, Any] = {"id": id, "name": name}
+    summary = f"Update image {id} '{meta.get('name')}' (page {meta.get('uploaded_to')})"
+    if has_file:
+        data, fname = _image_source(content_base64, path, filename)
+        current_ext = _ext(str(meta.get("path") or meta.get("url") or ""))
+        if current_ext and _ext(fname) != current_ext:
+            raise ValueError(f"Image {id} is a .{current_ext}; BookStack only replaces it with another .{current_ext}.")
+        change.update(_file_change(data, fname))
+        summary += f": new picture {fname} ({len(data)} bytes)"
+    summary += f", rename to '{name}'." if name else "."
+    if preview := _confirm("update_image", change, summary, confirm):
+        return preview
+    if has_file:
+        image = await client.post_form(
+            f"image-gallery/{id}", data=_fields(_method="PUT", name=name), files={"image": (fname, data, _ctype(fname))}
+        )
+    else:
+        image = await client.put(f"image-gallery/{id}", json={"name": name})
+    return _pick(image, _IMAGE_FIELDS)
 
 
 def main() -> None:

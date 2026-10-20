@@ -49,7 +49,21 @@ def kind_of(data: bytes, content_type: str, filename: str = "") -> str:
         return "eml"
     if ctype.startswith(TEXT_TYPES) or name.endswith((".log", ".txt", ".csv", ".json", ".xml", ".yml", ".yaml", ".ini", ".conf")):
         return "text"
+    if _looks_like_text(data):  # scripts, markdown, configs with no or a generic content type
+        return "text"
     return "binary"
+
+
+def _looks_like_text(data: bytes) -> bool:
+    """UTF-8 without NUL bytes in the first 8 KB (a cut multi-byte char at the end is fine)."""
+    head = data[:8192]
+    if not head or b"\x00" in head:
+        return False
+    try:
+        head.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return len(head) == 8192 and exc.start >= len(head) - 3
+    return True
 
 
 def read(
