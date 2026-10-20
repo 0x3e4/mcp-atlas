@@ -3,8 +3,9 @@
 A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
 Claude Code) to a **PRTG Network Monitor** (Paessler) server through its HTTP API. Ask about your
 monitoring in natural language — sensors and their state, devices/groups/probes, channels, the log,
-server/system health, and historic data — and, opt-in, **pause/resume objects, acknowledge alarms
-and trigger a scan**.
+server/system health, and historic data — and, opt-in, **pause/resume objects, acknowledge alarms,
+trigger a scan, rename and edit objects (tags, priority, comments, location, host, interval), set
+channel limits, clone, move and add devices/groups, and run auto-discovery**.
 
 - One shared `httpx.AsyncClient`; **API-token** auth (`Authorization: Bearer` + `apitoken`), with a
   legacy **username + passhash** fallback.
@@ -27,6 +28,7 @@ and trigger a scan**.
 | `system_health()` | System health metrics (CPU / memory / disk / probe health). |
 | `list_messages(sensor_id?, status?, limit?, full?)` | Log / event messages, newest first. |
 | `historic_data(sensor_id, start, end, avg?, limit?)` | Historic channel data (dates `yyyy-mm-dd-hh-mm-ss`). |
+| `get_object_property(object_id, property, channel_id?)` | One raw setting of an object or channel (`getobjectproperty.htm`), e.g. its own `tags`, `interval`, `host`, `limitmaxerror`. |
 | `prtg_get(endpoint, params?, as_text?)` | Escape hatch: raw read-only GET against any `/api/...` endpoint. |
 
 Results are trimmed to useful columns by default; pass `full=true` for PRTG's default columns, and
@@ -46,8 +48,23 @@ error block in the body) is reported as an error, never as success.
 | `resume_object(object_id)` | Resume a manually paused object (`pause.htm?action=1`). |
 | `acknowledge_alarm(sensor_id, message?, duration_minutes?)` | Acknowledge a Down sensor (`acknowledgealarm.htm`) → Down (Acknowledged), indefinitely or for N minutes. |
 | `scan_now(object_id)` | Scan a sensor now, or every sensor below a device/group/probe (`scannow.htm`). |
+| `rename_object(object_id, name)` | Rename a group/device/sensor (`rename.htm`). |
+| `update_object(object_id, tags? \| add_tags?/remove_tags?, priority?, comments?, location?, host?, interval_seconds?)` | Edit settings, one `setobjectproperty.htm` call per field (priority via `setpriority.htm`). `add_tags`/`remove_tags` read the object's **own** tags first and leave inherited ones alone. A new interval also switches off interval inheritance (`intervalgroup_=0`). |
+| `set_channel_limits(sensor_id, channel_id, upper_error?, upper_warning?, lower_warning?, lower_error?, error_message?, warning_message?, enabled?)` | Channel warning/error limits (`setobjectproperty.htm?subtype=channel&subid=`); limits are written before `limitmode`. |
+| `clone_object(object_id, name, target_id, host?, resume?)` | Clone a group/device/sensor (`duplicateobject.htm`) — PRTG's supported way to add monitoring. Returns `new_id`; the copy starts paused unless `resume=true`. |
+| `move_object(object_id, target_id?, position?)` | Move a group/device under another group/probe (`/moveobjectnow.htm`) and/or reorder it `up`/`down`/`top`/`bottom` (`setposition.htm`). |
+| `add_group(parent_id, name, tags?)` | Create an empty group (`/addgroup2.htm`). Returns `new_id`. |
+| `add_device(group_id, name, host, ipv6?, tags?, discovery?)` | Create a device (`/adddevice2.htm`), with auto-discovery `none`/`standard`/`detailed`. Returns `new_id`. |
+| `discover_now(object_id, templates?)` | Run auto-discovery on a group/device now (`discovernow.htm`), optionally with device templates. |
 
 PRTG applies these asynchronously; check the result with `get_sensor` / `list_sensors` afterwards.
+A tool that sends several calls (`update_object`, `set_channel_limits`) stops at the first failure
+and says which fields were already applied.
+
+`moveobjectnow.htm`, `adddevice2.htm` and `addgroup2.htm` are not in Paessler's API manual (they sit
+outside `/api`, are what PRTG's own forms use and are what PrtgAPI calls); Paessler recommends
+`clone_object` for adding objects. They are untested against a live PRTG here, so try them on a test
+group first. There is **no delete tool**, by design.
 
 **Confirmation before every write** (`PRTG_CONFIRM_WRITE`, default `true`): a write tool's first
 call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
@@ -223,14 +240,19 @@ With `PRTG_ALLOW_WRITE=true` you can also:
 - "Resume device 2040."
 - "Acknowledge the alarm on sensor 2143: 'on it, disk cleanup running'."
 - "Scan sensor 2143 now and tell me whether it's back up."
+- "Clone device 2040 as web-02 with host 10.0.0.11 into group 50 and resume it."
+- "Add the tags `web` and `prod` to device 2040 and set its priority to 4."
+- "Set the upper warning limit of channel 0 on sensor 2143 to 80 and the error limit to 90."
+- "Move group 70 under probe 1 and put it on top."
 
 ## Notes & scope
 
 - **Writes are opt-in.** Reads are always available; the write tools refuse unless
   `PRTG_ALLOW_WRITE=true` and the key/user has write access on the objects. Leave the flag unset for
-  read-only. All writes are reversible (pause ↔ resume; an acknowledgement ends when the sensor
-  changes state). There are no delete/edit-settings tools, and `prtg_get` refuses state-changing
-  endpoints (`pause*`, `set*`, `delete*`, `add*`, `duplicate*`, …).
+  read-only. Writes can be undone by another write (pause ↔ resume, rename/edit back, move back; a
+  clone or new device/group would have to be deleted in the PRTG UI). There are no delete tools, and
+  `prtg_get` refuses state-changing endpoints (`pause*`, `set*`, `delete*`, `add*`, `duplicate*`,
+  `rename*`, `move*`, `discover*`, …).
 - **`status_raw` codes:** 1/2 = Unknown/Collecting, 3 = Up, 4 = Warning, 5 = Down, 7-12 = Paused
   (user/dependency/schedule/license), 10 = Unusual, 13 = DownAcknowledged, 14 = DownPartial.
 - **Large payloads:** `historic_data` (use a non-zero `avg` and a bounded date range — PRTG caps raw

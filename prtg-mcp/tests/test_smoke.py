@@ -26,14 +26,26 @@ EXPECTED_TOOLS = {
     "list_messages",
     "historic_data",
     "prtg_get",
+    "get_object_property",
     # write tools (always registered; gated at call time by PRTG_ALLOW_WRITE)
     "pause_object",
     "resume_object",
     "acknowledge_alarm",
     "scan_now",
+    "rename_object",
+    "update_object",
+    "set_channel_limits",
+    "clone_object",
+    "move_object",
+    "add_group",
+    "add_device",
+    "discover_now",
 }
 
-WRITE_TOOLS = {"pause_object", "resume_object", "acknowledge_alarm", "scan_now"}
+WRITE_TOOLS = {
+    "pause_object", "resume_object", "acknowledge_alarm", "scan_now", "rename_object", "update_object",
+    "set_channel_limits", "clone_object", "move_object", "add_group", "add_device", "discover_now",
+}
 
 _BASE = {"PRTG_BASE_URL": "https://prtg.test.corp", "PRTG_API_TOKEN": "tok"}
 
@@ -127,6 +139,8 @@ def test_write_tools_refuse_without_allow_write():
             asyncio.run(server.pause_object(2040))
         with pytest.raises(ValueError, match="PRTG_ALLOW_WRITE"):
             asyncio.run(server.acknowledge_alarm(2143, message="on it"))
+        with pytest.raises(ValueError, match="PRTG_ALLOW_WRITE"):
+            asyncio.run(server.clone_object(2040, "web-02", 50, host="10.0.0.11"))
     finally:
         server._client = None
 
@@ -135,7 +149,8 @@ def test_prtg_get_refuses_state_changing_endpoints():
     server._client = server.PrtgClient(Settings.from_env(_BASE))
     try:
         for ep in ("pause.htm", "/api/acknowledgealarm.htm", "setobjectproperty.htm", "deleteobject.htm",
-                   "https://prtg.test.corp/api/scannow.htm"):
+                   "https://prtg.test.corp/api/scannow.htm", "duplicateobject.htm", "rename.htm",
+                   "https://prtg.test.corp/moveobjectnow.htm", "adddevice2.htm", "discovernow.htm"):
             with pytest.raises(ValueError, match="read-only"):
                 asyncio.run(server.prtg_get(ep, params={"id": 1}))
     finally:
@@ -237,3 +252,179 @@ def test_writes_need_a_matching_confirm_code():
     finally:
         server._client = None
     assert sent == ["/api/pauseobjectfor.htm"]
+
+
+def _prop(value: str) -> httpx.Response:
+    return httpx.Response(200, text=f"<?xml version='1.0'?><prtg><version>24.1</version><result>{value}</result></prtg>")
+
+
+def test_get_object_property_reads_the_raw_value():
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        assert request.url.path == "/api/getobjectproperty.htm"
+        return _prop("linux web &amp; prod")
+
+    server._client = _write_client(handler)
+    try:
+        out = asyncio.run(server.get_object_property(2040, "tags_"))
+        assert out == {"object_id": 2040, "property": "tags", "value": "linux web & prod"}
+        out = asyncio.run(server.get_object_property(2143, "limitmaxerror", channel_id=2))
+        assert out["channel_id"] == 2
+    finally:
+        server._client = None
+    assert seen[0] == {"id": "2040", "name": "tags", "show": "nohtmlencode", "apitoken": "tok"}
+    assert seen[1]["subtype"] == "channel" and seen[1]["subid"] == "2"
+
+
+def test_new_write_requests_match_the_prtg_api():
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        params.pop("apitoken")
+        seen.append((request.url.path, params))
+        if request.url.path == "/api/getobjectproperty.htm":
+            return _prop("linux old")
+        if request.url.path == "/api/duplicateobject.htm":
+            return httpx.Response(302, headers={"location": "/device.htm?id=4711&tabid=1"})
+        if request.url.path in ("/api/rename.htm", "/moveobjectnow.htm", "/api/setposition.htm"):
+            return httpx.Response(302, headers={"location": "/device.htm?id=2040"})
+        return httpx.Response(200, text="<HTML>OK</HTML>")
+
+    server._client = _write_client(handler)
+
+    async def calls():
+        await server.rename_object(2040, " web-01 ")
+        out = await server.update_object(2040, add_tags=["web", "prod"], remove_tags=["old"], priority=4,
+                                         location="Room 1", interval_seconds=300)
+        assert out["ok"] is True and len(out["applied"]) == 5
+        await server.set_channel_limits(2143, 0, upper_error=90, upper_warning=80.5, enabled=True)
+        clone = await server.clone_object(2040, "web-02", 50, host="10.0.0.11", resume=True)
+        assert clone["new_id"] == 4711 and clone["paused"] is False
+        await server.move_object(2040, target_id=60, position="top")
+        await server.discover_now(2040, templates=["Linux SNMP.odt"])
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None
+
+    assert seen == [
+        ("/api/rename.htm", {"id": "2040", "value": "web-01"}),
+        ("/api/getobjectproperty.htm", {"id": "2040", "name": "tags", "show": "nohtmlencode"}),
+        ("/api/setobjectproperty.htm", {"id": "2040", "name": "tags", "value": "linux web prod"}),
+        ("/api/setpriority.htm", {"id": "2040", "prio": "4"}),
+        ("/api/setobjectproperty.htm", {"id": "2040", "name": "location", "value": "Room 1"}),
+        ("/api/setobjectproperty.htm", {"id": "2040", "name": "intervalgroup_", "value": "0"}),
+        ("/api/setobjectproperty.htm", {"id": "2040", "name": "interval", "value": "300|5 minutes"}),
+        ("/api/setobjectproperty.htm", {"id": "2143", "subtype": "channel", "subid": "0", "name": "limitmaxerror", "value": "90"}),
+        ("/api/setobjectproperty.htm", {"id": "2143", "subtype": "channel", "subid": "0", "name": "limitmaxwarning", "value": "80.5"}),
+        ("/api/setobjectproperty.htm", {"id": "2143", "subtype": "channel", "subid": "0", "name": "limitmode", "value": "1"}),
+        ("/api/duplicateobject.htm", {"id": "2040", "name": "web-02", "targetid": "50", "host": "10.0.0.11"}),
+        ("/api/pause.htm", {"id": "4711", "action": "1"}),
+        ("/moveobjectnow.htm", {"id": "2040", "targetid": "60"}),
+        ("/api/setposition.htm", {"id": "2040", "newpos": "top"}),
+        ("/api/discovernow.htm", {"id": "2040", "template": '"Linux SNMP.odt"'}),
+    ]
+
+
+def test_interval_values():
+    assert server._interval(30) == "30|30 seconds"
+    assert server._interval(60) == "60|60 seconds"
+    assert server._interval(90) == "90|90 seconds"
+    assert server._interval(600) == "600|10 minutes"
+    assert server._interval(3600) == "3600|1 hour"
+    assert server._interval(86400) == "86400|24 hours"
+
+
+def test_add_device_finds_the_new_id():
+    tables = [
+        {"devices": [{"objid": 3001, "name": "web-03"}]},
+        {"devices": [{"objid": 3001, "name": "web-03"}, {"objid": 3050, "name": "web-03"}, {"objid": 3051, "name": "web-03b"}]},
+    ]
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        params.pop("apitoken")
+        seen.append((request.url.path, params))
+        if request.url.path == "/api/table.json":
+            return httpx.Response(200, json=tables.pop(0))
+        return httpx.Response(302, headers={"location": "/device.htm?id=50"})
+
+    server._client = _write_client(handler)
+    try:
+        out = asyncio.run(server.add_device(50, "web-03", "10.0.0.13", tags=["web"]))
+    finally:
+        server._client = None
+    assert out["new_id"] == 3050 and out["endpoint"] == "/adddevice2.htm"
+    assert seen[1] == ("/adddevice2.htm", {"id": "50", "name_": "web-03", "host_": "10.0.0.13", "ipversion_": "0",
+                                           "discoverytype_": "0", "discoveryschedule_": "0", "tags_": "web"})
+    assert seen[0][1]["filter_parentid"] == "50"
+
+
+def test_clone_without_new_id_is_an_error():
+    server._client = _write_client(lambda r: httpx.Response(302, headers={"location": "/api/duplicateobject.htm?id=2040"}))
+    try:
+        with pytest.raises(PrtgError, match="instead of the new object's page"):
+            asyncio.run(server.clone_object(2040, "web-02", 50))
+    finally:
+        server._client = None
+
+
+def test_failed_step_reports_what_was_applied():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.params["name"] if "name" in request.url.params else request.url.path)
+        if len(calls) == 2:
+            return httpx.Response(302, headers={"location": "/error.htm?errormsg=Invalid+value"})
+        return httpx.Response(200, text="OK")
+
+    server._client = _write_client(handler)
+    try:
+        with pytest.raises(PrtgError, match=r"Invalid value.*already applied: tags"):
+            asyncio.run(server.update_object(2040, tags=["a"], comments="x", location="y"))
+    finally:
+        server._client = None
+    assert len(calls) == 2
+
+
+def test_update_object_validation():
+    server._client = _write_client(lambda r: httpx.Response(200, text="OK"))
+    try:
+        with pytest.raises(ValueError, match="not both"):
+            asyncio.run(server.update_object(2040, tags=["a"], add_tags=["b"]))
+        with pytest.raises(ValueError, match="no spaces"):
+            asyncio.run(server.update_object(2040, tags=["two words"]))
+        with pytest.raises(ValueError, match="Nothing to update"):
+            asyncio.run(server.update_object(2040))
+        with pytest.raises(ValueError, match="position"):
+            asyncio.run(server.move_object(2040, position="sideways"))
+    finally:
+        server._client = None
+
+
+def test_tag_merge_is_bound_into_the_confirm_code():
+    current = {"value": "linux"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/getobjectproperty.htm":
+            return _prop(current["value"])
+        return httpx.Response(200, text="OK")
+
+    server._client = _write_client(handler, confirm_write=True)
+
+    async def calls():
+        preview = await server.update_object(2040, add_tags=["web"])
+        assert "Tags become: linux web" in preview["summary"]
+        current["value"] = "linux db"  # someone else changed the tags in between
+        again = await server.update_object(2040, add_tags=["web"], confirm=preview["confirm_code"])
+        assert again["status"] == "confirmation_required" and "linux db web" in again["summary"]
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None

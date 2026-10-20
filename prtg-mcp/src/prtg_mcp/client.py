@@ -10,6 +10,8 @@ Writes go through ``action()``: PRTG's classic API changes state with GET-style 
 (``pause.htm``, ``acknowledgealarm.htm``, ...) that answer with HTML, and report failures as a
 redirect to ``/error.htm?errormsg=...`` (or to the login page on bad credentials) rather than an
 error status. ``action()`` never follows redirects, so such a failure surfaces as ``PrtgError``.
+Calls that answer success with a redirect to the object's page (rename, clone, move, add) pass
+``redirect_ok=True`` and get the target back as ``location``.
 """
 
 from __future__ import annotations
@@ -73,14 +75,20 @@ class PrtgClient:
         url = f"{self._settings.api_base}/{endpoint.lstrip('/')}"
         return await self._request(url, params=params, as_text=as_text)
 
-    async def action(self, endpoint: str, *, params: dict[str, Any]) -> dict[str, Any]:
+    async def action(
+        self, endpoint: str, *, params: dict[str, Any], root: bool = False, redirect_ok: bool = False
+    ) -> dict[str, Any]:
         """Run a state-changing ``/api/<endpoint>`` call (e.g. ``pause.htm``) and check it worked.
 
-        Redirects are not followed: ``/error.htm`` → the PRTG error message, a login page → auth
-        error, anything else → error (the outcome is unknown). A 200 whose body is a PRTG error
-        block or the login page is also an error. Returns the status and a short body snippet.
+        ``root=True`` calls ``<base>/<endpoint>`` instead (the undocumented ``moveobjectnow.htm``,
+        ``adddevice2.htm`` and ``addgroup2.htm`` live outside ``/api``). Redirects are not followed:
+        ``/error.htm`` → the PRTG error message, a login page → auth error; any other redirect is the
+        success answer when ``redirect_ok`` (returned as ``location``), else an error (the outcome is
+        unknown). A 200 whose body is a PRTG error block or the login page is also an error.
+        Returns the status and a short body snippet.
         """
-        url = f"{self._settings.api_base}/{endpoint.lstrip('/')}"
+        base = self._settings.base_url if root else self._settings.api_base
+        url = f"{base}/{endpoint.lstrip('/')}"
         client = await self._http()
         try:
             resp = await client.get(
@@ -90,7 +98,10 @@ class PrtgClient:
             raise PrtgError(f"Network error calling PRTG {url}: {exc}") from exc
 
         if resp.is_redirect:
-            raise PrtgError(_redirect_error(resp), status=resp.status_code)
+            failure = _redirect_failure(resp)
+            if redirect_ok and failure is None:
+                return {"http_status": resp.status_code, "location": _location(resp)}
+            raise PrtgError(failure or _redirect_error(resp), status=resp.status_code)
         if resp.status_code >= 400:
             raise PrtgError(_format_error(resp.status_code, resp), status=resp.status_code)
         body = resp.text or ""
@@ -117,7 +128,7 @@ class PrtgClient:
         if name.startswith(_ACTION_PREFIXES):
             raise ValueError(
                 f"prtg_get is read-only and refuses state-changing endpoints like {name!r}; use the "
-                "dedicated write tools (pause_object, resume_object, acknowledge_alarm, scan_now)."
+                "dedicated write tools (pause_object, rename_object, update_object, clone_object, ...)."
             )
         return await self._request(url, params=params, as_text=as_text)
 
@@ -159,16 +170,31 @@ def _looks_like_login(body: str) -> bool:
     return "/public/login.htm" in low or 'id="loginform"' in low or 'name="loginform"' in low
 
 
-def _redirect_error(resp: httpx.Response) -> str:
-    """Explain a redirect from a PRTG action call (PRTG signals failures this way)."""
-    location = urljoin(str(resp.request.url), resp.headers.get("location", ""))
-    parts = urlsplit(location)
+def _location(resp: httpx.Response) -> str:
+    """A redirect's target as path + query (e.g. ``/sensor.htm?id=1234``)."""
+    parts = urlsplit(urljoin(str(resp.request.url), resp.headers.get("location", "")))
+    return parts.path + (f"?{parts.query}" if parts.query else "")
+
+
+def _redirect_failure(resp: httpx.Response) -> str | None:
+    """The error behind a redirect to ``/error.htm`` or the login page; None for any other target."""
+    parts = urlsplit(urljoin(str(resp.request.url), resp.headers.get("location", "")))
     path = parts.path.lower()
     if path.endswith("/error.htm"):
         msg = (parse_qs(parts.query).get("errormsg") or [""])[0]
         return f"PRTG refused the request: {_strip_html(msg) or 'no error message given'}"
     if "login" in path:
         return _AUTH_MSG
+    return None
+
+
+def _redirect_error(resp: httpx.Response) -> str:
+    """Explain a redirect from a PRTG action call (PRTG signals failures this way)."""
+    failure = _redirect_failure(resp)
+    if failure:
+        return failure
+    location = urljoin(str(resp.request.url), resp.headers.get("location", ""))
+    parts = urlsplit(location)
     return (
         f"PRTG answered with an unexpected redirect (HTTP {resp.status_code} to {parts.path or location!r}); "
         "the action may not have run — check the object's state."
