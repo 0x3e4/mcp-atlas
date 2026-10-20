@@ -15,23 +15,27 @@ The regex/host/plan logic lives in ``waf.py``.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import hashlib
 import hmac
+import inspect
 import json
 import re
 import secrets
 import sys
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import Field
+from pydantic import Field, validate_call
 
 from . import bot, waf
 from .client import NitroClient, NitroError
-from .config import ConfigError, Settings
+from .config import DEFAULT_INSTANCE, ConfigError, load_instances
 
 mcp = FastMCP(
     "netscaler-mcp",
@@ -40,19 +44,122 @@ mcp = FastMCP(
         "save_config) need the user's confirmation: a preview (dry_run=true, or a first dry_run=false call) "
         "changes nothing and returns a confirm_code. Show the user a short overview of what will change, "
         "end with 'Confirm it?', and only after they say yes repeat the call with dry_run=false and "
-        "confirm=<code>."
+        "confirm=<code>. When the user wants more than one change, put them all into one apply_batch call "
+        "(optionally save=true) so they get one overview and one confirmation. Several NetScaler appliances may be configured (list_instances): every tool takes "
+        "instance=<name>; read tools also accept instance='all' to run on each one, and compare_instances "
+        "diffs configuration (e.g. GSLB) between them. Writes go to one named instance at a time."
     ),
 )
 
-# Lazily-built shared client so the module imports without credentials (e.g. for tests).
-_client: NitroClient | None = None
+# Lazily-built clients, one per configured appliance, so the module imports without credentials (tests).
+_clients: dict[str, NitroClient] = {}
+_default_instance = DEFAULT_INSTANCE
+# The instance the running tool call targets; set by _tool for the duration of one call.
+_instance: ContextVar[str | None] = ContextVar("netscaler_instance", default=None)
+_ALL_INSTANCES = ("all", "*")
+
+
+def _load_clients() -> dict[str, NitroClient]:
+    global _clients, _default_instance
+    if not _clients:
+        settings, _default_instance = load_instances()
+        _clients = {name: NitroClient(s) for name, s in settings.items()}
+    return _clients
 
 
 def _get_client() -> NitroClient:
-    global _client
-    if _client is None:
-        _client = NitroClient(Settings.from_env())
-    return _client
+    """The client for the instance the current tool call targets (the default one outside a call)."""
+    return _load_clients()[_instance.get() or _default_instance]
+
+
+def _resolve_instance(instance: str | None, *, write: bool) -> str:
+    """Validate a tool's ``instance`` argument; omitted means the caller's instance, else the default."""
+    clients = _load_clients()
+    name = (instance or "").strip().lower()
+    if not name:
+        current = _instance.get()
+        if current:
+            return current
+        if write and len(clients) > 1:
+            raise ValueError(
+                f"Several NetScaler instances are configured ({', '.join(clients)}): write tools need an "
+                "explicit instance=<name>."
+            )
+        return _default_instance
+    if name not in clients:
+        raise ValueError(f"Unknown NetScaler instance {instance!r}; configured: {', '.join(clients)}.")
+    return name
+
+
+_READ_INSTANCE_DESC = (
+    "NetScaler instance to query (names from list_instances); omit for the default one. 'all' runs this "
+    "read on every configured instance and returns the results keyed by instance."
+)
+_WRITE_INSTANCE_DESC = (
+    "NetScaler instance to change (names from list_instances). Required when several are configured; "
+    "a write always goes to exactly one instance."
+)
+
+
+async def _on_each(call: Any, names: list[str] | None = None) -> dict[str, Any]:
+    """Run ``call()`` once per instance, concurrently; a failing instance reports its error instead."""
+    async def one(name: str) -> tuple[str, Any]:
+        token = _instance.set(name)
+        try:
+            return name, await call()
+        except (NitroError, ValueError) as exc:
+            return name, {"error": str(exc)}
+        finally:
+            _instance.reset(token)
+
+    results = await asyncio.gather(*(one(n) for n in names or list(_load_clients())))
+    return dict(results)
+
+
+def _tool(fn: Any) -> Any:
+    """``@mcp.tool()`` plus an ``instance`` parameter that picks the appliance for this call.
+
+    Read tools also accept ``instance='all'`` (results keyed by instance); write tools — those taking a
+    ``confirm`` code — refuse it and, with several instances configured, need the instance named.
+    """
+    sig = inspect.signature(fn, eval_str=True)
+    write = "confirm" in sig.parameters
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, instance: str | None = None, **kwargs: Any) -> Any:
+        if (instance or "").strip().lower() in _ALL_INSTANCES:
+            if write:
+                raise ValueError("instance='all' is for reads; a write goes to one named instance at a time.")
+            return {"instances": await _on_each(lambda: fn(*args, **kwargs))}
+        token = _instance.set(_resolve_instance(instance, write=write))
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _instance.reset(token)
+
+    param = inspect.Parameter(
+        "instance",
+        inspect.Parameter.KEYWORD_ONLY,
+        default=None,
+        annotation=Annotated[
+            str | None, Field(description=_WRITE_INSTANCE_DESC if write else _READ_INSTANCE_DESC)
+        ],
+    )
+    wrapper.__signature__ = sig.replace(parameters=[*sig.parameters.values(), param])
+    mcp.tool()(wrapper)
+    if write:
+        # apply_batch calls write tools as steps, with the same argument validation the MCP call gets.
+        _WRITE_TOOLS[fn.__name__] = validate_call(fn)
+    return wrapper
+
+
+# Write tools by name (unwrapped, argument-validated): the steps apply_batch may run.
+_WRITE_TOOLS: dict[str, Any] = {}
+
+
+def _instance_note() -> dict[str, str]:
+    """``{"instance": name}`` for results that should say which appliance they touch (multi-instance only)."""
+    return {"instance": _instance.get() or _default_instance} if len(_load_clients()) > 1 else {}
 
 
 def _require_write() -> None:
@@ -70,23 +177,37 @@ _CONFIRM_DESC = (
     "Confirm code from this tool's preview. Leave empty on the first call; pass it only after the user "
     "has seen the overview and confirmed."
 )
+# Set by apply_batch around its steps: {"record": [...]} collects each step's plan during the preview
+# pass; {"approved": [...]} then lets exactly those plans through, once each, without asking again.
+_batch: ContextVar[dict[str, list[str]] | None] = ContextVar("netscaler_batch", default=None)
 
 
 def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
     """Return a preview the agent must confirm with the user, or None when the write may run.
 
     Writes run straight away when NETSCALER_CONFIRM_WRITE=false, or when ``code`` matches this exact
-    tool + change (so what runs is what the user saw).
+    tool + change on this instance (so what runs is what the user saw, where they saw it). Inside an
+    apply_batch, a step runs when its plan is one the user confirmed with the batch.
     """
     if not _get_client().settings.confirm_write:
         return None
-    raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
+    instance = _instance.get() or _default_instance
+    entry = json.dumps([tool, instance, change], sort_keys=True, default=str)
+    batch = _batch.get()
+    if batch is not None:
+        if "record" in batch:
+            batch["record"].append(entry)
+        elif entry in batch["approved"]:
+            batch["approved"].remove(entry)
+            return None
+    raw = entry.encode()
     expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
     if code and hmac.compare_digest(code.strip(), expected):
         return None
     out: dict[str, Any] = {
         "status": "confirmation_required",
         "changed": False,
+        **_instance_note(),
         "summary": summary,
         "change": change,
         "confirm_code": expected,
@@ -132,6 +253,7 @@ def _gate(
     # deploy/discard already use "summary" for their status tally
     preview["change_summary" if "summary" in preview else "summary"] = summary
     preview.update(
+        _instance_note(),
         dry_run=True,
         status=pending["status"],
         confirm_code=code,
@@ -294,7 +416,7 @@ async def _get_list(
 
 # ---- tools: configuration -----------------------------------------------
 
-@mcp.tool()
+@_tool
 async def list_lb_vservers(
     name: Annotated[str | None, Field(description="Exact LB vserver name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max vservers to return.", ge=1, le=500)] = 50,
@@ -308,7 +430,7 @@ async def list_lb_vservers(
     return await _get_list("config", "lbvserver", _LBVSERVER_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def list_cs_vservers(
     name: Annotated[str | None, Field(description="Exact CS vserver name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max vservers to return.", ge=1, le=500)] = 50,
@@ -318,7 +440,7 @@ async def list_cs_vservers(
     return await _get_list("config", "csvserver", _CSVSERVER_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def list_gslb_vservers(
     name: Annotated[str | None, Field(description="Exact GSLB vserver name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max vservers to return.", ge=1, le=500)] = 50,
@@ -331,7 +453,7 @@ async def list_gslb_vservers(
     return await _get_list("config", "gslbvserver", _GSLBVSERVER_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def list_services(
     name: Annotated[str | None, Field(description="Exact service/servicegroup name to fetch one; omit to list all.")] = None,
     servicegroup: Annotated[bool, Field(description="List service GROUPS (servicegroup) instead of individual services.")] = False,
@@ -350,7 +472,7 @@ async def list_services(
     return await _get_list("config", "service", _SERVICE_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def list_servers(
     name: Annotated[str | None, Field(description="Exact server name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max servers to return.", ge=1, le=500)] = 50,
@@ -360,7 +482,7 @@ async def list_servers(
     return await _get_list("config", "server", _SERVER_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def list_certificates(
     expiring_within_days: Annotated[
         int | None,
@@ -394,7 +516,7 @@ async def list_certificates(
     return {"count": len(rows), "sslcertkey": rows}
 
 
-@mcp.tool()
+@_tool
 async def ha_status(
     full: Annotated[bool, Field(description="Return full hanode objects instead of a trimmed summary.")] = False,
 ) -> dict[str, Any]:
@@ -407,7 +529,7 @@ async def ha_status(
     return await _get_list("config", "hanode", _HANODE_FIELDS, full=full)
 
 
-@mcp.tool()
+@_tool
 async def system_health(
     full: Annotated[bool, Field(description="Return the full stats object instead of a trimmed summary.")] = False,
 ) -> dict[str, Any]:
@@ -417,7 +539,7 @@ async def system_health(
     return ns if full else _pick(ns, _NS_STAT_FIELDS)
 
 
-@mcp.tool()
+@_tool
 async def vserver_stats(
     kind: Annotated[str, Field(description="Which vserver type: 'lb', 'cs' or 'gslb'.")] = "lb",
     name: Annotated[str | None, Field(description="Exact vserver name; omit for all of that kind.")] = None,
@@ -441,7 +563,7 @@ async def vserver_stats(
     return await _get_list("stat", resourcetype, fields, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def system_info(
     full: Annotated[bool, Field(description="Return full objects for each section instead of a summary.")] = False,
 ) -> dict[str, Any]:
@@ -471,7 +593,7 @@ async def system_info(
 
 # ---- tools: GSLB --------------------------------------------------------
 
-@mcp.tool()
+@_tool
 async def list_gslb_services(
     name: Annotated[str | None, Field(description="Exact GSLB service name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max services to return.", ge=1, le=500)] = 50,
@@ -481,7 +603,7 @@ async def list_gslb_services(
     return await _get_list("config", "gslbservice", _GSLBSERVICE_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def list_gslb_sites(
     name: Annotated[str | None, Field(description="Exact GSLB site name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max sites to return.", ge=1, le=500)] = 50,
@@ -493,7 +615,7 @@ async def list_gslb_sites(
 
 # ---- tools: DNS ---------------------------------------------------------
 
-@mcp.tool()
+@_tool
 async def list_dns_records(
     record_type: Annotated[str, Field(description="DNS record type: A, AAAA, CNAME, NS, SOA, MX, TXT, SRV or PTR.")] = "A",
     limit: Annotated[int, Field(description="Max records to return.", ge=1, le=500)] = 100,
@@ -510,7 +632,7 @@ async def list_dns_records(
     return await _get_list("config", resourcetype, fields, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def list_dns_zones(
     name: Annotated[str | None, Field(description="Exact zone name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max zones to return.", ge=1, le=500)] = 100,
@@ -520,7 +642,7 @@ async def list_dns_zones(
     return await _get_list("config", "dnszone", _DNSZONE_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def list_dns_nameservers(
     limit: Annotated[int, Field(description="Max name servers to return.", ge=1, le=500)] = 100,
     full: Annotated[bool, Field(description="Return full objects instead of a trimmed summary.")] = False,
@@ -531,7 +653,7 @@ async def list_dns_nameservers(
 
 # ---- tools: Application Firewall (WAF) ----------------------------------
 
-@mcp.tool()
+@_tool
 async def list_waf_profiles(
     name: Annotated[str | None, Field(description="Exact AppFW profile name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max profiles to return.", ge=1, le=500)] = 50,
@@ -541,7 +663,7 @@ async def list_waf_profiles(
     return await _get_list("config", "appfwprofile", _APPFWPROFILE_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def list_waf_policies(
     name: Annotated[str | None, Field(description="Exact AppFW policy name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max policies to return.", ge=1, le=500)] = 50,
@@ -551,7 +673,7 @@ async def list_waf_policies(
     return await _get_list("config", "appfwpolicy", _APPFWPOLICY_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def waf_stats(
     name: Annotated[str | None, Field(description="Exact AppFW policy name; omit for all.")] = None,
     limit: Annotated[int, Field(description="Max policies to return.", ge=1, le=500)] = 100,
@@ -563,7 +685,7 @@ async def waf_stats(
 
 # ---- tools: Bot management ----------------------------------------------
 
-@mcp.tool()
+@_tool
 async def list_bot_profiles(
     name: Annotated[str | None, Field(description="Exact bot profile name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max profiles to return.", ge=1, le=500)] = 50,
@@ -573,7 +695,7 @@ async def list_bot_profiles(
     return await _get_list("config", "botprofile", _BOTPROFILE_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def list_bot_policies(
     name: Annotated[str | None, Field(description="Exact bot policy name to fetch one; omit to list all.")] = None,
     limit: Annotated[int, Field(description="Max policies to return.", ge=1, le=500)] = 50,
@@ -583,7 +705,7 @@ async def list_bot_policies(
     return await _get_list("config", "botpolicy", _BOTPOLICY_FIELDS, name=name, limit=limit, full=full)
 
 
-@mcp.tool()
+@_tool
 async def bot_stats(
     name: Annotated[str | None, Field(description="Exact bot policy name; omit for all.")] = None,
     limit: Annotated[int, Field(description="Max policies to return.", ge=1, le=500)] = 100,
@@ -1055,7 +1177,7 @@ async def _rehost_profile(
     return {"host_replacements": replacements, **out}
 
 
-@mcp.tool()
+@_tool
 async def list_waf_rules(
     profile: Annotated[str, Field(description="AppFw profile name.")],
     rule_type: Annotated[str | None, Field(description="Only this rule type: start_url, deny_url, sql_injection, cross_site_scripting, cmd_injection, field_consistency, cookie_consistency, csrf_tag, field_format, content_type, credit_card, safe_object, trusted_learning_client, xml_dos_url, xml_wsi_url, xml_attachment_url, json_dos_url, json_sql_url, json_xss_url, json_cmd_url. Omit for all.")] = None,
@@ -1072,7 +1194,7 @@ async def list_waf_rules(
     return await _rules_overview(waf.WAF, profile, rule_type, contains, limit)
 
 
-@mcp.tool()
+@_tool
 async def list_waf_learned_rules(
     profile: Annotated[str, Field(description="AppFw profile name.")],
     rule_type: Annotated[str, Field(description="'all' for a per-check overview, or one learned check: start_url, sql_injection, cross_site_scripting, field_consistency, cookie_consistency, field_format, csrf_tag, content_type, credit_card, xml_dos, xml_wsi, xml_attachment (NITRO names like 'startURL' work too).")] = "all",
@@ -1117,7 +1239,7 @@ async def list_waf_learned_rules(
     return out
 
 
-@mcp.tool()
+@_tool
 async def list_waf_urls(
     profile: Annotated[str, Field(description="AppFw profile name.")],
     host: Annotated[str | None, Field(description="Only URLs for this hostname (rules for any host '*' are kept).")] = None,
@@ -1189,7 +1311,7 @@ async def list_waf_urls(
     return out
 
 
-@mcp.tool()
+@_tool
 async def export_waf_profile(
     profile: Annotated[str, Field(description="AppFw profile name.")],
     host_map: Annotated[dict[str, str] | None, Field(description="Rewrite hostnames on the way out, e.g. {\"app.test.corp\": \"app.corp\"}.")] = None,
@@ -1205,7 +1327,7 @@ async def export_waf_profile(
     return await _export_profile(waf.WAF, profile, host_map, save_as)
 
 
-@mcp.tool()
+@_tool
 async def add_waf_rule(
     profile: Annotated[str, Field(description="AppFw profile name; comma-separate several to add the same rule to each.")],
     rule: Annotated[str, Field(description="Preset: allow_url, allow_static, deny_url, allow_sql_field, allow_xss_field, allow_cmd_field, allow_field_consistency, allow_cookie, allow_csrf, allow_content_type, trusted_learning_client — or 'raw' (rule_type + binding_attrs).")],
@@ -1246,7 +1368,7 @@ async def add_waf_rule(
     )
 
 
-@mcp.tool()
+@_tool
 async def remove_waf_rule(
     profile: Annotated[str, Field(description="AppFw profile name.")],
     rule_type: Annotated[str, Field(description="Rule type, as in list_waf_rules (e.g. 'start_url').")],
@@ -1267,7 +1389,7 @@ async def remove_waf_rule(
     )
 
 
-@mcp.tool()
+@_tool
 async def deploy_waf_learned_rules(
     profile: Annotated[str, Field(description="AppFw profile name.")],
     rule_type: Annotated[str, Field(description="Learned check to deploy: start_url, sql_injection, cross_site_scripting, field_consistency, cookie_consistency, field_format, csrf_tag, content_type or credit_card.")],
@@ -1363,7 +1485,7 @@ async def deploy_waf_learned_rules(
     return _answer(results, True)
 
 
-@mcp.tool()
+@_tool
 async def discard_waf_learned_rules(
     profile: Annotated[str, Field(description="AppFw profile name.")],
     rule_type: Annotated[str, Field(description="Learned check: start_url, sql_injection, cross_site_scripting, field_consistency, cookie_consistency, field_format, csrf_tag, content_type or credit_card.")],
@@ -1427,7 +1549,7 @@ async def discard_waf_learned_rules(
     return _answer(True)
 
 
-@mcp.tool()
+@_tool
 async def set_waf_check_actions(
     profile: Annotated[str, Field(description="AppFw profile name.")],
     checks: Annotated[list[str], Field(description="Checks to change, e.g. ['start_url', 'sql_injection', 'cross_site_scripting'], or ['all'] for every check the profile has.")],
@@ -1481,7 +1603,7 @@ async def set_waf_check_actions(
     return out
 
 
-@mcp.tool()
+@_tool
 async def import_waf_profile(
     document: Annotated[dict[str, Any] | str | None, Field(description="An export_waf_profile document (object or JSON string).")] = None,
     file: Annotated[str | None, Field(description="Or a bare file name in NETSCALER_EXPORT_DIR, e.g. 'pr_app-test.json'.")] = None,
@@ -1506,7 +1628,7 @@ async def import_waf_profile(
     )
 
 
-@mcp.tool()
+@_tool
 async def rehost_waf_profile(
     profile: Annotated[str, Field(description="AppFw profile whose rules to switch.")],
     from_host: Annotated[str, Field(description="Hostname in the current rules, e.g. 'app.test.corp' (append ':port' to switch a port as well).")],
@@ -1531,7 +1653,7 @@ async def rehost_waf_profile(
     )
 
 
-@mcp.tool()
+@_tool
 async def save_config(
     confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
@@ -1547,9 +1669,99 @@ async def save_config(
     return {"saved": True}
 
 
+_BATCH_TOOL_KEYS = ("status", "confirm_code", "next", "note", "dry_run")
+
+
+@_tool
+async def apply_batch(
+    changes: Annotated[list[dict[str, Any]], Field(description="The changes in order, each {\"tool\": <write tool>, \"args\": {<that tool's arguments>}}, e.g. [{\"tool\": \"add_waf_rule\", \"args\": {\"profile\": \"pr_app\", \"rule\": \"allow_url\", \"host\": \"app.example.com\", \"path\": \"/api/\"}}, {\"tool\": \"set_waf_check_actions\", \"args\": {\"profile\": \"pr_app\", \"checks\": [\"sql_injection\"], \"add_actions\": [\"block\"]}}]. Any write tool except save_config / apply_batch; leave dry_run, confirm and instance out of args.", min_length=1, max_length=50)],
+    save: Annotated[bool, Field(description="Save the running config (save ns config) once every step applied cleanly.")] = False,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Several changes on one instance with ONE preview and ONE confirmation (WRITE — requires
+    NETSCALER_ALLOW_WRITE).
+
+    Use this whenever the user wants more than one change — several rules, different actions for
+    different checks, bot entries plus detection switches, then save — instead of confirming each write
+    tool separately. Every step is previewed exactly as its own tool would preview it; the single
+    confirm code covers all of them. On apply, steps run in order and stop at the first failure (later
+    steps are reported 'not run', and nothing is saved). A step whose live plan no longer matches the
+    preview — for example because an earlier step in the same batch changed what it acts on — is not
+    applied either.
+    """
+    args = _call_args(locals())
+    steps: list[tuple[str, dict[str, Any]]] = []
+    for i, item in enumerate(changes, 1):
+        name = str(item.get("tool") or "").strip()
+        sub = item.get("args") or {}
+        if name not in _WRITE_TOOLS or name in ("save_config", "apply_batch"):
+            usable = sorted(set(_WRITE_TOOLS) - {"save_config", "apply_batch"})
+            raise ValueError(f"Step {i}: tool must be one of {usable} (save with save=true); got {name!r}.")
+        if not isinstance(sub, dict):
+            raise ValueError(f"Step {i}: args must be an object of {name}'s arguments.")
+        if reserved := sorted(set(sub) & {"dry_run", "confirm", "instance"}):
+            raise ValueError(f"Step {i}: leave {reserved} out of args; apply_batch sets them for every step.")
+        steps.append((name, sub))
+    if not dry_run:
+        _require_write()
+
+    async def run(apply: bool) -> tuple[list[dict[str, Any]], bool]:
+        done: list[dict[str, Any]] = []
+        for i, (name, sub) in enumerate(steps, 1):
+            try:
+                result = await _WRITE_TOOLS[name](**sub, dry_run=not apply)
+            except (NitroError, ValueError) as exc:
+                done.append({"step": i, "tool": name, "error": str(exc)})
+                break
+            if apply and result.get("status") == "confirmation_required":
+                done.append({"step": i, "tool": name, "error": (
+                    "Its live plan differs from the confirmed preview (an earlier step or someone else changed "
+                    "it), so it was not applied. Preview the remaining steps again."
+                ), "plan_now": {k: v for k, v in result.items() if k not in _BATCH_TOOL_KEYS}})
+                break
+            done.append({"step": i, "tool": name, **{k: v for k, v in result.items() if k not in _BATCH_TOOL_KEYS}})
+        done += [{"step": j, "tool": n, "status": "not run"} for j, (n, _) in enumerate(steps, 1) if j > len(done)]
+        return done, all("error" not in s and "status" not in s for s in done)
+
+    batch = {"record": []}
+    token = _batch.set(batch)
+    try:
+        preview_steps, ok = await run(apply=False)
+    finally:
+        _batch.reset(token)
+    if not ok:
+        return {
+            "dry_run": True, **_instance_note(), "steps": preview_steps,
+            "error": "A step failed in the preview; fix it and preview the batch again. Nothing was applied.",
+        }
+    parts = [s.get("change_summary") or s.get("summary") for s in preview_steps]
+    summary = f"{len(steps)} step(s): " + " ".join(p for p in parts if isinstance(p, str))
+    if save:
+        summary += " Then save the running configuration."
+    preview = {"dry_run": dry_run, **_instance_note(), "steps": preview_steps, "save": save}
+    change = {"args": args, "plans": batch["record"]}
+    if not _gate("apply_batch", change, summary, preview, dry_run=dry_run, confirm=confirm,
+                 writes=bool(batch["record"]) or save):
+        return preview
+
+    token = _batch.set({"approved": list(batch["record"])})
+    try:
+        applied, ok = await run(apply=True)
+    finally:
+        _batch.reset(token)
+    out: dict[str, Any] = {"dry_run": False, **_instance_note(), "steps": applied, "saved": False}
+    if save and ok:
+        await _get_client().action("nsconfig", "save")
+        out["saved"] = True
+    elif save:
+        out["note"] = "Not saved because a step failed; the applied steps are live but unsaved (save_config)."
+    return out
+
+
 # ---- tools: Bot management rollout ---------------------------------------
 
-@mcp.tool()
+@_tool
 async def list_bot_rules(
     profile: Annotated[str, Field(description="Bot profile name.")],
     rule_type: Annotated[str | None, Field(description="Only this rule type: allow_list, deny_list, rate_limit, tps, captcha, ip_reputation, log_expression, km_expression, trap_url. Omit for all.")] = None,
@@ -1566,7 +1778,7 @@ async def list_bot_rules(
     return await _rules_overview(bot.BOT, profile, rule_type, contains, limit)
 
 
-@mcp.tool()
+@_tool
 async def list_bot_detections(
     profile: Annotated[str | None, Field(description="Bot profile name; omit for appliance-wide counters only.")] = None,
     full: Annotated[bool, Field(description="Also return the raw stat object (every counter).")] = False,
@@ -1598,7 +1810,7 @@ async def list_bot_detections(
     return out
 
 
-@mcp.tool()
+@_tool
 async def add_bot_rule(
     profile: Annotated[str, Field(description="Bot profile name; comma-separate several to add the same entry to each.")],
     rule: Annotated[str, Field(description="Preset: allow_ip, allow_expression, block_ip, block_expression, rate_limit_url, rate_limit_source_ip, rate_limit_session, rate_limit_geo, tps_source_ip, tps_url, tps_geo, tps_host, captcha, ip_reputation, trap_url, log_expression, km_expression — or 'raw' (rule_type + binding_attrs).")],
@@ -1645,7 +1857,7 @@ async def add_bot_rule(
     )
 
 
-@mcp.tool()
+@_tool
 async def remove_bot_rule(
     profile: Annotated[str, Field(description="Bot profile name.")],
     rule_type: Annotated[str, Field(description="Rule type, as in list_bot_rules (e.g. 'allow_list').")],
@@ -1666,7 +1878,7 @@ async def remove_bot_rule(
     )
 
 
-@mcp.tool()
+@_tool
 async def set_bot_detections(
     profile: Annotated[str, Field(description="Bot profile name.")],
     detections: Annotated[list[str], Field(description="Detections to change: allow_list, deny_list, rate_limit, tps, ip_reputation, device_fingerprint, trap, km_detection, headless_browser, signature_no_user_agent, signature_multiple_user_agent, spoofed_request — or ['all'].")],
@@ -1735,7 +1947,7 @@ async def set_bot_detections(
     return out
 
 
-@mcp.tool()
+@_tool
 async def export_bot_profile(
     profile: Annotated[str, Field(description="Bot profile name.")],
     host_map: Annotated[dict[str, str] | None, Field(description="Rewrite hostnames on the way out, e.g. {\"app.test.corp\": \"app.corp\"} (bot URLs are usually paths, so this often changes nothing).")] = None,
@@ -1750,7 +1962,7 @@ async def export_bot_profile(
     return await _export_profile(bot.BOT, profile, host_map, save_as)
 
 
-@mcp.tool()
+@_tool
 async def import_bot_profile(
     document: Annotated[dict[str, Any] | str | None, Field(description="An export_bot_profile document (object or JSON string).")] = None,
     file: Annotated[str | None, Field(description="Or a bare file name in NETSCALER_EXPORT_DIR, e.g. 'bot_app-test.json'.")] = None,
@@ -1776,7 +1988,7 @@ async def import_bot_profile(
     )
 
 
-@mcp.tool()
+@_tool
 async def rehost_bot_profile(
     profile: Annotated[str, Field(description="Bot profile whose entries to switch.")],
     from_host: Annotated[str, Field(description="Hostname in the current entries, e.g. 'app.test.corp'.")],
@@ -1883,7 +2095,7 @@ async def _enforcement(kind: waf.ProfileKind, profile: str | None, limit: int) -
     return {"policies": rows, "profiles_without_policy": sorted(unused)}
 
 
-@mcp.tool()
+@_tool
 async def waf_violations(
     profile: Annotated[str | None, Field(description="AppFw profile name; omit for appliance-wide counters.")] = None,
     include_zero: Annotated[bool, Field(description="Also list checks that have counted nothing.")] = False,
@@ -1917,7 +2129,7 @@ async def waf_violations(
     return out
 
 
-@mcp.tool()
+@_tool
 async def list_signatures(
     kind: Annotated[str, Field(description="'waf', 'bot' or 'both'.")] = "both",
     full: Annotated[bool, Field(description="Return full objects instead of a trimmed summary.")] = False,
@@ -1949,7 +2161,7 @@ async def list_signatures(
     return out
 
 
-@mcp.tool()
+@_tool
 async def update_signatures(
     kind: Annotated[str, Field(description="'waf' or 'bot'.")],
     name: Annotated[str, Field(description="Signature object name, as listed by list_signatures.")],
@@ -1989,7 +2201,7 @@ async def update_signatures(
     return {"dry_run": False, "kind": features[0], "updated": name}
 
 
-@mcp.tool()
+@_tool
 async def list_enforcement(
     kind: Annotated[str, Field(description="'waf', 'bot' or 'both'.")] = "both",
     profile: Annotated[str | None, Field(description="Only policies that select this profile.")] = None,
@@ -2008,7 +2220,7 @@ async def list_enforcement(
     }
 
 
-@mcp.tool()
+@_tool
 async def recent_security_violations(
     feature: Annotated[str, Field(description="'waf', 'bot' or 'both' — which log lines to keep (APPFW_* / BOT_*).")] = "both",
     contains: Annotated[str | None, Field(description="Only lines containing this (case-insensitive): a URL, profile name or client IP.")] = None,
@@ -2062,6 +2274,226 @@ async def recent_security_violations(
     }
 
 
+# ---- tools: several appliances (GSLB peers, standalone boxes, separate HA pairs) ----
+
+# What identifies the same object on every instance, and which configuration attributes must agree.
+# gslbsite leaves out sitetype: a site is LOCAL on its own appliance and REMOTE everywhere else.
+_COMPARE: dict[str, tuple[str, tuple[str, ...]]] = {
+    "gslbsite": ("sitename", (
+        "siteipaddress", "publicip", "metricexchange", "nwmetricexchange", "sessionexchange",
+        "triggermonitor", "parentsite",
+    )),
+    "gslbvserver": ("name", (
+        "servicetype", "dnsrecordtype", "lbmethod", "backuplbmethod", "persistencetype", "persistenceid",
+        "timeout", "tolerance", "iptype", "state", "considereffectivestate", "mir", "disableprimaryondown",
+        "backupvserver",
+    )),
+    "gslbservice": ("servicename", (
+        "servicetype", "ipaddress", "port", "publicip", "publicport", "sitename", "cnameentry",
+        "servername", "state", "maxclient",
+    )),
+}
+# The identity of a row inside the gslbvserver_binding aggregate, and its comparable attributes.
+_GSLB_BINDING_KEYS = ("servicename", "servicegroupname", "domainname", "policyname")
+_GSLB_BINDING_ATTRS = ("weight", "ttl", "backupip", "cookietimeout", "sitedomainttl", "priority", "gotopriorityexpression")
+# Runtime attributes left out of a generic (non-curated) comparison.
+_VOLATILE = re.compile(r"state|time|ticks|health|hits|count|status|cur|active|total|rate|^_")
+
+
+def _keyed(rows: list[dict[str, Any]], key: str, attrs: tuple[str, ...] | None) -> dict[str, dict[str, Any]]:
+    """Rows by their ``key`` value, reduced to ``attrs`` (or every non-runtime attribute)."""
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row.get(key) is None:
+            continue
+        if attrs is None:
+            out[str(row[key])] = {a: v for a, v in row.items() if a != key and not _VOLATILE.search(a)}
+        else:
+            out[str(row[key])] = {a: row.get(a) for a in attrs}
+    return out
+
+
+def _diff(found: dict[str, dict[str, dict[str, Any]]], limit: int) -> dict[str, Any]:
+    """Compare one resource's keyed objects across instances: what is missing where, and what differs."""
+    names = list(found)
+    keys = sorted(set().union(*found.values()))
+    missing: dict[str, list[str]] = {n: [k for k in keys if k not in found[n]] for n in names}
+    different: list[dict[str, Any]] = []
+    for key in keys:
+        holders = [n for n in names if key in found[n]]
+        if len(holders) < 2:
+            continue
+        delta = {}
+        for attr in sorted(set().union(*(found[n][key] for n in holders))):
+            values = {n: found[n][key].get(attr) for n in holders}
+            if len({json.dumps(v, sort_keys=True, default=str) for v in values.values()}) > 1:
+                delta[attr] = values
+        if delta:
+            different.append({"key": key, "attrs": delta})
+    differ = {d["key"] for d in different}
+    out: dict[str, Any] = {
+        "objects": len(keys),
+        "identical": sum(1 for k in keys if k not in differ and all(k in found[n] for n in names)),
+    }
+    if any(missing.values()):
+        out["missing_on"] = {n: v[:limit] for n, v in missing.items() if v}
+        out["missing_counts"] = {n: len(v) for n, v in missing.items() if v}
+    if different:
+        out["different"] = different[:limit]
+        out["different_count"] = len(different)
+    return out
+
+
+async def _fetch_keyed(
+    resourcetype: str, key: str, attrs: tuple[str, ...] | None, extra: tuple[str, ...] = ()
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """GET a config collection on the current instance; returns (keyed for comparison, raw rows)."""
+    wire = (key, *attrs, *extra) if attrs is not None else None
+    rows = _rows(await _get_client().get("config", resourcetype, attrs=wire), resourcetype)
+    return _keyed(rows, key, attrs), rows
+
+
+async def _gslb_snapshot(limit: int) -> dict[str, Any]:
+    """Everything GSLB on the current instance, keyed for comparison, plus its LOCAL site(s)."""
+    out: dict[str, Any] = {}
+    sites, site_rows = await _fetch_keyed("gslbsite", *_COMPARE["gslbsite"], extra=("sitetype",))
+    out["gslbsite"] = sites
+    out["local_sites"] = sorted(
+        str(r.get("sitename")) for r in site_rows if str(r.get("sitetype", "")).upper() == "LOCAL"
+    )
+    out["gslbvserver"], _ = await _fetch_keyed("gslbvserver", *_COMPARE["gslbvserver"])
+    out["gslbservice"], _ = await _fetch_keyed("gslbservice", *_COMPARE["gslbservice"])
+    # One aggregate GET per vserver returns all of its bindings (services, domains, policies).
+    bindings: dict[str, dict[str, dict[str, Any]]] = {}
+    for vserver in sorted(out["gslbvserver"])[: _clamp(limit, maximum=500)]:
+        agg = _one(await _get_client().get("config", "gslbvserver_binding", resource_name=vserver), "gslbvserver_binding")
+        for btype, rows in agg.items():
+            if not btype.endswith("_binding") or not isinstance(rows, list):
+                continue
+            for row in rows:
+                ident = next((row[k] for k in _GSLB_BINDING_KEYS if row.get(k)), None)
+                if ident is not None:
+                    attrs = {a: row[a] for a in _GSLB_BINDING_ATTRS if a in row}
+                    bindings.setdefault(btype, {})[f"{vserver} -> {ident}"] = attrs
+    out["bindings"] = bindings
+    return out
+
+
+@mcp.tool()
+async def list_instances(
+    probe: Annotated[bool, Field(description="Also contact each instance: firmware version and HA role (one quick read each), and whether it answers at all.")] = False,
+) -> dict[str, Any]:
+    """List the NetScaler appliances this server is configured for, and the default one.
+
+    Every other tool takes instance=<name> (omit it for the default); read tools also take
+    instance='all' to run on every appliance at once. probe=true tells standalone boxes, GSLB peers and
+    HA pairs apart: 'ha_peers' is empty for a standalone appliance. compare_instances diffs
+    configuration between them.
+    """
+    clients = _load_clients()
+    rows: dict[str, dict[str, Any]] = {
+        name: {
+            "url": c.settings.base_origin,
+            "default": name == _default_instance,
+            "auth_mode": c.settings.auth_mode,
+            "allow_write": c.settings.allow_write,
+            "confirm_write": c.settings.confirm_write,
+        }
+        for name, c in clients.items()
+    }
+    if probe:
+        async def probe_one() -> dict[str, Any]:
+            client = _get_client()
+            version = _one(await client.get("config", "nsversion"), "nsversion").get("version")
+            nodes = _rows(await client.get("config", "hanode", attrs=_HANODE_FIELDS), "hanode")
+            local = next((n for n in nodes if str(n.get("id")) == "0"), {})
+            return {
+                "reachable": True,
+                "version": version,
+                "ha_role": local.get("masterstate"),
+                "ha_peers": [n.get("ipaddress") for n in nodes if str(n.get("id")) != "0"],
+            }
+
+        for name, result in (await _on_each(probe_one)).items():
+            rows[name].update({"reachable": False, **result} if "error" in result else result)
+    return {"default": _default_instance, "count": len(rows), "instances": rows}
+
+
+@mcp.tool()
+async def compare_instances(
+    resourcetype: Annotated[str, Field(description="'gslb' (sites, vservers, services and every vserver's service/domain bindings), or any config resource type, e.g. 'gslbservice', 'appfwprofile', 'sslcertkey'.")] = "gslb",
+    key: Annotated[str | None, Field(description="Attribute that names the same object on every instance. Default: servicename for gslbservice, sitename for gslbsite, else 'name'.")] = None,
+    attrs: Annotated[str | None, Field(description="Comma-separated attributes to compare. Default: a curated configuration set for GSLB resources, else every attribute except runtime ones (states, counters, timestamps).")] = None,
+    instances: Annotated[str | None, Field(description="Comma-separated instance names to compare; default: all configured.")] = None,
+    limit: Annotated[int, Field(description="Max missing / differing objects listed per resource (totals are always reported).", ge=1, le=500)] = 50,
+) -> dict[str, Any]:
+    """Diff configuration between NetScaler instances that are not an HA pair (nothing syncs them).
+
+    Typical use: GSLB peers. Every participating site must carry the same GSLB sites, vservers,
+    services and bindings, and only HA pairs sync that by themselves. resourcetype='gslb' compares all of
+    it, including each GSLB vserver's service and domain bindings, and checks that each site is LOCAL
+    on exactly one compared instance (sitetype itself legitimately differs). Any other config resource
+    type is compared object by object, keyed by `key`. Instances that fail (unreachable, feature off)
+    are listed under 'errors' and left out of the diff.
+    """
+    names = [_resolve_instance(n, write=False) for n in (_csv(instances) or tuple(_load_clients()))]
+    names = list(dict.fromkeys(names))
+    if len(names) < 2:
+        raise ValueError(
+            f"compare_instances needs at least two instances; configured: {', '.join(_load_clients())}. "
+            "Add more appliances via NETSCALER_INSTANCES."
+        )
+    rt = (resourcetype or "").strip()
+    if rt.lower() == "gslb":
+        snaps = await _on_each(lambda: _gslb_snapshot(limit), names)
+    else:
+        default_key, default_attrs = _COMPARE.get(rt, ("name", None))
+        wanted = _csv(attrs) or default_attrs
+        key = (key or "").strip() or default_key
+
+        async def fetch() -> dict[str, Any]:
+            keyed, _ = await _fetch_keyed(rt, key, wanted)
+            return {rt: keyed}
+
+        snaps = await _on_each(fetch, names)
+
+    errors = {n: s["error"] for n, s in snaps.items() if "error" in s}
+    ok = {n: s for n, s in snaps.items() if "error" not in s}
+    out: dict[str, Any] = {"instances": names}
+    if errors:
+        out["errors"] = errors
+    if len(ok) < 2:
+        out["in_sync"] = None
+        out["note"] = "Fewer than two instances answered, so nothing was compared."
+        return out
+
+    resources: dict[str, Any] = {}
+    plain = [r for r in next(iter(ok.values())) if r not in ("local_sites", "bindings")]
+    for res in plain:
+        resources[res] = _diff({n: s[res] for n, s in ok.items()}, limit)
+    if rt.lower() == "gslb":
+        btypes = sorted(set().union(*(s["bindings"] for s in ok.values())))
+        for btype in btypes:
+            resources[btype] = _diff({n: s["bindings"].get(btype, {}) for n, s in ok.items()}, limit)
+        local = {n: s["local_sites"] for n, s in ok.items()}
+        out["local_sites"] = local
+        warnings = []
+        holders: dict[str, list[str]] = {}
+        for n, sites in local.items():
+            if not sites:
+                warnings.append(f"{n} has no LOCAL GSLB site.")
+            for site in sites:
+                holders.setdefault(site, []).append(n)
+        warnings += [f"GSLB site {site} is LOCAL on {', '.join(h)}." for site, h in holders.items() if len(h) > 1]
+        if warnings:
+            out["warnings"] = warnings
+    out["in_sync"] = not out.get("warnings") and all(
+        "missing_on" not in r and "different" not in r for r in resources.values()
+    )
+    out["resources"] = resources
+    return out
+
+
 # ---- tool: raw escape hatch ---------------------------------------------
 
 def _pairs(value: dict[str, Any] | str | None, param: str) -> dict[str, str] | None:
@@ -2081,7 +2513,7 @@ def _pairs(value: dict[str, Any] | str | None, param: str) -> dict[str, str] | N
     return pairs
 
 
-@mcp.tool()
+@_tool
 async def nitro_get(
     tree: Annotated[str, Field(description="Which NITRO tree: 'config' or 'stat'.")],
     resourcetype: Annotated[str, Field(description="NITRO resource type, e.g. 'route', 'nsip', 'sslcertkey'. Note the stat 'Interface' resource is Capitalized.")],
@@ -2122,17 +2554,18 @@ async def nitro_get(
 
 def main() -> None:
     """Console entry point: load settings, wire transport, and run the server."""
+    global _clients, _default_instance
     try:
-        settings = Settings.from_env()
+        instances, _default_instance = load_instances()
     except ConfigError as exc:
         print(f"netscaler-mcp: {exc}", file=sys.stderr)
         raise SystemExit(2)
+    settings = instances[_default_instance]  # transport / host / port are shared by every instance
 
-    # Share the configured client with the tools.
-    global _client
-    _client = NitroClient(settings)
+    # Share the configured clients with the tools.
+    _clients = {name: NitroClient(s) for name, s in instances.items()}
 
-    # FastMCP.run() ignores host/port — they must be set on the instance settings.
+    # FastMCP.run() ignores host/port — they must be set on mcp.settings.
     mcp.settings.host = settings.host
     mcp.settings.port = settings.port
     mcp.settings.transport_security = TransportSecuritySettings(

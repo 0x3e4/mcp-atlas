@@ -9,7 +9,8 @@ from their preview before they apply; ``NETSCALER_EXPORT_DIR`` enables file-base
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from urllib.parse import urlsplit
 
 VALID_TRANSPORTS = ("stdio", "streamable-http")
@@ -17,6 +18,18 @@ VALID_AUTH_MODES = ("session", "stateless")
 
 # User/password are needed in both auth modes, so all three are required.
 _REQUIRED = ("NETSCALER_BASE_URL", "NETSCALER_USER", "NETSCALER_PASSWORD")
+
+# Name of the only instance when NETSCALER_INSTANCES is unset.
+DEFAULT_INSTANCE = "default"
+# Appliance settings an instance may override with NETSCALER_<NAME>_<KEY>. Transport, host, port and
+# the row cap belong to the server and stay shared.
+INSTANCE_KEYS = (
+    "BASE_URL", "USER", "PASSWORD", "AUTH_MODE", "SESSION_TIMEOUT", "TIMEOUT", "VERIFY_SSL",
+    "CA_BUNDLE", "ALLOW_WRITE", "CONFIRM_WRITE", "EXPORT_DIR",
+)
+_INSTANCE_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+# Every NETSCALER_* variable the server reads itself; an instance prefix must not produce one of them.
+_GLOBAL_KEYS = frozenset(INSTANCE_KEYS) | {"INSTANCES", "DEFAULT_INSTANCE", "MAX_ROWS"}
 
 
 class ConfigError(RuntimeError):
@@ -42,6 +55,7 @@ class Settings:
     allow_write: bool = False
     confirm_write: bool = True
     export_dir: str = ""
+    name: str = DEFAULT_INSTANCE
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -105,6 +119,72 @@ class Settings:
     def httpx_verify(self) -> str | bool:
         """Value for httpx ``verify=``: a CA bundle path if set, else the verify_ssl bool."""
         return self.ca_bundle or self.verify_ssl
+
+
+def load_instances(env: dict[str, str] | None = None) -> tuple[dict[str, Settings], str]:
+    """Resolve every configured appliance: ``({name: Settings}, default name)``.
+
+    Without ``NETSCALER_INSTANCES`` this is the single ``NETSCALER_BASE_URL`` appliance under the name
+    ``default``. With it, each listed instance needs its own ``NETSCALER_<NAME>_BASE_URL``; other
+    ``INSTANCE_KEYS`` fall back to the shared ``NETSCALER_<KEY>``. ``NETSCALER_DEFAULT_INSTANCE`` picks
+    the instance tools use when none is named (default: the first listed).
+    """
+    env = os.environ if env is None else env
+    raw = env.get("NETSCALER_INSTANCES", "").strip()
+    if not raw:
+        single = Settings.from_env(env)
+        return {single.name: single}, single.name
+
+    names = list(dict.fromkeys(n.strip().lower() for n in raw.split(",") if n.strip()))
+    prefixes: dict[str, str] = {}
+    for name in names:
+        if not _INSTANCE_NAME.fullmatch(name):
+            raise ConfigError(
+                f"NETSCALER_INSTANCES: {name!r} is not a valid instance name (start with a letter; "
+                "letters, digits, '_' and '-'; at most 32 characters)."
+            )
+        key = name.upper().replace("-", "_")
+        if key in prefixes:
+            raise ConfigError(
+                f"NETSCALER_INSTANCES: {prefixes[key]!r} and {name!r} share the variable prefix "
+                f"NETSCALER_{key}_; rename one."
+            )
+        clash = sorted(f"{key}_{k}" for k in INSTANCE_KEYS if f"{key}_{k}" in _GLOBAL_KEYS)
+        if clash:
+            raise ConfigError(
+                f"NETSCALER_INSTANCES: the name {name!r} would read the shared NETSCALER_{clash[0]} as its "
+                "own setting; rename the instance."
+            )
+        prefixes[key] = name
+
+    out: dict[str, Settings] = {}
+    for key, name in prefixes.items():
+        prefix = f"NETSCALER_{key}_"
+        if not env.get(prefix + "BASE_URL", "").strip():
+            raise ConfigError(
+                f"Instance {name!r}: set {prefix}BASE_URL (every instance in NETSCALER_INSTANCES needs "
+                "its own appliance URL)."
+            )
+        view = dict(env)
+        for setting in INSTANCE_KEYS:
+            value = env.get(prefix + setting)
+            if value is not None and value.strip() != "":
+                view["NETSCALER_" + setting] = value
+        try:
+            settings = Settings.from_env(view)
+        except ConfigError as exc:
+            raise ConfigError(
+                f"Instance {name!r}: {exc} Per-instance values use {prefix}<KEY>; NETSCALER_<KEY> is the "
+                "shared fallback."
+            ) from exc
+        out[name] = replace(settings, name=name)
+
+    default = env.get("NETSCALER_DEFAULT_INSTANCE", "").strip().lower() or names[0]
+    if default not in out:
+        raise ConfigError(
+            f"NETSCALER_DEFAULT_INSTANCE={default!r} is not in NETSCALER_INSTANCES ({', '.join(out)})."
+        )
+    return out, default
 
 
 def _int_env(env: dict[str, str], name: str, default: int) -> int:

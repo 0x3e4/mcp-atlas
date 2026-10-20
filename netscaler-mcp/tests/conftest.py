@@ -29,9 +29,9 @@ def ns(tmp_path):
         }
         client = server.NitroClient(Settings.from_env(env))
         client._client = httpx.AsyncClient(transport=httpx.MockTransport(fake))
-        server._client = client
+        server._clients = {"default": client}
 
     fake.use = use
     use()
     yield fake
-    server._client = None
+    server._clients = {}

@@ -16,6 +16,9 @@ applies a profile, and what do the log lines behind a block say.
   tools are **opt-in** behind `NETSCALER_ALLOW_WRITE`, every one previews first (`dry_run=true`), and
   none applies without your confirmation (`NETSCALER_CONFIRM_WRITE`, default on).
 - A raw escape-hatch tool (`nitro_get`) so any NITRO `config`/`stat` resource stays reachable.
+- **Several appliances** from one server: standalone boxes, GSLB peers or separate HA pairs
+  (`NETSCALER_INSTANCES`). Every tool takes `instance=<name>`, reads also take `instance='all'`, and
+  `compare_instances` diffs their configuration, e.g. whether GSLB peers carry the same GSLB setup.
 
 ## Tools
 
@@ -42,7 +45,12 @@ applies a profile, and what do the log lines behind a block say.
 | `system_health(full?)` | Appliance CPU / memory / disk / uptime (stat `ns`). |
 | `vserver_stats(kind="lb"\|"cs"\|"gslb", name?, limit?, full?)` | Live vserver traffic/health counters. |
 | `system_info(full?)` | Version, hardware, license and HA summary in one call. |
+| `list_instances(probe?)` | The configured appliances and the default one; `probe=true` adds firmware + HA role per box. |
+| `compare_instances(resourcetype="gslb", key?, attrs?, instances?, limit?)` | Diff config between appliances that don't sync (GSLB peers, standalone boxes): missing / different objects per instance. |
 | `nitro_get(tree, resourcetype, name?, attrs?, filter?, args?, count?, pagesize?, pageno?)` | Escape hatch: raw read-only GET against any NITRO resource; `args` reaches resources with required lookup arguments (e.g. `appfwlearningdata`, `systemfile`). |
+
+Every tool except the two instance tools also takes `instance` (which appliance; reads also accept `'all'`). See
+[Several appliances](#several-appliances-gslb-peers-standalone-boxes).
 
 Results are trimmed to the useful columns by default; pass `full=true` for the raw NITRO objects, and
 list results are capped (`NETSCALER_MAX_ROWS`, default 200) unless `full`.
@@ -71,6 +79,7 @@ and apply only with the preview's `confirm` code, see [Confirmation before every
 | `import_waf_profile(document \| file, target_profile?, host_map?, mode?, include_settings?, dry_run)` | Apply an export to a profile (created if missing): `merge` adds missing rules, `replace` mirrors the document. |
 | `rehost_waf_profile(profile, from_host, to_host, target_profile?, dry_run)` | Switch every rule to another hostname, in place or into a copy for another environment. |
 | `save_config(confirm?)` | `save ns config` — persist applied changes (first call returns the confirm code). |
+| `apply_batch(changes, save?, dry_run, confirm?)` | **Several changes, one confirmation:** a list of write-tool steps (`{"tool": …, "args": {…}}`, WAF and Bot), previewed together and applied in order with one confirm code, optionally followed by `save ns config`. |
 
 ### Bot management tools
 
@@ -136,6 +145,44 @@ cp .env.example netscaler.env
   still asks for confirmation unless `NETSCALER_CONFIRM_WRITE=false`);
   `NETSCALER_EXPORT_DIR` lets export/import use files. See
   [WAF & Bot rollout](#waf--bot-rollout-optional-write-tools).
+
+### Several appliances (GSLB peers, standalone boxes)
+
+An HA pair needs nothing extra: it is one appliance to NITRO (point at the management VIP or primary).
+For appliances that do **not** sync with each other — two standalone boxes, GSLB sites in separate
+data centres, separate HA pairs — one server can reach all of them:
+
+```bash
+NETSCALER_INSTANCES=dc1,dc2
+NETSCALER_DC1_BASE_URL=https://10.0.0.10
+NETSCALER_DC2_BASE_URL=https://10.0.1.10
+NETSCALER_USER=nsmcp                 # shared by both …
+NETSCALER_PASSWORD=...
+NETSCALER_DC2_PASSWORD=...           # … unless an instance sets its own
+# NETSCALER_DEFAULT_INSTANCE=dc1     # default: the first listed
+```
+
+- Each listed instance needs its own `NETSCALER_<NAME>_BASE_URL` (`-` in a name becomes `_` in the
+  variable). Every other appliance setting — `USER`, `PASSWORD`, `AUTH_MODE`, `SESSION_TIMEOUT`,
+  `TIMEOUT`, `VERIFY_SSL`, `CA_BUNDLE`, `ALLOW_WRITE`, `CONFIRM_WRITE`, `EXPORT_DIR` — can be set per
+  instance as `NETSCALER_<NAME>_<KEY>`, with the plain `NETSCALER_<KEY>` as shared fallback. So writes can
+  be on for one box and off for another (`NETSCALER_DC2_ALLOW_WRITE=true`).
+- Every tool takes **`instance`**; omitted, it uses the default instance. Read tools also take
+  **`instance='all'`**: they run on every appliance at once and return `{"instances": {name: result}}`.
+  An unreachable box reports its `error` without failing the others.
+- **Writes go to one named instance at a time.** With several instances configured, a write tool
+  refuses to run without `instance=<name>`, never takes `'all'`, and its preview names the instance.
+  The confirm code is bound to that instance: a code from a preview on `dc1` does not apply on `dc2`.
+- **`list_instances(probe?)`** shows what is configured (URL, default, write flags); `probe=true` also
+  asks each box for its firmware and HA role (`ha_peers` is empty on a standalone appliance).
+- **`compare_instances(resourcetype="gslb", key?, attrs?, instances?, limit?)`** diffs configuration
+  between instances. `gslb` compares GSLB sites, vservers, services and each GSLB vserver's service and
+  domain bindings. All of these must match on every participating site, and nothing syncs them
+  outside an HA pair unless you run `sync gslb config`. It also checks that each site is LOCAL on exactly
+  one box. Any other config resource type (`appfwprofile`, `sslcertkey`, …) is compared object by object.
+  Runtime attributes (states, counters, timestamps) are skipped unless you pass `attrs`. Results list
+  what is `missing_on` which instance, what is `different` (per attribute, per instance), and
+  `in_sync`.
 
 ## 3. Run & register with Claude Code
 
@@ -215,7 +262,9 @@ gateway walkthrough and client setup.
 
 The same image runs as several containers side by side, each with its own env file —
 for example the shared read-only instance next to a write-enabled one that uses another
-account, or one container per appliance or HA pair.
+account, or one container per appliance or HA pair. (To reach several appliances from **one**
+container, and compare them, use `NETSCALER_INSTANCES` instead — see
+[Several appliances](#several-appliances-gslb-peers-standalone-boxes).)
 A YAML anchor keeps the shared settings in one place (Compose ignores top-level `x-` keys).
 Ready to copy: [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
 
@@ -275,6 +324,8 @@ In Claude Code, run `/mcp` to confirm the `netscaler` server connected, then ask
 - "Which WAF checks are firing on pr_app, and is anything already blocking?"
 - "Is the WAF profile pr_app actually enforced anywhere, and are the signatures current?"
 - "What is bot profile bot_app catching at the moment?"
+- "Do dc1 and dc2 have the same GSLB configuration?" (with `NETSCALER_INSTANCES`)
+- "Which certificates expire within 30 days on any of the appliances?"
 
 ## WAF & Bot rollout (optional write tools)
 
@@ -311,6 +362,27 @@ the server restarts). For learned-rule deploy/discard the code binds the entries
 which keep moving while learning runs. A call with nothing to change needs no confirmation.
 `save_config` has no `dry_run`: its first call returns the code, the second (`confirm=<code>`) saves. Set
 `NETSCALER_CONFIRM_WRITE=false` to let `dry_run=false` apply directly, as before.
+
+**Several changes → `apply_batch`.** Each write tool asks once per call, so ten single settings would
+mean ten previews and ten "Confirm it?" (plus one more for `save_config`). Put them into one
+`apply_batch` call instead:
+
+```json
+{"changes": [
+  {"tool": "add_waf_rule",          "args": {"profile": "pr_app", "rule": "allow_url", "host": "app.example.com", "path": "/api/"}},
+  {"tool": "set_waf_check_actions", "args": {"profile": "pr_app", "checks": ["sql_injection", "cross_site_scripting"], "add_actions": ["block"]}},
+  {"tool": "set_waf_check_actions", "args": {"profile": "pr_app", "checks": ["start_url"], "remove_actions": ["learn"]}},
+  {"tool": "add_bot_rule",          "args": {"profile": "bot_app", "rule": "allow_ip", "value": "10.0.0.0/24"}}
+ ],
+ "save": true}
+```
+
+Every step is previewed exactly like its own tool would preview it. The one code binds all step plans
+(and `save`) on that one instance. On apply the steps run in order and stop at the first error: the
+rest is reported `not run` and nothing is saved. A step whose live plan no longer matches what you
+confirmed is not applied either; that happens, for example, when an earlier step in the same batch
+added the rule a later step removes. Steps take the same arguments as the tools, minus `dry_run`,
+`confirm` and `instance`.
 
 ### Export files (optional)
 

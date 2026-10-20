@@ -66,6 +66,10 @@ EXPECTED_TOOLS = {
     "update_signatures",
     "list_enforcement",
     "recent_security_violations",
+    # several appliances, and several changes under one confirmation
+    "list_instances",
+    "compare_instances",
+    "apply_batch",
 }
 
 
@@ -298,7 +302,7 @@ WRITE_TOOLS = {
     "add_waf_rule", "remove_waf_rule", "deploy_waf_learned_rules", "discard_waf_learned_rules",
     "set_waf_check_actions", "import_waf_profile", "rehost_waf_profile", "save_config",
     "add_bot_rule", "remove_bot_rule", "set_bot_detections", "import_bot_profile", "rehost_bot_profile",
-    "update_signatures",
+    "update_signatures", "apply_batch",
 }
 
 
@@ -316,27 +320,27 @@ def test_every_write_tool_takes_a_confirm_code():
 
 
 def test_write_tools_refuse_without_allow_write():
-    server._client = server.NitroClient(Settings.from_env(_base_env()))
+    server._clients = {"default": server.NitroClient(Settings.from_env(_base_env()))}
     try:
         with pytest.raises(ValueError, match="NETSCALER_ALLOW_WRITE"):
             asyncio.run(server.save_config())
         with pytest.raises(ValueError, match="NETSCALER_ALLOW_WRITE"):
             asyncio.run(server.add_waf_rule("pr_app", "allow_url", host="app.example.com", dry_run=False))
     finally:
-        server._client = None
+        server._clients = {}
 
 
 def test_export_path_confined_to_export_dir(tmp_path):
     env = _base_env()
     env["NETSCALER_EXPORT_DIR"] = str(tmp_path)
-    server._client = server.NitroClient(Settings.from_env(env))
+    server._clients = {"default": server.NitroClient(Settings.from_env(env))}
     try:
         assert server._export_path("pr_app-test") == tmp_path / "pr_app-test.json"
         for bad in ("../evil", "sub/x.json", ".hidden.json", "a..b.json", "C:\\x.json"):
             with pytest.raises(ValueError):
                 server._export_path(bad)
     finally:
-        server._client = None
+        server._clients = {}
 
 
 def test_nitro_get_sends_args_like_the_nitro_reference():
@@ -350,7 +354,7 @@ def test_nitro_get_sends_args_like_the_nitro_reference():
     env["NETSCALER_AUTH_MODE"] = "stateless"  # no login request in the log
     client = server.NitroClient(Settings.from_env(env))
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    server._client = client
+    server._clients = {"default": client}
 
     async def calls():
         await server.nitro_get("config", "appfwlearningdata", args="profilename:pr_app,securitycheck:startURL")
@@ -361,7 +365,7 @@ def test_nitro_get_sends_args_like_the_nitro_reference():
     try:
         asyncio.run(calls())
     finally:
-        server._client = None
+        server._clients = {}
     assert seen == [
         "/nitro/v1/config/appfwlearningdata?args=profilename:pr_app,securitycheck:startURL",
         "/nitro/v1/config/systemfile?args=filelocation:%2Fnsconfig%2Fssl&pagesize=10&pageno=1",
