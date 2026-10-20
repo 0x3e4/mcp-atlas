@@ -34,6 +34,8 @@ EXPECTED_TOOLS = {
     "tag_ticket",
     "reply_email",
     "get_attachment",
+    "get_ticket_links",
+    "link_tickets",
 }
 
 
@@ -171,7 +173,7 @@ def test_tag_and_pending_payloads_match_the_zammad_api():
     ]
 
 
-CONFIRM_TOOLS = {'create_ticket', 'update_ticket', 'add_note', 'tag_ticket', 'reply_email'}
+CONFIRM_TOOLS = {'create_ticket', 'update_ticket', 'add_note', 'tag_ticket', 'reply_email', 'link_tickets'}
 
 
 def test_write_tools_take_a_confirm_code_and_confirm_defaults_on():
@@ -480,3 +482,124 @@ def test_zammad_get_reads_attachment_links_instead_of_failing_on_non_json():
         assert isinstance(articles, list) and articles[0]["id"] == 9  # JSON stays JSON
     finally:
         server._client = None
+
+
+# ---- linked tickets -----------------------------------------------------
+
+class _FakeLinks:
+    """Zammad's Link model in miniature: rows are (type, source, target); list/remove mirror both ways."""
+
+    MIRROR = {"normal": "normal", "parent": "child", "child": "parent"}
+    TICKETS = {
+        42: {"id": 42, "number": "20261020001", "title": "VPN down", "state_id": 2},
+        43: {"id": 43, "number": "20261020002", "title": "VPN down (site B)", "state_id": 1},
+        44: {"id": 44, "number": "20261020003", "title": "Firewall change", "state_id": 4},
+    }
+
+    def __init__(self, rows):
+        self.rows = set(rows)
+        self.calls = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path, q = request.url.path, request.url.params
+        body = json.loads(request.content) if request.content else None
+        if request.method != "GET":
+            self.calls.append((request.method, path, body))
+        if path == "/api/v1/links":
+            me = int(q["link_object_value"])
+            links = [{"link_type": self.MIRROR[k], "link_object": "Ticket", "link_object_value": tgt} for k, src, tgt in self.rows if src == me]
+            links += [{"link_type": k, "link_object": "Ticket", "link_object_value": src} for k, src, tgt in self.rows if tgt == me]
+            assets = {str(l["link_object_value"]): self.TICKETS[l["link_object_value"]] for l in links}
+            return httpx.Response(200, json={"links": links, "assets": {"Ticket": assets}})
+        if path == "/api/v1/links/add":
+            src = next(i for i, tk in self.TICKETS.items() if tk["number"] == body["link_object_source_number"])
+            self.rows.add((body["link_type"], src, body["link_object_target_value"]))
+            return httpx.Response(201, json={"id": 1})
+        if path == "/api/v1/links/remove":
+            k, src, tgt = body["link_type"], body["link_object_source_value"], body["link_object_target_value"]
+            self.rows -= {(k, src, tgt), (self.MIRROR[k], tgt, src)}
+            return httpx.Response(201, json={})
+        if path == "/api/v1/ticket_states":
+            return httpx.Response(200, json=[{"id": 1, "name": "new"}, {"id": 2, "name": "open"}, {"id": 4, "name": "closed"}])
+        if path == "/api/v1/tickets/search":
+            number = q["query"].split(":", 1)[1]
+            return httpx.Response(200, json=[tk for tk in self.TICKETS.values() if tk["number"] == number])
+        if path.startswith("/api/v1/tickets/"):
+            return httpx.Response(200, json=self.TICKETS[int(path.rsplit("/", 1)[1])])
+        return httpx.Response(404, json={"error": "not found"})
+
+
+def _links_client(fake: _FakeLinks, *, confirm: bool = False) -> None:
+    env = _base_env()
+    env["ZAMMAD_ALLOW_WRITE"] = "true"
+    env["ZAMMAD_CONFIRM_WRITE"] = "true" if confirm else "false"
+    client = server.ZammadClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
+    server._client = client
+
+
+def test_get_ticket_links_reads_both_directions():
+    # 44 was linked as parent of 42 from 42's side; 42 was linked as "normal" from 43's side
+    fake = _FakeLinks({("parent", 44, 42), ("normal", 42, 43)})
+    _links_client(fake)
+    try:
+        out = asyncio.run(server.get_ticket_links(42))
+        mirror = asyncio.run(server.get_ticket_links(44))
+    finally:
+        server._client = None
+    assert sorted(out["links"], key=lambda l: l["ticket_id"]) == [
+        {"link_type": "normal", "ticket_id": 43, "number": "20261020002", "title": "VPN down (site B)", "state": "new"},
+        {"link_type": "parent", "ticket_id": 44, "number": "20261020003", "title": "Firewall change", "state": "closed"},
+    ]
+    assert mirror["links"] == [
+        {"link_type": "child", "ticket_id": 42, "number": "20261020001", "title": "VPN down", "state": "open"}]
+
+
+def test_link_tickets_adds_by_id_or_number_relinks_and_removes():
+    fake = _FakeLinks({("normal", 44, 42)})
+    _links_client(fake)
+    try:
+        out = asyncio.run(server.link_tickets(42, add=[43, "#20261020003"], link_type="parent"))
+    finally:
+        server._client = None
+    assert fake.calls == [
+        ("POST", "/api/v1/links/add", {"link_type": "parent", "link_object_source": "Ticket", "link_object_source_number": "20261020002",
+                                       "link_object_target": "Ticket", "link_object_target_value": 42}),
+        # 44 was "normal" before: unlinked, then linked again as parent
+        ("DELETE", "/api/v1/links/remove", {"link_type": "normal", "link_object_source": "Ticket", "link_object_source_value": 44,
+                                            "link_object_target": "Ticket", "link_object_target_value": 42}),
+        ("POST", "/api/v1/links/add", {"link_type": "parent", "link_object_source": "Ticket", "link_object_source_number": "20261020003",
+                                       "link_object_target": "Ticket", "link_object_target_value": 42}),
+    ]
+    assert {(l["ticket_id"], l["link_type"]) for l in out["links"]} == {(43, "parent"), (44, "parent")}
+
+    fake.calls.clear()
+    _links_client(fake)
+    try:
+        out = asyncio.run(server.link_tickets(42, remove=[44, "#20261020001"]))
+        same = asyncio.run(server.link_tickets(42, add=[43], link_type="parent"))
+        with pytest.raises(ValueError, match="itself"):
+            asyncio.run(server.link_tickets(42, add=[42]))
+        with pytest.raises(ValueError, match="link_type"):
+            asyncio.run(server.link_tickets(42, add=[43], link_type="sibling"))
+        with pytest.raises(ValueError, match="No ticket with number"):
+            asyncio.run(server.link_tickets(42, add=["#999"]))
+    finally:
+        server._client = None
+    assert [c[:2] for c in fake.calls] == [("DELETE", "/api/v1/links/remove")]
+    assert out["skipped"] == ["#20261020001 is not linked"]
+    assert [l["ticket_id"] for l in out["links"]] == [43]
+    assert same["changed"] is False and same["skipped"] == ["#20261020002 is already linked as parent"]
+
+
+def test_link_tickets_preview_names_the_tickets_and_writes_nothing():
+    fake = _FakeLinks(set())
+    _links_client(fake, confirm=True)
+    try:
+        preview = asyncio.run(server.link_tickets(42, add=[43]))
+        assert preview["status"] == "confirmation_required" and fake.calls == []
+        assert "link #20261020002 'VPN down (site B)' as normal" in preview["summary"]
+        done = asyncio.run(server.link_tickets(42, add=[43], confirm=preview["confirm_code"]))
+    finally:
+        server._client = None
+    assert done["changed"] is True and fake.rows == {("normal", 43, 42)}

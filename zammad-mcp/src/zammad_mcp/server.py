@@ -3,7 +3,7 @@
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
 always-on HTTP server. Read tools (tickets, articles, users, organizations, reference data) are GET;
 the raw ``zammad_get`` escape hatch reaches anything else. Write tools (add a note/comment, update
-a ticket, create a ticket, tag a ticket, reply by email) are **opt-in**: they refuse unless ``ZAMMAD_ALLOW_WRITE=true`` and need a
+a ticket, create a ticket, tag or link tickets, reply by email) are **opt-in**: they refuse unless ``ZAMMAD_ALLOW_WRITE=true`` and need a
 token with agent (ticket.agent) permission. With the flag off the server is effectively read-only.
 
 Reads pass ``expand=true`` so *_id fields come back as human-readable names.
@@ -449,6 +449,151 @@ async def tag_ticket(
         await client.delete("tags/remove", json={"item": tag, "object": "Ticket", "o_id": ticket_id})
     data = await client.get("tags", params={"object": "Ticket", "o_id": ticket_id})
     return {"ticket_id": ticket_id, "tags": data.get("tags", []) if isinstance(data, dict) else data}
+
+
+# ---- tools: linked tickets ------------------------------------------------
+
+_LINK_TYPES = ("normal", "parent", "child")
+_LINK_REF_DESC = "Tickets as ids (e.g. 123) or as ticket numbers with a leading '#' (e.g. '#20261020001')."
+
+
+async def _links(ticket_id: int) -> list[dict[str, Any]]:
+    """A ticket's links, from its own point of view (GET /links)."""
+    client = _get_client()
+    data = await client.get("links", params={"link_object": "Ticket", "link_object_value": ticket_id})
+    data = data if isinstance(data, dict) else {}
+    tickets = (data.get("assets") or {}).get("Ticket") or {}
+    states: dict[Any, str] = {}
+    if tickets:
+        try:
+            states = {s.get("id"): s.get("name") for s in await client.get("ticket_states") or [] if isinstance(s, dict)}
+        except ZammadError:
+            pass  # names are a nicety; ids still identify the state
+    out = []
+    for link in data.get("links") or []:
+        value = link.get("link_object_value")
+        if link.get("link_object") != "Ticket":
+            out.append({"link_type": link.get("link_type"), "object": link.get("link_object"), "id": value})
+            continue
+        ticket = tickets.get(str(value)) or tickets.get(value) or {}
+        out.append({
+            "link_type": link.get("link_type"),
+            "ticket_id": value,
+            "number": ticket.get("number"),
+            "title": ticket.get("title"),
+            "state": states.get(ticket.get("state_id"), ticket.get("state_id")),
+        })
+    return out
+
+
+async def _resolve_ticket(ref: int | str) -> dict[str, Any]:
+    """Ticket id (``123``) or number (``'#20261020001'``) → ``{id, number, title}``."""
+    client = _get_client()
+    text = str(ref).strip()
+    if text.startswith("#"):
+        number = text[1:].strip()
+        rows = await client.get("tickets/search", params={"query": f"number:{number}", "per_page": 5})
+        if isinstance(rows, dict):  # older instances answer {tickets: [ids], assets}
+            rows = list(((rows.get("assets") or {}).get("Ticket") or {}).values())
+        match = next((r for r in rows or [] if isinstance(r, dict) and str(r.get("number")) == number), None)
+        if match is None:
+            raise ValueError(f"No ticket with number {number}.")
+        ticket = match
+    else:
+        if not text.isdigit():
+            raise ValueError(f"{ref!r} is neither a ticket id nor a '#<number>'.")
+        ticket = await client.get(f"tickets/{text}")
+    return {"id": ticket.get("id"), "number": str(ticket.get("number")), "title": ticket.get("title")}
+
+
+@mcp.tool()
+async def get_ticket_links(
+    ticket_id: Annotated[int, Field(description="The ticket id.")],
+) -> dict[str, Any]:
+    """List a ticket's linked tickets (GET /links): related ('normal'), 'parent' and 'child' links.
+
+    link_type is seen from this ticket: 'parent' means the linked ticket is this ticket's parent,
+    'child' means it is a child of this ticket, 'normal' means "related".
+    """
+    return {"ticket_id": ticket_id, "links": await _links(ticket_id)}
+
+
+@mcp.tool()
+async def link_tickets(
+    ticket_id: Annotated[int, Field(description="The ticket to link from.")],
+    add: Annotated[list[int | str] | None, Field(description="Tickets to link. " + _LINK_REF_DESC)] = None,
+    link_type: Annotated[str, Field(description="For add — what the linked tickets are to this one: 'normal' (related), 'parent' or 'child'.")] = "normal",
+    remove: Annotated[list[int | str] | None, Field(description="Tickets to unlink (whatever their link type). " + _LINK_REF_DESC)] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Link related tickets to a ticket, or remove links (WRITE — requires ZAMMAD_ALLOW_WRITE).
+
+    Like Zammad's "Linked objects" sidebar: POSTs /links/add per ticket (link_type 'normal' = related,
+    'parent' = the linked ticket is the parent, 'child' = it is a child) and DELETEs /links/remove.
+    A ticket that is already linked with another type is re-linked with the new type. Needs update
+    permission on ticket_id and read permission on the linked tickets. Returns the links afterwards.
+    """
+    _require_write()
+    link_type = (link_type or "").strip().lower()
+    if link_type not in _LINK_TYPES:
+        raise ValueError(f"link_type must be one of {_LINK_TYPES}.")
+    if not add and not remove:
+        raise ValueError("Nothing to do: provide add and/or remove.")
+    existing = {link["ticket_id"]: link["link_type"] for link in await _links(ticket_id) if "ticket_id" in link}
+
+    to_add, to_remove, skipped = [], [], []
+    for ref in add or ():
+        ticket = await _resolve_ticket(ref)
+        if ticket["id"] == ticket_id:
+            raise ValueError("A ticket can't be linked to itself.")
+        if existing.get(ticket["id"]) == link_type:
+            skipped.append(f"#{ticket['number']} is already linked as {link_type}")
+        elif ticket["id"] not in {t["id"] for t in to_add}:
+            to_add.append({**ticket, "replaces": existing.get(ticket["id"])})
+    for ref in remove or ():
+        ticket = await _resolve_ticket(ref)
+        if ticket["id"] not in existing:
+            skipped.append(f"#{ticket['number']} is not linked")
+        elif ticket["id"] not in {t["id"] for t in to_remove}:
+            to_remove.append({**ticket, "link_type": existing[ticket["id"]]})
+    if not to_add and not to_remove:
+        return {"ticket_id": ticket_id, "changed": False, "skipped": skipped, "links": await _links(ticket_id)}
+
+    change = {
+        "ticket_id": ticket_id,
+        "add": [{"ticket_id": t["id"], "number": t["number"], "link_type": link_type, "replaces": t["replaces"]} for t in to_add],
+        "remove": [{"ticket_id": t["id"], "number": t["number"], "link_type": t["link_type"]} for t in to_remove],
+    }
+    parts = [f"link #{t['number']} '{t['title']}' as {link_type}" + (f" (was {t['replaces']})" if t["replaces"] else "") for t in to_add]
+    parts += [f"unlink #{t['number']} '{t['title']}' ({t['link_type']})" for t in to_remove]
+    if preview := _confirm("link_tickets", change, f"Ticket {ticket_id}: " + "; ".join(parts) + ".", confirm):
+        if skipped:
+            preview["skipped"] = skipped
+        return preview
+
+    client = _get_client()
+
+    async def unlink(other_id: int, kind: str) -> None:
+        await client.delete("links/remove", json={
+            "link_type": kind,
+            "link_object_source": "Ticket", "link_object_source_value": other_id,
+            "link_object_target": "Ticket", "link_object_target_value": ticket_id,
+        })
+
+    for t in to_remove:
+        await unlink(t["id"], t["link_type"])
+    for t in to_add:
+        if t["replaces"]:
+            await unlink(t["id"], t["replaces"])
+        await client.post("links/add", json={
+            "link_type": link_type,
+            "link_object_source": "Ticket", "link_object_source_number": t["number"],
+            "link_object_target": "Ticket", "link_object_target_value": ticket_id,
+        })
+    out: dict[str, Any] = {"ticket_id": ticket_id, "changed": True, "links": await _links(ticket_id)}
+    if skipped:
+        out["skipped"] = skipped
+    return out
 
 
 def _addresses(line: str | None) -> list[str]:

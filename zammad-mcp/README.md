@@ -3,7 +3,7 @@
 A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
 Claude Code) to a **[Zammad](https://zammad.org)** helpdesk through its REST API. Ask about your
 tickets in natural language — browse/search tickets, read the conversation (articles), look up users
-and organizations — and, opt-in, **add notes/comments, reply by email, update, create and tag tickets**.
+and organizations — and, opt-in, **add notes/comments, reply by email, update, create, tag and link tickets**.
 
 - One shared `httpx.AsyncClient`; **token** auth (`Authorization: Token token=<token>`).
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
@@ -26,6 +26,7 @@ and organizations — and, opt-in, **add notes/comments, reply by email, update,
 | `whoami()` | The user behind the token (connectivity/permission check). |
 | `list_organizations(limit?, page?, full?)` | List organizations. |
 | `list_reference(kind)` | Reference data: `groups`, `states` or `priorities`. |
+| `get_ticket_links(ticket_id)` | Linked tickets (related / parent / child) with number, title and state. `link_type` is seen from this ticket: `parent` = the linked ticket is its parent. |
 | `zammad_get(path, params?)` | Escape hatch: raw read-only GET against any `/api/v1/...` path. Non-JSON answers (e.g. an image link `ticket_attachment/…?view=inline` copied from an article body) are read like `get_attachment` instead of failing. |
 
 Results are trimmed to useful fields by default (with names from `expand=true`); pass `full=true` for
@@ -42,6 +43,7 @@ clear message). The token also needs **agent** (`ticket.agent`) permission.
 | `update_ticket(ticket_id, state?, priority?, group?, owner_id?, title?, pending_time?)` | Update a ticket's fields (state/priority/group by name). Pending states take a `pending_time` (ISO 8601). |
 | `create_ticket(title, group, customer, body, internal?, state?, priority?, html?)` | Create a ticket with an initial note. `customer` is an email or user id (prefix an unknown email with `guess:`). |
 | `tag_ticket(ticket_id, add?, remove?)` | Add and/or remove tags; returns the ticket's tags afterwards. |
+| `link_tickets(ticket_id, add?, link_type='normal'\|'parent'\|'child', remove?)` | Link related tickets (Zammad's *Linked objects*), or remove links. Tickets as ids (`123`) or numbers (`'#20261020001'`). A ticket already linked with another type is re-linked; already-linked ones are skipped. Returns the links afterwards. |
 | `reply_email(ticket_id, body, recipients='customer'\|'all', article_id?, cc?, subject?, html?)` | **Sends a real email** through the group's email channel, threaded to the last email (or `article_id`). `customer` writes only to the ticket's customer; `all` works like *Reply all* on that email (sender, To, Cc — minus Zammad's own addresses and yours). The preview shows the resolved To/Cc/subject. Zammad adds `RE:` and the ticket number; it does not add the group signature for API articles. |
 
 **Confirmation before every write** (`ZAMMAD_CONFIRM_WRITE`, default `true`): a write tool's first
@@ -207,6 +209,8 @@ With `ZAMMAD_ALLOW_WRITE=true` you can also:
 - "Add an internal note to ticket 4521: 'Called the user, awaiting logs.'"
 - "Set ticket 4521 to pending reminder for Monday 9:00 and assign it to agent 8."
 - "Tag ticket 4521 with vpn and escalated."
+- "Find tickets about the same VPN outage as 4521 and link them as related."
+- "Make ticket #20261020001 the parent of 4522 and 4523."
 - "Reply to the customer on ticket 4521 by email: the VPN is fixed, please retry."
 - "Reply all on ticket 4521's last email and say we'll patch tonight."
 - "Create a ticket in group Support for alice@example.com titled 'Laptop won't boot'."
