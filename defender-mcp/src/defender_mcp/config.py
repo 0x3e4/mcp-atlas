@@ -3,7 +3,8 @@
 Secrets are never hardcoded; everything comes from the process environment (typically supplied
 via ``--env-file`` for Docker or a local ``.env`` exported into the shell). Writes are opt-in via
 ``DEFENDER_ALLOW_WRITE``; each write then needs the user's confirmation unless
-``DEFENDER_CONFIRM_WRITE=false``.
+``DEFENDER_CONFIRM_WRITE=false``. ``DEFENDER_AUTH`` picks the identity: ``app`` (client credentials,
+default) or ``delegated`` (a signed-in user via device code, refresh token kept in ``DEFENDER_TOKEN_CACHE``).
 """
 
 from __future__ import annotations
@@ -13,8 +14,10 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 VALID_TRANSPORTS = ("stdio", "streamable-http")
+VALID_AUTH = ("app", "delegated")
 
-_REQUIRED = ("DEFENDER_TENANT_ID", "DEFENDER_CLIENT_ID", "DEFENDER_CLIENT_SECRET")
+_REQUIRED = ("DEFENDER_TENANT_ID", "DEFENDER_CLIENT_ID")
+_DEFAULT_TOKEN_CACHE = "~/.defender-mcp/token.json"
 
 
 class ConfigError(RuntimeError):
@@ -27,7 +30,9 @@ class Settings:
 
     tenant_id: str
     client_id: str
-    client_secret: str
+    client_secret: str = ""
+    auth: str = "app"
+    token_cache: str = os.path.expanduser(_DEFAULT_TOKEN_CACHE)
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -47,7 +52,13 @@ class Settings:
         """
         env = os.environ if env is None else env
 
-        missing = [name for name in _REQUIRED if not env.get(name)]
+        auth = env.get("DEFENDER_AUTH", "app").strip().lower() or "app"
+        if auth not in VALID_AUTH:
+            raise ConfigError(f"DEFENDER_AUTH must be one of {VALID_AUTH}; got {auth!r}.")
+
+        # Delegated sign-in is a public client (device code): no secret.
+        required = _REQUIRED if auth == "delegated" else (*_REQUIRED, "DEFENDER_CLIENT_SECRET")
+        missing = [name for name in required if not env.get(name)]
         if missing:
             raise ConfigError(
                 "Missing required environment variable(s): "
@@ -64,7 +75,11 @@ class Settings:
         return cls(
             tenant_id=env["DEFENDER_TENANT_ID"].strip(),
             client_id=env["DEFENDER_CLIENT_ID"].strip(),
-            client_secret=env["DEFENDER_CLIENT_SECRET"],
+            client_secret=env.get("DEFENDER_CLIENT_SECRET", "") if auth == "app" else "",
+            auth=auth,
+            token_cache=os.path.expanduser(
+                env.get("DEFENDER_TOKEN_CACHE", "").strip() or _DEFAULT_TOKEN_CACHE
+            ),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),
@@ -75,6 +90,11 @@ class Settings:
             allow_write=_bool_env(env, "DEFENDER_ALLOW_WRITE", False),
             confirm_write=_bool_env(env, "DEFENDER_CONFIRM_WRITE", True),
         )
+
+    @property
+    def delegated(self) -> bool:
+        """True when tools act as a signed-in user instead of the app registration."""
+        return self.auth == "delegated"
 
     @property
     def token_url(self) -> str:
@@ -88,9 +108,25 @@ class Settings:
         return f"{parts.scheme}://{parts.netloc}"
 
     @property
+    def device_code_url(self) -> str:
+        """OAuth2 v2.0 device authorization endpoint for this tenant."""
+        return f"{self.login_base_url}/{self.tenant_id}/oauth2/v2.0/devicecode"
+
+    @property
+    def graph_beta_url(self) -> str:
+        """Graph beta base URL on the configured host (case management is beta-only)."""
+        return f"{self.graph_origin}/beta"
+
+    @property
     def scope(self) -> str:
         """Client-credentials scope: ``<graph-origin>/.default`` (works for Gov clouds too)."""
         return f"{self.graph_origin}/.default"
+
+    @property
+    def delegated_scope(self) -> str:
+        """Delegated scope: every admin-consented delegated Graph permission, plus a refresh token
+        (offline_access) and an id_token naming the user (openid profile)."""
+        return f"openid profile offline_access {self.graph_origin}/.default"
 
 
 def _int_env(env: dict[str, str], name: str, default: int) -> int:

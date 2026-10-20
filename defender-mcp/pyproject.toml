@@ -4,8 +4,8 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "defender-mcp"
-version = "0.2.0"
-description = "Microsoft Defender XDR MCP server (advanced hunting, incidents, alerts, devices, vulnerabilities; opt-in incident/alert triage writes)"
+version = "0.3.0"
+description = "Microsoft Defender XDR MCP server (advanced hunting, incidents, alerts, devices, vulnerabilities, cases; opt-in triage writes; app or signed-in user auth)"
 readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"

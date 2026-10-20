@@ -1,5 +1,6 @@
 # Several instances of defender-mcp from one image, each with its own env file — e.g. a shared
-# read-only instance next to a write-enabled one with another app registration. Copy and customize locally:
+# read-only instance next to a write-enabled one with another app registration, or a personal one per
+# analyst that acts as that person (DEFENDER_AUTH=delegated). Copy and customize locally:
 #   cp compose.yml.multiuser.example compose.yml      # compose.yml is gitignored (per-deployment)
 #   mkdir -p env && cp .env.example env/instance_a.env # instance a: its app registration + DEFENDER_ALLOW_WRITE=true
 #   docker network create atlas-net                    # once; shared by the gateway + every server
@@ -7,6 +8,9 @@
 # Register each instance with the gateway under its own name:
 #   mcpjungle register --name defender --url http://defender-mcp:8000/mcp
 #   mcpjungle register --name defender-instance-a --url http://defender-mcp-instance-a:8000/mcp
+#   mcpjungle register --name defender-user-a --url http://defender-mcp-user-a:8000/mcp
+# Personal (delegated) instance: sign in once, the token is kept in its volume:
+#   docker compose exec defender-mcp-user-a defender-mcp login
 # Writes still ask for confirmation first unless DEFENDER_CONFIRM_WRITE=false in that instance's env file.
 # Images are built and pushed to GHCR by .github/workflows/build.yml.
 # (No GHCR? Replace the image: line with "build: ." to build from this folder instead.)
@@ -33,8 +37,18 @@ services:
     container_name: defender-mcp-instance-a
     env_file: ./env/instance_a.env
 
-  # Add more instances the same way: a new service name + container_name + env file.
+  defender-mcp-user-a:             # acts as user a (DEFENDER_AUTH=delegated in env/user_a.env, no secret)
+    <<: *defender
+    container_name: defender-mcp-user-a
+    env_file: ./env/user_a.env
+    volumes:
+      - defender-user-a-token:/home/appuser/.defender-mcp   # user a's sign-in; one volume per person
+
+  # Add more instances the same way: a new service name + container_name + env file (+ token volume).
 
 networks:
   atlas-net:
     external: true
+
+volumes:
+  defender-user-a-token:

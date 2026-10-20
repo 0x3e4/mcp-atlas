@@ -3,10 +3,11 @@
 A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
 Claude Code) to **Microsoft Defender XDR** through the **Microsoft Graph security API**. Ask about
 your Defender data in natural language — advanced hunting (KQL telemetry), incidents, alerts,
-devices, and vulnerabilities — and, opt-in, **triage incidents and alerts** (status, owner,
-classification, determination, tags, comments).
+devices, vulnerabilities and **cases** — and, opt-in, **triage incidents and alerts** (status, owner,
+classification, determination, tags, comments) and **work cases** (create/update, comments, tasks).
 
-- One OAuth2 client-credentials token, one `httpx.AsyncClient`.
+- Acts as the **app registration** (client credentials, default) or as **you** (`DEFENDER_AUTH=delegated`,
+  see [Act as yourself](#act-as-yourself-delegated-sign-in)); one `httpx.AsyncClient`.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
 - **Read-only by default**; write tools are **opt-in** behind `DEFENDER_ALLOW_WRITE` (see below).
   No device response/remediation actions (isolate device, run AV scan, etc.).
@@ -25,6 +26,10 @@ classification, determination, tags, comments).
 | `get_vulnerabilities(device?, severity?, cve?, top=50, full?)` | Software vulns (via a `DeviceTvmSoftwareVulnerabilities` hunt). |
 | `graph_get(path, params?)` | Escape hatch: raw read-only GET against any Graph endpoint. |
 | `graph_hunt(kql, timespan?)` | Escape hatch: raw hunting query, untrimmed `{schema, results}`. |
+| `whoami()` | Who the tools act as (signed-in user or app) and the permissions in its token. |
+| `list_cases(case_type?, status?, assigned_to?, top=25, skip?, full?)` | Case management cases (**Graph beta**). |
+| `get_case(case_id, include_audit?)` | One case with its tasks and comments. |
+| `get_case_type_config(case_type)` | The tenant's case statuses and custom fields (`generic` / `incident`). |
 
 Results are trimmed to the useful columns by default; pass `full=true` for the raw payload, and row
 counts are capped (`DEFENDER_MAX_ROWS`, default 200) unless `full`.
@@ -41,6 +46,11 @@ permissions (see [section 1](#1-register-an-entra-id-application)). Only the fie
 | `add_incident_comment(incident_id, comment)` | `POST /security/incidents/{id}/comments` — add a comment. |
 | `update_alert(alert_id, status?, assigned_to?, classification?, determination?)` | `PATCH /security/alerts_v2/{id}` — triage an alert. |
 | `add_alert_comment(alert_id, comment)` | `POST /security/alerts_v2/{id}/comments` — add a comment. |
+| `create_case(display_name, status, description?, assigned_to?, priority?, due_date_time?, custom_fields?)` | Create a generic case (beta). |
+| `update_case(case_id, status?, display_name?, assigned_to?, priority?, description?, closing_notes?, severity?, classification?, determination?, due_date_time?, custom_fields?)` | Update a case (beta); fields depend on the case type. |
+| `add_case_comment(case_id, comment)` | Comment on a case (beta). |
+| `add_case_task(case_id, display_name, category?, priority?, status?, description?, assigned_to?, due_date_time?)` | Add a task to a case (beta). |
+| `update_case_task(case_id, task_id, status?, assigned_to?, priority?, category?, display_name?, description?, closing_notes?, due_date_time?)` | Update a case task (beta). |
 
 - **status** — incidents: `active`, `inProgress`, `resolved`; alerts: `new`, `inProgress`, `resolved`
   (`redirected` is set by Defender when incidents are merged, so it isn't offered).
@@ -49,9 +59,27 @@ permissions (see [section 1](#1-register-an-entra-id-application)). Only the fie
   `unwantedSoftware`, `other`, `multiStagedAttack`, `compromisedAccount`, `phishing`,
   `maliciousUserActivity`, `notMalicious`, `notEnoughDataToValidate`, `confirmedActivity`,
   `lineOfBusinessApplication`.
-- **assigned_to** is free text (usually a UPN); `''` unassigns. **custom_tags replaces all custom
-  tags** of the incident (`[]` clears them); omit it to leave them alone.
-- Comments can't be edited or deleted through Graph — they show up in the portal as written by the app.
+- **assigned_to** is free text (usually a UPN); `''` unassigns; `'me'` means the signed-in user
+  (delegated mode only). **custom_tags replaces all custom tags** of the incident (`[]` clears them);
+  omit it to leave them alone.
+- Comments can't be edited or deleted through Graph — they show up in the portal as written by the app,
+  or by you in delegated mode.
+
+**Cases (Graph beta, preview).** Defender's case management (public preview since 2026-09) is only in
+Microsoft Graph **beta** (`/beta/security/caseManagement`), so it may change without notice. The case
+tools use the beta endpoint on your configured Graph host (global cloud only).
+
+- **Incident cases** are created by Defender, one per incident; you can only update them. Status, owner,
+  title, severity, classification and determination are mirrored to the incident: Graph answers
+  `202 Accepted` and the case shows the change after a few minutes. **Generic cases** are yours to
+  create.
+- **Case statuses are tenant-defined** (e.g. *Active* with custom sub-statuses like *Triage*). The
+  tools check the status against `get_case_type_config` and send its exact spelling.
+- **custom_fields** take plain values keyed by the field's name (`{"Region": "EU", "Users affected": 3}`);
+  the server wraps them into Graph's typed values and rejects unknown/disabled fields and invalid options.
+- Tasks: category `uncategorized|triage|contain|investigate|remediate|prevent`, priority
+  `notSet|veryLow|low|medium|high|critical`, status `new|inProgress|failed|partiallyCompleted|skipped|completed`.
+- A case holds at most 100 comments. There are no delete tools.
 
 **Confirmation before every write** (`DEFENDER_CONFIRM_WRITE`, default `true`): a write tool's first
 call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
@@ -70,9 +98,12 @@ expire when the server restarts). Set `DEFENDER_CONFIRM_WRITE=false` to let writ
    - `SecurityAlert.Read.All` — alerts
    - `SecurityIncident.Read.All` — incidents
 
+   For the **case** tools add `CaseManagement.Read.All`.
+
    For the **write** tools (`DEFENDER_ALLOW_WRITE=true`) add as well:
    - `SecurityIncident.ReadWrite.All` — `update_incident`, `add_incident_comment`
    - `SecurityAlert.ReadWrite.All` — `update_alert`, `add_alert_comment`
+   - `CaseManagement.ReadWrite.All` — `create_case`, `update_case`, `add_case_comment`, `add_case_task`, `update_case_task`
 
    Leave them out for a read-only deployment: the token then can't change anything even if the flag
    is set. A second app registration (and env file) with the ReadWrite permissions keeps the
@@ -85,6 +116,49 @@ expire when the server restarts). Set `DEFENDER_CONFIRM_WRITE=false` to let writ
 > The client-credentials flow uses the scope `https://graph.microsoft.com/.default`, which grants the
 > token **all** admin-consented application permissions for Graph. There is no refresh token — the
 > server re-fetches on expiry (~60 min).
+
+### Act as yourself (delegated sign-in)
+
+With `DEFENDER_AUTH=delegated` the server calls Graph **as a signed-in user** instead of as the app:
+comments, status changes and case edits carry that person's name in Defender and in the audit log,
+and the server can only do what **both** the consented permissions **and** the user's Defender role
+allow (writes: *Security Operator* / *Security Administrator* or a matching Defender XDR RBAC role;
+a *Security Reader* can only read).
+
+1. Use a **separate app registration** (e.g. `defender-mcp-delegated`) so the app-only one stays
+   untouched. **Authentication** → *Allow public client flows* = **Yes**. No secret, no redirect URI.
+2. **API permissions** → Microsoft Graph → **Delegated permissions**: the same names as above
+   (`ThreatHunting.Read.All`, `SecurityAlert.Read.All`, `SecurityIncident.Read.All`,
+   `CaseManagement.Read.All`, and the `*.ReadWrite.All` ones for writes), plus `offline_access`,
+   `openid`, `profile`. **Grant admin consent**.
+3. Optional but recommended: in **Enterprise applications** → the app → *Properties*, set
+   *Assignment required* = Yes and assign only the analysts who should use it.
+4. Env file: `DEFENDER_AUTH=delegated`, tenant + client id, **no** `DEFENDER_CLIENT_SECRET`.
+5. Sign in once, inside the container (the code is shown on the console; open the URL on any device):
+
+   ```bash
+   docker compose exec defender-mcp-user-a defender-mcp login     # always-on container
+   # stdio: docker run -it --rm --env-file ./env/user_a.env -v defender-user-a-token:/home/appuser/.defender-mcp defender-mcp login
+   docker compose exec defender-mcp-user-a defender-mcp status    # who am I, which scopes
+   docker compose exec defender-mcp-user-a defender-mcp logout    # forget the sign-in
+   ```
+
+   The refresh token is stored in `DEFENDER_TOKEN_CACHE` (default `/home/appuser/.defender-mcp/token.json`,
+   mode 0600) — mount a **volume** there, or every restart needs a new login. The server picks up a
+   new login on its next call; no restart needed. Without a sign-in, tools answer
+   *"Not signed in … run `defender-mcp login`"*.
+
+**Run one container per person, reachable only by that person.** Whoever can reach the container acts
+as the signed-in user, and whoever can read the token volume can too. Don't register a delegated
+instance as the shared gateway entry. See [`compose.yml.multiuser.example`](compose.yml.multiuser.example).
+
+Things that can get in the way:
+
+- **Conditional Access** may block the device code flow (Microsoft recommends blocking it for most
+  users) → `AADSTS53003`. Ask for an exception for this app/your account, or keep app-only auth.
+- The sign-in lasts as long as the refresh token: 90 days of inactivity, sign-in-frequency policies,
+  password resets or revoked sessions end it → *"Sign-in of … can't be renewed"* → `login` again.
+- New permissions after you signed in: `login` again so the token includes them.
 
 ## 2. Configure
 
@@ -235,6 +309,9 @@ With `DEFENDER_ALLOW_WRITE=true` you can also:
 - "Resolve incident 29 as a true positive, determination malware, and tag it ir-2026-10."
 - "Mark alert da123 as a false positive (not malicious) and comment that it was the admin backup script."
 - "Add a comment to incident 29: contained, vm-42 reimaged."
+- "Show my open cases" (delegated) / "list incident cases with status Active".
+- "Open a case 'Insider review', priority high, assign it to me, and add a contain task 'Reset creds'."
+- "Set the case of incident 29 to Resolved, true positive, phishing."
 
 ## Notes & limits
 
@@ -253,6 +330,10 @@ With `DEFENDER_ALLOW_WRITE=true` you can also:
   event timestamp.
 - **`list_alerts` `category`** is filtered client-side (it isn't a documented `$filter` field); other
   filters are server-side OData. `alerts_v2` does not support `$orderby` (results are most-recent-first).
+
+- **Case management is Graph beta.** Microsoft can change it before it reaches v1.0; the docs also
+  list read-only roles for write calls, which is likely a copy error — expect writes to need Security
+  Operator or higher.
 
 ## Future
 

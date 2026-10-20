@@ -29,9 +29,21 @@ EXPECTED_TOOLS = {
     "add_incident_comment",
     "update_alert",
     "add_alert_comment",
+    "whoami",
+    "list_cases",
+    "get_case",
+    "get_case_type_config",
+    "create_case",
+    "update_case",
+    "add_case_comment",
+    "add_case_task",
+    "update_case_task",
 }
 
-WRITE_TOOLS = {"update_incident", "add_incident_comment", "update_alert", "add_alert_comment"}
+WRITE_TOOLS = {
+    "update_incident", "add_incident_comment", "update_alert", "add_alert_comment",
+    "create_case", "update_case", "add_case_comment", "add_case_task", "update_case_task",
+}
 
 
 def _tools() -> dict[str, object]:
