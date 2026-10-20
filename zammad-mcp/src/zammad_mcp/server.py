@@ -11,6 +11,7 @@ Reads pass ``expand=true`` so *_id fields come back as human-readable names.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -509,13 +510,60 @@ async def _resolve_ticket(ref: int | str) -> dict[str, Any]:
 @mcp.tool()
 async def get_ticket_links(
     ticket_id: Annotated[int, Field(description="The ticket id.")],
+    with_content: Annotated[bool, Field(description="Also read each linked ticket: its details (state, owner, customer, group …) and its latest articles.")] = False,
+    max_articles: Annotated[int, Field(description="With with_content: newest articles per linked ticket.", ge=0, le=50)] = 10,
+    max_body_chars: Annotated[int, Field(description="With with_content: article bodies are cut to this many characters (HTML is turned into text).", ge=100, le=20000)] = 2000,
 ) -> dict[str, Any]:
     """List a ticket's linked tickets (GET /links): related ('normal'), 'parent' and 'child' links.
 
     link_type is seen from this ticket: 'parent' means the linked ticket is this ticket's parent,
-    'child' means it is a child of this ticket, 'normal' means "related".
+    'child' means it is a child of this ticket, 'normal' means "related". With with_content=true
+    each linked ticket (up to 20) comes with its details and newest articles, so background from
+    related tickets is available in one call; their attachments are listed and open with
+    get_attachment(<linked ticket id>, ...). Use get_ticket_articles for a linked ticket's full history.
     """
-    return {"ticket_id": ticket_id, "links": await _links(ticket_id)}
+    links = await _links(ticket_id)
+    if not with_content:
+        return {"ticket_id": ticket_id, "links": links}
+    tickets = [link for link in links if "ticket_id" in link]
+    contents = await asyncio.gather(*(
+        _ticket_content(link["ticket_id"], max_articles, max_body_chars) for link in tickets[:_MAX_LINKED_CONTENT]
+    ))
+    for link, content in zip(tickets, contents):
+        link.update(content)
+    out: dict[str, Any] = {"ticket_id": ticket_id, "links": links}
+    if len(tickets) > _MAX_LINKED_CONTENT:
+        out["note"] = f"Content read for the first {_MAX_LINKED_CONTENT} of {len(tickets)} linked tickets; open the rest with get_ticket / get_ticket_articles."
+    return out
+
+
+_MAX_LINKED_CONTENT = 20
+
+
+async def _ticket_content(ticket_id: int, max_articles: int, max_body_chars: int) -> dict[str, Any]:
+    """A linked ticket's details plus its newest articles with shortened text bodies."""
+    client = _get_client()
+    try:
+        ticket, articles = await asyncio.gather(
+            client.get(f"tickets/{ticket_id}", params={"expand": "true"}),
+            client.get(f"ticket_articles/by_ticket/{ticket_id}", params={"expand": "true"}),
+        )
+    except ZammadError as exc:  # e.g. linked, but this token may not read it
+        return {"error": str(exc)}
+    rows = sorted((a for a in articles or [] if isinstance(a, dict)), key=lambda a: a.get("id") or 0)
+    shown = rows[-max_articles:] if max_articles else []
+    trimmed = []
+    for row in shown:
+        article = _article(row)
+        body = str(article.get("body") or "")
+        if "html" in str(article.get("content_type") or ""):
+            body = attachments.html_to_text(body)
+        article["body"] = body[:max_body_chars]
+        if len(body) > max_body_chars:
+            article["body_truncated"] = True
+        trimmed.append(article)
+    details = {k: v for k, v in _pick(ticket, _TICKET_FIELDS).items() if k not in ("id", "number", "title")}
+    return {"details": details, "article_count": len(rows), "articles": trimmed}
 
 
 @mcp.tool()

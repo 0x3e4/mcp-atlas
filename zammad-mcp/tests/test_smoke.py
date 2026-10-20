@@ -603,3 +603,44 @@ def test_link_tickets_preview_names_the_tickets_and_writes_nothing():
     finally:
         server._client = None
     assert done["changed"] is True and fake.rows == {("normal", 43, 42)}
+
+
+def test_get_ticket_links_with_content_reads_the_linked_tickets():
+    fake = _FakeLinks({("normal", 43, 42), ("parent", 44, 42)})
+    articles = [
+        {"id": 7, "ticket_id": 43, "type": "note", "internal": True, "body": "old note", "content_type": "text/plain"},
+        {"id": 8, "ticket_id": 43, "type": "email", "internal": False, "content_type": "text/html",
+         "body": "<p>Site B: tunnel flaps every <b>10 min</b>.</p><p>" + "x" * 300 + "</p>",
+         "attachments": [{"id": 3, "filename": "log.txt", "size": "9", "preferences": {"Content-Type": "text/plain"}}]},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/tickets/44":
+            return httpx.Response(403, json={"error_human": "Not authorized"})
+        if path == "/api/v1/tickets/43":
+            return httpx.Response(200, json={**_FakeLinks.TICKETS[43], "state": "new", "owner": "agent-a", "group": "Network"})
+        if path == "/api/v1/ticket_articles/by_ticket/43":
+            return httpx.Response(200, json=list(reversed(articles)))
+        if path == "/api/v1/ticket_articles/by_ticket/44":
+            return httpx.Response(403, json={"error_human": "Not authorized"})
+        return fake.handler(request)
+
+    env = _base_env()
+    client = server.ZammadClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    server._client = client
+    try:
+        plain = asyncio.run(server.get_ticket_links(42))
+        out = asyncio.run(server.get_ticket_links(42, with_content=True, max_articles=1, max_body_chars=100))
+    finally:
+        server._client = None
+    assert all("articles" not in link for link in plain["links"])
+    related = next(l for l in out["links"] if l["ticket_id"] == 43)
+    assert related["link_type"] == "normal" and related["details"]["group"] == "Network"
+    assert related["article_count"] == 2 and [a["id"] for a in related["articles"]] == [8]  # newest only
+    newest = related["articles"][0]
+    assert newest["body"].startswith("Site B: tunnel flaps every 10 min.") and len(newest["body"]) == 100
+    assert newest["body_truncated"] is True and newest["attachments"][0]["filename"] == "log.txt"
+    parent = next(l for l in out["links"] if l["ticket_id"] == 44)
+    assert parent["link_type"] == "parent" and "403" in parent["error"]

@@ -26,7 +26,7 @@ and organizations — and, opt-in, **add notes/comments, reply by email, update,
 | `whoami()` | The user behind the token (connectivity/permission check). |
 | `list_organizations(limit?, page?, full?)` | List organizations. |
 | `list_reference(kind)` | Reference data: `groups`, `states` or `priorities`. |
-| `get_ticket_links(ticket_id)` | Linked tickets (related / parent / child) with number, title and state. `link_type` is seen from this ticket: `parent` = the linked ticket is its parent. |
+| `get_ticket_links(ticket_id, with_content?, max_articles?, max_body_chars?)` | Linked tickets (related / parent / child) with number, title and state. `link_type` is seen from this ticket: `parent` = the linked ticket is its parent. With `with_content=true` each linked ticket (up to 20) also comes with its details and newest articles (default 10, bodies as text cut to 2000 chars, attachments listed), so background from related tickets arrives in one call. |
 | `zammad_get(path, params?)` | Escape hatch: raw read-only GET against any `/api/v1/...` path. Non-JSON answers (e.g. an image link `ticket_attachment/…?view=inline` copied from an article body) are read like `get_attachment` instead of failing. |
 
 Results are trimmed to useful fields by default (with names from `expand=true`); pass `full=true` for
@@ -211,6 +211,7 @@ With `ZAMMAD_ALLOW_WRITE=true` you can also:
 - "Tag ticket 4521 with vpn and escalated."
 - "Find tickets about the same VPN outage as 4521 and link them as related."
 - "Make ticket #20261020001 the parent of 4522 and 4523."
+- "Work on ticket 4521 and take the linked tickets into account: what was already tried there?"
 - "Reply to the customer on ticket 4521 by email: the VPN is fixed, please retry."
 - "Reply all on ticket 4521's last email and say we'll patch tonight."
 - "Create a ticket in group Support for alice@example.com titled 'Laptop won't boot'."
