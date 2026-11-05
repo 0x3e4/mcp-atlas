@@ -75,6 +75,28 @@ AUDIT_MESSAGES = [
     "10/06/2026:12:00:04 GMT ns 0-PPE-0 : default SSLVPN LOGIN 1004 0 : someone logged in",
 ]
 
+# Load balancing / content switching: resource -> key attribute, binding -> (parent, parent attr, identity).
+LB_OBJECTS = {
+    "lbvserver": "name", "csvserver": "name", "service": "name", "servicegroup": "servicegroupname",
+    "server": "name", "cspolicy": "policyname", "csaction": "name", "lbmonitor": "monitorname",
+}
+LB_BINDINGS = {
+    "lbvserver_service_binding": ("lbvserver", "name", ("servicename",)),
+    "lbvserver_servicegroup_binding": ("lbvserver", "name", ("servicegroupname",)),
+    "servicegroup_servicegroupmember_binding": ("servicegroup", "servicegroupname", ("servername", "port")),
+    "service_lbmonitor_binding": ("service", "name", ("monitor_name",)),
+    "servicegroup_lbmonitor_binding": ("servicegroup", "servicegroupname", ("monitor_name",)),
+    "csvserver_cspolicy_binding": ("csvserver", "name", ("policyname",)),
+    "csvserver_lbvserver_binding": ("csvserver", "name", ("lbvserver",)),
+}
+# Where enable/disable shows: (attribute, enabled value, disabled value).
+LB_STATE = {
+    "lbvserver": ("curstate", "UP", "OUT OF SERVICE"), "csvserver": ("curstate", "UP", "OUT OF SERVICE"),
+    "service": ("svrstate", "UP", "OUT OF SERVICE"), "servicegroup": ("state", "ENABLED", "DISABLED"),
+    "server": ("state", "ENABLED", "DISABLED"),
+}
+LB_NOT_SETTABLE = {"servicetype"}
+
 
 def as_arg(value: Any) -> str:
     """Render a stored value the way it arrives in a NITRO ``args=`` pair."""
@@ -166,6 +188,55 @@ class FakeNetScaler:
         self.signatures = {
             "appfwsignatures": [{"name": "sig_default", "src": "https://sig.example/waf.xml", "encryptedversion": 97}],
             "botsignature": [{"name": "bot_sig", "src": "https://sig.example/bot.json", "comment": ""}],
+        }
+        self.lb = {
+            "lbvserver": {
+                "vs_web": {"name": "vs_web", "servicetype": "HTTP", "ipv46": "10.0.0.20", "port": 80,
+                           "lbmethod": "ROUNDROBIN", "persistencetype": "NONE", "curstate": "UP"},
+                "vs_api": {"name": "vs_api", "servicetype": "HTTP", "ipv46": "0.0.0.0", "port": 0,
+                           "lbmethod": "LEASTCONNECTION", "curstate": "UP"},
+            },
+            "csvserver": {"cs_app": {"name": "cs_app", "servicetype": "HTTP", "ipv46": "10.0.0.10", "port": 80,
+                                     "curstate": "UP"}},
+            "service": {"svc_web1": {"name": "svc_web1", "servername": "srv_web1", "ipaddress": "10.0.0.31",
+                                     "port": 80, "servicetype": "HTTP", "svrstate": "UP"}},
+            "servicegroup": {"sg_web": {"servicegroupname": "sg_web", "servicetype": "HTTP", "state": "ENABLED"}},
+            "server": {
+                "srv_web1": {"name": "srv_web1", "ipaddress": "10.0.0.31", "state": "ENABLED"},
+                "srv_web2": {"name": "srv_web2", "ipaddress": "10.0.0.32", "state": "ENABLED"},
+            },
+            "cspolicy": {
+                "cp_api": {"policyname": "cp_api", "rule": 'HTTP.REQ.URL.STARTSWITH("/api")', "action": "ca_api",
+                           "hits": "12"},
+                "cp_static": {"policyname": "cp_static", "rule": 'HTTP.REQ.URL.STARTSWITH("/static")',
+                              "action": "ca_web"},
+            },
+            "csaction": {
+                "ca_api": {"name": "ca_api", "targetlbvserver": "vs_api"},
+                "ca_web": {"name": "ca_web", "targetlbvserver": "vs_web"},
+            },
+            "lbmonitor": {"mon_http": {"monitorname": "mon_http", "type": "HTTP", "interval": 5, "respcode": ["200"]}},
+        }
+        self.lb_bindings: dict[str, dict[str, list[dict[str, Any]]]] = {
+            "lbvserver_servicegroup_binding": {"vs_web": [
+                {"name": "vs_web", "servicegroupname": "sg_web", "stateflag": "1"}]},
+            "lbvserver_service_binding": {"vs_api": [
+                {"name": "vs_api", "servicename": "svc_web1", "weight": "1", "curstate": "UP"}]},
+            "servicegroup_servicegroupmember_binding": {"sg_web": [
+                {"servicegroupname": "sg_web", "servername": "srv_web1", "ip": "10.0.0.31", "port": 80,
+                 "weight": "1", "state": "ENABLED", "svrstate": "UP"},
+                {"servicegroupname": "sg_web", "servername": "srv_web2", "ip": "10.0.0.32", "port": 80,
+                 "weight": "1", "state": "ENABLED", "svrstate": "UP"},
+            ]},
+            "servicegroup_lbmonitor_binding": {"sg_web": [
+                {"servicegroupname": "sg_web", "monitor_name": "mon_http", "weight": "1"}]},
+            "csvserver_cspolicy_binding": {"cs_app": [
+                {"name": "cs_app", "policyname": "cp_static", "priority": "200", "gotopriorityexpression": "END",
+                 "hits": "3"},
+                {"name": "cs_app", "policyname": "cp_api", "priority": "100", "gotopriorityexpression": "END",
+                 "hits": "12"},
+            ]},
+            "csvserver_lbvserver_binding": {"cs_app": [{"name": "cs_app", "lbvserver": "vs_web"}]},
         }
         self.settings = {
             "appfwsettings": {"signatureautoupdate": "OFF", "signatureurl": "https://sig.example/waf.xml",
@@ -264,6 +335,10 @@ class FakeNetScaler:
         if resource == "auditmessages":
             count = int(args.get("numofmesgs") or 20)
             return reply(auditmessages=[{"value": line} for line in AUDIT_MESSAGES[:count]])
+        if resource in LB_OBJECTS:
+            return self._lb_object_api(method, resource, name, params.get("action"), body.get(resource) or {}, args)
+        if resource in LB_BINDINGS or resource.removesuffix("_binding") in LB_OBJECTS:
+            return self._lb_binding_api(method, resource, name, args, body.get(resource) or {})
         return self._binding_api(method, resource, name, args, body.get(resource) or {})
 
     def _stat_api(self, resource: str, name: str | None) -> httpx.Response:
@@ -330,3 +405,111 @@ class FakeNetScaler:
                 checks[check] = keep
                 return reply()
         return reply(404, 258, "No such resource")
+
+    # ---- load balancing / content switching
+
+    def lb_rows(self, binding: str, parent: str) -> list[dict[str, Any]]:
+        return self.lb_bindings.get(binding, {}).get(parent, [])
+
+    def _lb_object_api(
+        self, method: str, resource: str, name: str | None, action: str | None, obj: dict[str, Any],
+        args: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        store, key = self.lb[resource], LB_OBJECTS[resource]
+        if method == "GET":
+            if name is None:
+                return reply(**{resource: list(store.values())})
+            return reply(**{resource: [store[name]]}) if name in store else reply(404, 258, "No such resource")
+        if method == "DELETE":
+            if name not in store:
+                return reply(404, 258, "No such resource")
+            if resource == "lbmonitor" and (args or {}).get("type") != store[name]["type"]:
+                return reply(400, 1092, "Required argument missing [type]")
+            if self._lb_in_use(resource, name):
+                return reply(409, 2083, "Cannot remove, the entity is in use")
+            del store[name]
+            for binding, (parent, _, _) in LB_BINDINGS.items():
+                if parent == resource:
+                    self.lb_bindings.get(binding, {}).pop(name, None)
+            return reply()
+        target = store.get(obj.get(key))
+        if action in ("enable", "disable"):
+            if target is None:
+                return reply(404, 258, "No such resource")
+            field, on, off = LB_STATE[resource]
+            if obj.get("servername"):
+                rows = self.lb_rows("servicegroup_servicegroupmember_binding", obj[key])
+                row = next((r for r in rows if r["servername"] == obj["servername"]
+                            and str(r["port"]) == str(obj["port"])), None)
+                if row is None:
+                    return reply(404, 258, "No such member")
+                row["state"] = "ENABLED" if action == "enable" else "DISABLED"
+            else:
+                target[field] = on if action == "enable" else off
+            return reply()
+        if action == "unset":
+            if target is None:
+                return reply(404, 258, "No such resource")
+            for attr, flag in obj.items():
+                if flag is True:
+                    target.pop(attr, None)
+            return reply()
+        if method == "POST":
+            if target is not None:
+                return reply(409, 273, "Resource already exists")
+            new = dict(obj)
+            if resource in LB_STATE:
+                field, on, _ = LB_STATE[resource]
+                new.setdefault(field, on)
+            store[obj[key]] = new
+            return reply(201)
+        if target is None:
+            return reply(404, 258, "No such resource")
+        if resource == "lbmonitor" and "type" not in obj:
+            return reply(400, 1092, "Required argument missing [type]")
+        if bad := sorted(set(obj) & LB_NOT_SETTABLE):
+            return reply(400, 278, f"Invalid argument [{bad[0]}]")
+        target.update(obj)
+        return reply()
+
+    def _lb_binding_api(
+        self, method: str, binding: str, name: str | None, args: dict[str, str], obj: dict[str, Any]
+    ) -> httpx.Response:
+        if binding not in LB_BINDINGS:  # aggregate <resource>_binding/<name>
+            parent = binding.removesuffix("_binding")
+            if name not in self.lb[parent]:
+                return reply(404, 258, "No such resource")
+            arrays = {b: self.lb_rows(b, name) for b, (p, _, _) in LB_BINDINGS.items()
+                      if p == parent and self.lb_rows(b, name)}
+            return reply(**{binding: [{LB_OBJECTS[parent]: name, **arrays}]})
+        parent, attr, ident = LB_BINDINGS[binding]
+        owner = name or obj.get(attr)
+        if owner not in self.lb[parent]:
+            return reply(404, 258, "No such resource")
+        rows = self.lb_bindings.setdefault(binding, {}).setdefault(owner, [])
+        if method == "GET":
+            return reply(**({binding: rows} if rows else {}))
+        if method == "PUT":
+            new = dict(obj)
+            if binding == "servicegroup_servicegroupmember_binding":
+                new.setdefault("servername", new.get("ip"))
+                new.setdefault("state", "ENABLED")
+            key = tuple(as_arg(new.get(a, "")) for a in ident)
+            if any(tuple(as_arg(r.get(a, "")) for a in ident) == key for r in rows):
+                return reply(409, 273, "Resource already exists")
+            rows.append(new)
+            return reply(201)
+        keep = [r for r in rows if not all(as_arg(r.get(k, "")) == v for k, v in args.items())]
+        if len(keep) == len(rows):
+            return reply(404, 258, "No such resource")
+        self.lb_bindings[binding][owner] = keep
+        return reply()
+
+    def _lb_in_use(self, resource: str, name: str) -> bool:
+        """Whether another object still refers to this one (the appliance refuses the delete then)."""
+        if resource == "cspolicy":
+            return any(r["policyname"] == name for rows in self.lb_bindings.get("csvserver_cspolicy_binding", {}).values()
+                       for r in rows)
+        if resource == "csaction":
+            return any(p.get("action") == name for p in self.lb["cspolicy"].values())
+        return False

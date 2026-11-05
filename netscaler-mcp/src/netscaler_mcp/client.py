@@ -303,7 +303,8 @@ def _format_nitro_error(env: dict[str, Any], *, login: bool = False, write: bool
     if code in (2138, 257) and write:
         return (
             f"NITRO not authorized (errorcode {code}) — this is a configuration change; the system user "
-            "needs a command policy allowing it (appfw add/set/bind/unbind/rm, save ns config — see the "
+            "needs a command policy allowing it (add/set/bind/unbind/enable/disable for the objects involved, "
+            "save ns config — see the "
             "netscaler-mcp README), not just 'readonlypolicy'."
         )
     if code in (2138, 257):
@@ -350,7 +351,7 @@ def _format_http_error(resp: httpx.Response, env: dict[str, Any], *, write: bool
     if status == 403 and write:
         return (
             "NITRO 403 — the system user may not make this change; bind a command policy that allows "
-            "the appfw changes (see the netscaler-mcp README)."
+            "these changes (see the netscaler-mcp README)."
         )
     if status == 403:
         return (

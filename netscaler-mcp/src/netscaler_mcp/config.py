@@ -25,7 +25,7 @@ DEFAULT_INSTANCE = "default"
 # the row cap belong to the server and stay shared.
 INSTANCE_KEYS = (
     "BASE_URL", "USER", "PASSWORD", "AUTH_MODE", "SESSION_TIMEOUT", "TIMEOUT", "VERIFY_SSL",
-    "CA_BUNDLE", "ALLOW_WRITE", "CONFIRM_WRITE", "EXPORT_DIR",
+    "CA_BUNDLE", "ALLOW_WRITE", "ALLOW_DELETE", "CONFIRM_WRITE", "EXPORT_DIR",
 )
 _INSTANCE_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 # Every NETSCALER_* variable the server reads itself; an instance prefix must not produce one of them.
@@ -53,6 +53,7 @@ class Settings:
     verify_ssl: bool = True
     ca_bundle: str = ""
     allow_write: bool = False
+    allow_delete: bool = False
     confirm_write: bool = True
     export_dir: str = ""
     name: str = DEFAULT_INSTANCE
@@ -100,6 +101,7 @@ class Settings:
             verify_ssl=_bool_env(env, "NETSCALER_VERIFY_SSL", True),
             ca_bundle=env.get("NETSCALER_CA_BUNDLE", "").strip(),
             allow_write=_bool_env(env, "NETSCALER_ALLOW_WRITE", False),
+            allow_delete=_bool_env(env, "NETSCALER_ALLOW_DELETE", False),
             confirm_write=_bool_env(env, "NETSCALER_CONFIRM_WRITE", True),
             export_dir=env.get("NETSCALER_EXPORT_DIR", "").strip(),
         )

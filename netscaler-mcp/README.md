@@ -3,7 +3,9 @@
 A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
 Claude Code) to a **NetScaler ADC** appliance (or HA pair) through the **NITRO REST API**. Ask about
 your load balancers in natural language — vservers and their up/down state, backend services/servers,
-SSL certificate expiry, HA status, and box CPU/memory/throughput — and roll out the **Web App
+SSL certificate expiry, HA status, and box CPU/memory/throughput — and, opt-in, **build and change load
+balancing and content switching**: vservers, services, service groups, servers, CS policies and actions,
+monitors and how they are bound together. Roll out the **Web App
 Firewall**: learned rules, the URL inventory, easy global rules, export/import between environments and
 hostname switching. **Bot management** gets the same treatment — allow/deny lists, rate limiting, TPS,
 CAPTCHA and IP reputation — and for both features: are the signatures current, which policy actually
@@ -12,8 +14,8 @@ applies a profile, and what do the log lines behind a block say.
 - One shared `httpx.AsyncClient`; NITRO **session** login with a cached `NITRO_AUTH_TOKEN` cookie
   (transparently re-logs-in on expiry), or **stateless** `X-NITRO-USER`/`X-NITRO-PASS` per request.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
-- **Read-only by default** — pair the server with a `readonlypolicy` account. The WAF and Bot write
-  tools are **opt-in** behind `NETSCALER_ALLOW_WRITE`, every one previews first (`dry_run=true`), and
+- **Read-only by default** — pair the server with a `readonlypolicy` account. The write tools (load
+  balancing / content switching, WAF, Bot) are **opt-in** behind `NETSCALER_ALLOW_WRITE`, every one previews first (`dry_run=true`), and
   none applies without your confirmation (`NETSCALER_CONFIRM_WRITE`, default on).
 - A raw escape-hatch tool (`nitro_get`) so any NITRO `config`/`stat` resource stays reachable.
 - **Several appliances** from one server: standalone boxes, GSLB peers or separate HA pairs
@@ -55,6 +57,33 @@ Every tool except the two instance tools also takes `instance` (which appliance;
 Results are trimmed to the useful columns by default; pass `full=true` for the raw NITRO objects, and
 list results are capped (`NETSCALER_MAX_ROWS`, default 200) unless `full`.
 
+### Load balancing & content switching
+
+Reads (always available):
+
+| Tool | What it does |
+|---|---|
+| `get_object(kind, name, limit?, full?)` | One object with everything bound to it. `cs_vserver` → **routes**: its CS policies in priority order with rule, action and target LB vserver, plus the default LB vserver; `lb_vserver` → services / service groups with state and weight; `service_group` → members and monitors; `server` → the services / groups using it; `cs_policy` → the CS vservers it is bound to. |
+| `list_cs_policies(name?, limit?, full?)` | CS policies: rule, action, hits. |
+| `list_cs_actions(name?, limit?, full?)` | CS actions and the LB vserver (or expression) each targets. |
+| `list_lb_monitors(name?, limit?, full?)` | Health monitors: type, interval, timeouts, request / expected response. |
+
+`kind` is one of `lb_vserver`, `cs_vserver`, `service`, `service_group`, `server`, `cs_policy`,
+`cs_action`, `monitor`. Writes (opt-in, see [Write tools](#write-tools-optional)):
+
+| Tool | What it does |
+|---|---|
+| `add_object(kind, name, settings, dry_run)` | Create an object; `settings` are the NITRO attributes (lower-case CLI option names), e.g. `lb_vserver` `{"servicetype": "HTTP", "ipv46": "10.0.0.20", "port": 80}`, `server` `{"ipaddress": "10.0.0.31"}`, `cs_policy` `{"rule": "HTTP.REQ.URL.STARTSWITH(\"/api\")", "action": "ca_api"}`. Existing objects are left alone. |
+| `update_object(kind, name, settings?, unset?, dry_run)` | Change attributes (before/after per attribute, only differing ones are sent) or reset them to their default (`unset`). |
+| `set_object_state(kind, names, enabled, members?, graceful?, delay_seconds?, dry_run)` | Enable / disable vservers, services, service groups, servers — or single group members (`members=['srv_web1:80']`), gracefully or after a delay. |
+| `delete_object(kind, names, dry_run)` | **Delete** objects, in the given order. The preview lists what is still bound to each one or uses it. The appliance refuses deletes that would leave dangling references (unbind first). Needs `NETSCALER_ALLOW_DELETE=true` on top of `NETSCALER_ALLOW_WRITE`, and **always** asks for confirmation, even with `NETSCALER_CONFIRM_WRITE=false`. |
+| `change_bindings(binding, name, add?, remove?, dry_run)` | Bind / unbind: `lb_vserver_service`, `lb_vserver_service_group`, `service_group_member` (`'srv:port'` or `'10.0.0.5:80'`), `service_monitor`, `service_group_monitor`, `cs_vserver_policy` (with `priority`), `cs_vserver_default`. Already-bound entries are skipped, changed weight / priority is re-bound, a new CS default replaces the old one. |
+
+A whole setup — server → service group + members → LB vserver → CS action + policy → bound on the CS
+vserver — goes into one `apply_batch` with one confirmation. Tearing one down works the same way: unbind,
+then `delete_object` (policy before its action, vserver before its service group). A batch that
+contains a delete always asks for confirmation.
+
 ### WAF rollout tools
 
 Reads (always available):
@@ -79,7 +108,7 @@ and apply only with the preview's `confirm` code, see [Confirmation before every
 | `import_waf_profile(document \| file, target_profile?, host_map?, mode?, include_settings?, dry_run)` | Apply an export to a profile (created if missing): `merge` adds missing rules, `replace` mirrors the document. |
 | `rehost_waf_profile(profile, from_host, to_host, target_profile?, dry_run)` | Switch every rule to another hostname, in place or into a copy for another environment. |
 | `save_config(confirm?)` | `save ns config` — persist applied changes (first call returns the confirm code). |
-| `apply_batch(changes, save?, dry_run, confirm?)` | **Several changes, one confirmation:** a list of write-tool steps (`{"tool": …, "args": {…}}`, WAF and Bot), previewed together and applied in order with one confirm code, optionally followed by `save ns config`. |
+| `apply_batch(changes, save?, dry_run, confirm?)` | **Several changes, one confirmation:** a list of write-tool steps (`{"tool": …, "args": {…}}`: LB/CS, WAF and Bot), previewed together and applied in order with one confirm code, optionally followed by `save ns config`. |
 
 ### Bot management tools
 
@@ -124,7 +153,7 @@ bind system user nsmcp readonlypolicy 100
 
 (Or in the GUI: **System → User Administration → Users → Add**, then bind the `readonlypolicy`
 command policy.) Use this account's credentials below. For the WAF write tools, use the account from
-[WAF rollout → Enable writes](#enable-writes) instead.
+[Write tools → Enable writes](#enable-writes) instead.
 
 ## 2. Configure
 
@@ -141,10 +170,11 @@ cp .env.example netscaler.env
   or (lab only) `NETSCALER_VERIFY_SSL=false`.
 - **Auth** — `NETSCALER_AUTH_MODE=session` (default) is efficient; switch to `stateless` if session
   slots are scarce or the appliance sits behind a non-sticky load balancer.
-- **WAF writes / files** — `NETSCALER_ALLOW_WRITE=true` enables the WAF and Bot write tools (each
-  still asks for confirmation unless `NETSCALER_CONFIRM_WRITE=false`);
+- **Writes / deletes / files** — `NETSCALER_ALLOW_WRITE=true` enables the write tools (each still
+  asks for confirmation unless `NETSCALER_CONFIRM_WRITE=false`); `NETSCALER_ALLOW_DELETE=true` also
+  enables `delete_object`, which always asks for confirmation;
   `NETSCALER_EXPORT_DIR` lets export/import use files. See
-  [WAF & Bot rollout](#waf--bot-rollout-optional-write-tools).
+  [Write tools](#write-tools-optional).
 
 ### Several appliances (GSLB peers, standalone boxes)
 
@@ -164,7 +194,7 @@ NETSCALER_DC2_PASSWORD=...           # … unless an instance sets its own
 
 - Each listed instance needs its own `NETSCALER_<NAME>_BASE_URL` (`-` in a name becomes `_` in the
   variable). Every other appliance setting — `USER`, `PASSWORD`, `AUTH_MODE`, `SESSION_TIMEOUT`,
-  `TIMEOUT`, `VERIFY_SSL`, `CA_BUNDLE`, `ALLOW_WRITE`, `CONFIRM_WRITE`, `EXPORT_DIR` — can be set per
+  `TIMEOUT`, `VERIFY_SSL`, `CA_BUNDLE`, `ALLOW_WRITE`, `ALLOW_DELETE`, `CONFIRM_WRITE`, `EXPORT_DIR` — can be set per
   instance as `NETSCALER_<NAME>_<KEY>`, with the plain `NETSCALER_<KEY>` as shared fallback. So writes can
   be on for one box and off for another (`NETSCALER_DC2_ALLOW_WRITE=true`).
 - Every tool takes **`instance`**; omitted, it uses the default instance. Read tools also take
@@ -320,6 +350,9 @@ In Claude Code, run `/mcp` to confirm the `netscaler` server connected, then ask
 - "What's the HA status?"
 - "Show CPU and memory usage."
 - "Show the live request rate for lb vserver vs_web."
+- "Where does cs_app send /api traffic, and which backends are behind it?"
+- "Take srv_web1 out of sg_web gracefully, then put it back." (write tools)
+- "Create vs_app on 10.0.0.21:80 with servers 10.0.0.51 and 10.0.0.52 on port 8080, and route app.example.com to it from cs_app." (write tools, one confirmation)
 - "Which learned start URLs on WAF profile pr_app aren't covered by a rule yet?"
 - "Which WAF checks are firing on pr_app, and is anything already blocking?"
 - "Is the WAF profile pr_app actually enforced anywhere, and are the signatures current?"
@@ -327,7 +360,10 @@ In Claude Code, run `/mcp` to confirm the `netscaler` server connected, then ask
 - "Do dc1 and dc2 have the same GSLB configuration?" (with `NETSCALER_INSTANCES`)
 - "Which certificates expire within 30 days on any of the appliances?"
 
-## WAF & Bot rollout (optional write tools)
+## Write tools (optional)
+
+The load balancing / content switching tools, the WAF and Bot rollout tools, `update_signatures`,
+`save_config` and `apply_batch` change the appliance. They all work the same way.
 
 ### Enable writes
 
@@ -344,9 +380,29 @@ In Claude Code, run `/mcp` to confirm the `netscaler` server connected, then ask
    bind system user nsmcp-waf readonlypolicy 110
    ```
 
+   For the load balancing / content switching tools, a second policy covers what they send:
+
+   ```
+   add system cmdPolicy nsmcp-lb ALLOW "^((add|set|unset|enable|disable)\s+(lb\s+vserver|cs\s+vserver|cs\s+policy|cs\s+action|lb\s+monitor|service|serviceGroup|server)|(bind|unbind)\s+(lb\s+vserver|cs\s+vserver|service|serviceGroup))(\s+.*)?$|^save\s+ns\s+config$"
+   bind system user nsmcp-waf nsmcp-lb 105
+   ```
+
+   `delete_object` additionally needs the `rm` commands, e.g. as a third policy that you only bind
+   where deletes are wanted:
+
+   ```
+   add system cmdPolicy nsmcp-lb-rm ALLOW "^rm\s+(lb\s+vserver|cs\s+vserver|cs\s+policy|cs\s+action|lb\s+monitor|service|serviceGroup|server)(\s+.*)?$"
+   bind system user nsmcp-waf nsmcp-lb-rm 106
+   ```
+
+   (Not yet checked against a live box: if a call answers "not authorized", look at the command the
+   appliance logged for it and widen the regex.)
+
    (Already created it for WAF only? `set system cmdPolicy nsmcp-waf ALLOW "<spec>"` updates it.)
    Consider a separate `netscaler-waf` MCP registration (its own env file) so day-to-day
    questions keep using the read-only account.
+3. Deletes are off even with writes on. Set `NETSCALER_ALLOW_DELETE=true` as well to enable
+   `delete_object`. Every delete asks for your confirmation, whatever `NETSCALER_CONFIRM_WRITE` says.
 
 ### Confirmation before every write
 
@@ -498,11 +554,13 @@ poetry run mcp dev src/netscaler_mcp/server.py  # MCP Inspector to exercise tool
   attributes used here are stable across 13.0 / 13.1 / 14.1, so older builds work too — if a build
   lacks a projected attribute it simply comes back `null`; use `full=true` or `nitro_get` for the raw
   payload. (NITRO is served under a fixed `/nitro/v1` path — there is no api-version parameter.)
-- **Writes are opt-in and limited to AppFw / Bot profiles** (plus signature re-fetch and
-  `save ns config`). Reads are always available. The write tools refuse unless
+- **Writes are opt-in**: LB / CS objects and their bindings, AppFw / Bot profiles, signature re-fetch
+  and `save ns config`. Reads are always available. The write tools refuse unless
   `NETSCALER_ALLOW_WRITE=true` and the account's command policy allows the change, and (unless
-  `NETSCALER_CONFIRM_WRITE=false`) only apply with the confirm code from a preview you approved. No tool deletes a
-  profile or a policy, no tool binds a policy to a vserver, and no other configuration is touched.
+  `NETSCALER_CONFIRM_WRITE=false`) only apply with the confirm code from a preview you approved.
+  **Deletes** (`delete_object`, LB / CS objects only) additionally need `NETSCALER_ALLOW_DELETE=true`
+  and always need a confirmation. No tool deletes a WAF / Bot profile or policy or binds a policy to a
+  vserver.
 - **Feature-gated resources** (GSLB, AppFW) return a clean "feature not enabled" error when the
   feature is off on the appliance.
 - The whole-config resources `nsrunningconfig` / `nssavedconfig` are reachable via `nitro_get` but

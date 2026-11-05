@@ -70,6 +70,16 @@ EXPECTED_TOOLS = {
     "list_instances",
     "compare_instances",
     "apply_batch",
+    # load balancing / content switching
+    "get_object",
+    "list_cs_policies",
+    "list_cs_actions",
+    "list_lb_monitors",
+    "add_object",
+    "update_object",
+    "set_object_state",
+    "change_bindings",
+    "delete_object",
 }
 
 
@@ -303,6 +313,7 @@ WRITE_TOOLS = {
     "set_waf_check_actions", "import_waf_profile", "rehost_waf_profile", "save_config",
     "add_bot_rule", "remove_bot_rule", "set_bot_detections", "import_bot_profile", "rehost_bot_profile",
     "update_signatures", "apply_batch",
+    "add_object", "update_object", "set_object_state", "change_bindings", "delete_object",
 }
 
 
