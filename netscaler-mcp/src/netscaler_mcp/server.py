@@ -1,4 +1,4 @@
-"""FastMCP server exposing NetScaler ADC (NITRO) tools.
+"""MCP server exposing NetScaler ADC (NITRO) tools.
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
 always-on HTTP server. Curated read tools cover the common questions; the raw ``nitro_get`` escape
@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field, validate_call
 
@@ -43,7 +43,7 @@ from . import __version__, bot, lb, waf
 from .client import NitroClient, NitroError
 from .config import DEFAULT_INSTANCE, ConfigError, load_instances
 
-mcp = FastMCP(
+mcp = MCPServer(
     "netscaler-mcp",
     instructions=(
         "Write tools (add_*/remove_*/update_object/change_bindings/delete_object/deploy_*/discard_*/set_*/"
@@ -55,10 +55,8 @@ mcp = FastMCP(
         "instance=<name>; read tools also accept instance='all' to run on each one, and compare_instances "
         "diffs configuration (e.g. GSLB) between them. Writes go to one named instance at a time."
     ),
+    version=__version__,
 )
-# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
-# otherwise send the MCP SDK's version.
-mcp._mcp_server.version = __version__
 
 # Lazily-built clients, one per configured appliance, so the module imports without credentials (tests).
 _clients: dict[str, NitroClient] = {}
@@ -3020,13 +3018,16 @@ def main() -> None:
     # Share the configured clients with the tools.
     _clients = {name: NitroClient(s) for name, s in instances.items()}
 
-    # FastMCP.run() ignores host/port — they must be set on mcp.settings.
-    mcp.settings.host = settings.host
-    mcp.settings.port = settings.port
-    mcp.settings.transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-    )
-    mcp.run(transport=settings.transport)
+    if settings.transport == "streamable-http":
+        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
+        mcp.run(
+            transport="streamable-http",
+            host=settings.host,
+            port=settings.port,
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

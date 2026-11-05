@@ -73,26 +73,26 @@ def test_tools_have_descriptions_and_schemas():
         if name not in EXPECTED_TOOLS:
             continue
         assert tool.description and tool.description.strip(), f"{name} missing description"
-        assert tool.inputSchema and "properties" in tool.inputSchema, f"{name} missing schema"
+        assert tool.input_schema and "properties" in tool.input_schema, f"{name} missing schema"
 
 
 def test_required_params_present():
     tools = _tools()
-    assert "path" in tools["bookstack_get"].inputSchema["properties"]
-    assert "query" in tools["search"].inputSchema["properties"]
-    assert "id" in tools["get_page"].inputSchema["properties"]
-    assert "kind" in tools["export_content"].inputSchema["properties"]
+    assert "path" in tools["bookstack_get"].input_schema["properties"]
+    assert "query" in tools["search"].input_schema["properties"]
+    assert "id" in tools["get_page"].input_schema["properties"]
+    assert "kind" in tools["export_content"].input_schema["properties"]
     # write tools (always registered; gated at call time by BOOKSTACK_ALLOW_WRITE)
     for p in ("name", "book_id", "chapter_id", "markdown", "html", "tags"):
-        assert p in tools["create_page"].inputSchema["properties"]
+        assert p in tools["create_page"].input_schema["properties"]
     for p in ("id", "move_to_book_id", "move_to_chapter_id", "changelog"):
-        assert p in tools["update_page"].inputSchema["properties"]
+        assert p in tools["update_page"].input_schema["properties"]
     for p in ("add_book_ids", "remove_book_ids"):
-        assert p in tools["update_shelf"].inputSchema["properties"]
+        assert p in tools["update_shelf"].input_schema["properties"]
     for p in ("page_id", "body", "reply_to"):
-        assert p in tools["add_comment"].inputSchema["properties"]
+        assert p in tools["add_comment"].input_schema["properties"]
     for name in WRITE_TOOLS:
-        assert "confirm" in tools[name].inputSchema["properties"], name
+        assert "confirm" in tools[name].input_schema["properties"], name
 
 
 def test_settings_requires_credentials():
@@ -420,7 +420,7 @@ def test_create_drawing_confirm_code_is_stable_for_the_same_diagram():
 
 import base64  # noqa: E402
 
-from mcp.server.fastmcp import Image  # noqa: E402
+from mcp.server.mcpserver import Image  # noqa: E402
 
 
 def _upload_client(handler, tmp_path=None, *, confirm_write: bool = False) -> server.BookStackClient:
@@ -715,4 +715,4 @@ def test_version_is_reported():
 
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__
+    assert srv.mcp.version == __version__

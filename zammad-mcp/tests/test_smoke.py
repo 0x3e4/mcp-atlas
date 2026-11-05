@@ -54,24 +54,24 @@ def test_tools_have_descriptions_and_schemas():
         if name not in EXPECTED_TOOLS:
             continue
         assert tool.description and tool.description.strip(), f"{name} missing description"
-        assert tool.inputSchema and "properties" in tool.inputSchema, f"{name} missing schema"
+        assert tool.input_schema and "properties" in tool.input_schema, f"{name} missing schema"
 
 
 def test_required_params_present():
     tools = _tools()
-    assert "path" in tools["zammad_get"].inputSchema["properties"]
-    assert "query" in tools["search_tickets"].inputSchema["properties"]
-    assert "ticket_id" in tools["get_ticket"].inputSchema["properties"]
-    assert "kind" in tools["list_reference"].inputSchema["properties"]
+    assert "path" in tools["zammad_get"].input_schema["properties"]
+    assert "query" in tools["search_tickets"].input_schema["properties"]
+    assert "ticket_id" in tools["get_ticket"].input_schema["properties"]
+    assert "kind" in tools["list_reference"].input_schema["properties"]
     # write tools (always registered; gated at call time by ZAMMAD_ALLOW_WRITE)
     for p in ("ticket_id", "body"):
-        assert p in tools["add_note"].inputSchema["properties"]
+        assert p in tools["add_note"].input_schema["properties"]
     for p in ("ticket_id", "pending_time"):
-        assert p in tools["update_ticket"].inputSchema["properties"]
+        assert p in tools["update_ticket"].input_schema["properties"]
     for p in ("ticket_id", "add", "remove"):
-        assert p in tools["tag_ticket"].inputSchema["properties"]
+        assert p in tools["tag_ticket"].input_schema["properties"]
     for p in ("title", "group", "customer", "body"):
-        assert p in tools["create_ticket"].inputSchema["properties"]
+        assert p in tools["create_ticket"].input_schema["properties"]
 
 
 def test_settings_requires_credentials():
@@ -179,7 +179,7 @@ CONFIRM_TOOLS = {'create_ticket', 'update_ticket', 'add_note', 'tag_ticket', 're
 def test_write_tools_take_a_confirm_code_and_confirm_defaults_on():
     tools = _tools()
     for name in CONFIRM_TOOLS:
-        assert "confirm" in tools[name].inputSchema["properties"], name
+        assert "confirm" in tools[name].input_schema["properties"], name
     assert Settings.from_env(_base_env()).confirm_write is True
     env = _base_env()
     env["ZAMMAD_CONFIRM_WRITE"] = "false"
@@ -344,10 +344,10 @@ def test_get_attachment_returns_images_as_image_content():
     _attachment_client()
     try:
         result = asyncio.run(server.mcp.call_tool("get_attachment", {"ticket_id": 42, "article_id": 9, "attachment_id": 5}))
-        blocks = result[0] if isinstance(result, tuple) else result
+        blocks = result.content
         kinds = [b.type for b in blocks]
         assert kinds == ["text", "image"]
-        assert blocks[1].mimeType == "image/png"
+        assert blocks[1].mime_type == "image/png"
         assert base64.b64decode(blocks[1].data) == _PNG
 
         text = asyncio.run(server.get_attachment(42, 9, 6))[0]
@@ -472,8 +472,8 @@ def test_zammad_get_reads_attachment_links_instead_of_failing_on_non_json():
         # the agent copies the image link straight out of an article body
         result = asyncio.run(server.mcp.call_tool(
             "zammad_get", {"path": "/api/v1/ticket_attachment/42/9/5?view=inline"}))
-        blocks = result[0] if isinstance(result, tuple) else result
-        assert [b.type for b in blocks] == ["text", "image"] and blocks[1].mimeType == "image/png"
+        blocks = result.content
+        assert [b.type for b in blocks] == ["text", "image"] and blocks[1].mime_type == "image/png"
         assert json.loads(blocks[0].text)["path"] == "/api/v1/ticket_attachment/42/9/5?view=inline"
 
         pdf = asyncio.run(server.zammad_get("ticket_attachment/42/9/7"))
@@ -655,4 +655,4 @@ def test_version_is_reported():
 
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__
+    assert srv.mcp.version == __version__

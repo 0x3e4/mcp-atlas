@@ -166,7 +166,7 @@ The servers share a deliberate, lightweight design so they read and operate the 
 - **Trimmed results** — responses are projected to the useful fields and row-capped; pass
   `full=true` for the raw payload.
 - **Clean errors, not tracebacks**, and **secrets only from env vars**.
-- Built on the official **MCP SDK (FastMCP)**, **Poetry** and **httpx**; **stdio** transport by
+- Built on the official **MCP SDK** (2.x, `MCPServer`), **Poetry** and **httpx**; **stdio** transport by
   default with an optional **streamable-http** mode; shipped as a slim, non-root **Docker** image.
 
 ## Versioning
@@ -195,7 +195,7 @@ Copy [`_template/`](_template/) to a new `<name>-mcp/` folder and rename it. Pic
 1. `cp -r _template acme-mcp`, and rename the package dir `src/template_mcp/` → `src/acme_mcp/`.
 2. Find/replace **case-sensitively** across the folder:
    - `template_mcp` → `acme_mcp` — Python package / imports
-   - `template-mcp` → `acme-mcp` — script name, Docker image, FastMCP server name
+   - `template-mcp` → `acme-mcp` — script name, Docker image, MCP server name
    - `TEMPLATE_` → `ACME_` — env-var prefix
    - `template.env` → `acme.env` — local env file
 3. Wire up `config.py` (required env vars), `client.py` (auth + error mapping) and `server.py`

@@ -83,7 +83,7 @@ def test_instance_config_errors(env, message):
 def test_every_appliance_tool_takes_an_instance():
     tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
     for name, tool in tools.items():
-        props = tool.inputSchema["properties"]
+        props = tool.input_schema["properties"]
         if name in ("list_instances", "compare_instances"):
             assert "instance" not in props
             continue

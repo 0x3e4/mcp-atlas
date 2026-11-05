@@ -98,16 +98,16 @@ def test_tools_have_descriptions_and_schemas():
         if name not in EXPECTED_TOOLS:
             continue
         assert tool.description and tool.description.strip(), f"{name} missing description"
-        assert tool.inputSchema and "properties" in tool.inputSchema, f"{name} missing schema"
+        assert tool.input_schema and "properties" in tool.input_schema, f"{name} missing schema"
 
 
 def test_required_params_present():
     tools = _tools()
-    assert "tree" in tools["nitro_get"].inputSchema["properties"]
-    assert "resourcetype" in tools["nitro_get"].inputSchema["properties"]
-    assert "expiring_within_days" in tools["list_certificates"].inputSchema["properties"]
-    assert "kind" in tools["vserver_stats"].inputSchema["properties"]
-    assert "record_type" in tools["list_dns_records"].inputSchema["properties"]
+    assert "tree" in tools["nitro_get"].input_schema["properties"]
+    assert "resourcetype" in tools["nitro_get"].input_schema["properties"]
+    assert "expiring_within_days" in tools["list_certificates"].input_schema["properties"]
+    assert "kind" in tools["vserver_stats"].input_schema["properties"]
+    assert "record_type" in tools["list_dns_records"].input_schema["properties"]
 
 
 def test_settings_requires_credentials():
@@ -302,10 +302,10 @@ def test_check_actions_go_live():
 
 def test_waf_tool_params_present():
     tools = _tools()
-    assert "dry_run" in tools["add_waf_rule"].inputSchema["properties"]
-    assert "host_map" in tools["import_waf_profile"].inputSchema["properties"]
-    assert "from_host" in tools["rehost_waf_profile"].inputSchema["properties"]
-    assert "min_hits" in tools["deploy_waf_learned_rules"].inputSchema["properties"]
+    assert "dry_run" in tools["add_waf_rule"].input_schema["properties"]
+    assert "host_map" in tools["import_waf_profile"].input_schema["properties"]
+    assert "from_host" in tools["rehost_waf_profile"].input_schema["properties"]
+    assert "min_hits" in tools["deploy_waf_learned_rules"].input_schema["properties"]
 
 
 WRITE_TOOLS = {
@@ -320,7 +320,7 @@ WRITE_TOOLS = {
 def test_every_write_tool_takes_a_confirm_code():
     tools = _tools()
     for name in WRITE_TOOLS:
-        props = tools[name].inputSchema["properties"]
+        props = tools[name].input_schema["properties"]
         assert "confirm" in props, f"{name} missing confirm"
         assert "WRITE" in tools[name].description, f"{name} docstring should say WRITE"
         if name != "save_config":
@@ -381,7 +381,7 @@ def test_nitro_get_sends_args_like_the_nitro_reference():
         "/nitro/v1/config/appfwlearningdata?args=profilename:pr_app,securitycheck:startURL",
         "/nitro/v1/config/systemfile?args=filelocation:%2Fnsconfig%2Fssl&pagesize=10&pageno=1",
     ]
-    assert "args" in _tools()["nitro_get"].inputSchema["properties"]
+    assert "args" in _tools()["nitro_get"].input_schema["properties"]
 
 
 def test_missing_lookup_argument_errors_point_to_args():
@@ -401,4 +401,4 @@ def test_version_is_reported():
 
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__
+    assert srv.mcp.version == __version__

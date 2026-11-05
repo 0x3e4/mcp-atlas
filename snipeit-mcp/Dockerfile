@@ -24,5 +24,5 @@ RUN useradd --create-home --uid 10001 appuser
 USER appuser
 
 # stdio transport by default. For streamable-http, set MCP_TRANSPORT=streamable-http and
-# MCP_HOST=0.0.0.0 / FASTMCP_HOST=0.0.0.0, and publish the port (see compose.yml).
+# MCP_HOST=0.0.0.0, and publish the port (see compose.yml).
 ENTRYPOINT ["snipeit-mcp"]

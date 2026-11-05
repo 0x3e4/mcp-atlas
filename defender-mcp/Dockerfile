@@ -25,5 +25,5 @@ RUN useradd --create-home --uid 10001 appuser     && install -d -m 0700 -o appus
 USER appuser
 
 # stdio transport by default. For streamable-http, set MCP_TRANSPORT=streamable-http and
-# FASTMCP_HOST=0.0.0.0, and publish the port (see compose.yml).
+# MCP_HOST=0.0.0.0, and publish the port (see compose.yml).
 ENTRYPOINT ["defender-mcp"]

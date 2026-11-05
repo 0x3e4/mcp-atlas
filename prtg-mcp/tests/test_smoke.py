@@ -65,18 +65,18 @@ def test_tools_have_descriptions_and_schemas():
         if name not in EXPECTED_TOOLS:
             continue
         assert tool.description and tool.description.strip(), f"{name} missing description"
-        assert tool.inputSchema and "properties" in tool.inputSchema, f"{name} missing schema"
+        assert tool.input_schema and "properties" in tool.input_schema, f"{name} missing schema"
 
 
 def test_required_params_present():
     tools = _tools()
-    assert "endpoint" in tools["prtg_get"].inputSchema["properties"]
-    assert "sensor_id" in tools["list_channels"].inputSchema["properties"]
-    assert "sensor_id" in tools["get_sensor"].inputSchema["properties"]
+    assert "endpoint" in tools["prtg_get"].input_schema["properties"]
+    assert "sensor_id" in tools["list_channels"].input_schema["properties"]
+    assert "sensor_id" in tools["get_sensor"].input_schema["properties"]
     for p in ("sensor_id", "start", "end"):
-        assert p in tools["historic_data"].inputSchema["properties"]
+        assert p in tools["historic_data"].input_schema["properties"]
     for name in WRITE_TOOLS:
-        assert "confirm" in tools[name].inputSchema["properties"], name
+        assert "confirm" in tools[name].input_schema["properties"], name
 
 
 def test_settings_requires_base_url():
@@ -439,4 +439,4 @@ def test_version_is_reported():
 
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__
+    assert srv.mcp.version == __version__

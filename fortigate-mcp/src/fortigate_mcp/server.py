@@ -1,4 +1,4 @@
-"""FastMCP server exposing FortiGate (FortiOS REST API) tools.
+"""MCP server exposing FortiGate (FortiOS REST API) tools.
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
 always-on HTTP server. Read tools (GET) cover the common questions across the cmdb (config) and
@@ -21,7 +21,7 @@ import sys
 from typing import Annotated, Any
 from urllib.parse import quote
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
@@ -29,7 +29,7 @@ from . import __version__
 from .client import FortiClient, FortiError
 from .config import ConfigError, Settings
 
-mcp = FastMCP(
+mcp = MCPServer(
     "fortigate-mcp",
     instructions=(
         "Write tools (create_address/update_address/add_to_address_group/remove_from_address_group/"
@@ -37,10 +37,8 @@ mcp = FastMCP(
         "preview with a confirm_code. Show the user a short overview of what will change, end with "
         "'Confirm it?', and only after they say yes repeat the call with confirm=<code>."
     ),
+    version=__version__,
 )
-# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
-# otherwise send the MCP SDK's version.
-mcp._mcp_server.version = __version__
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: FortiClient | None = None
@@ -654,13 +652,16 @@ def main() -> None:
     global _client
     _client = FortiClient(settings)
 
-    # FastMCP.run() ignores host/port — they must be set on the instance settings.
-    mcp.settings.host = settings.host
-    mcp.settings.port = settings.port
-    mcp.settings.transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-    )
-    mcp.run(transport=settings.transport)
+    if settings.transport == "streamable-http":
+        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
+        mcp.run(
+            transport="streamable-http",
+            host=settings.host,
+            port=settings.port,
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

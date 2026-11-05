@@ -1,4 +1,4 @@
-"""FastMCP server exposing NetBox (DCIM/IPAM) tools.
+"""MCP server exposing NetBox (DCIM/IPAM) tools.
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
 always-on HTTP server. Read tools (GET) cover devices, interfaces, IP addresses/prefixes, virtual
@@ -20,7 +20,7 @@ import secrets
 import sys
 from typing import Annotated, Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
@@ -28,7 +28,7 @@ from . import __version__
 from .client import NetBoxClient
 from .config import ConfigError, Settings
 
-mcp = FastMCP(
+mcp = MCPServer(
     "netbox-mcp",
     instructions=(
         "Write tools (create_ip_address/update_ip_address/assign_next_ip/update_device/add_journal_entry) "
@@ -36,10 +36,8 @@ mcp = FastMCP(
         "confirm_code. Show the user a short overview of what will change, end with 'Confirm it?', and "
         "only after they say yes repeat the call with confirm=<code>."
     ),
+    version=__version__,
 )
-# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
-# otherwise send the MCP SDK's version.
-mcp._mcp_server.version = __version__
 
 _client: NetBoxClient | None = None
 
@@ -500,12 +498,16 @@ def main() -> None:
     global _client
     _client = NetBoxClient(settings)
 
-    mcp.settings.host = settings.host
-    mcp.settings.port = settings.port
-    mcp.settings.transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-    )
-    mcp.run(transport=settings.transport)
+    if settings.transport == "streamable-http":
+        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
+        mcp.run(
+            transport="streamable-http",
+            host=settings.host,
+            port=settings.port,
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

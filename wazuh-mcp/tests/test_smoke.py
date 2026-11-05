@@ -32,18 +32,18 @@ def test_all_tools_registered_with_descriptions():
     assert READ_TOOLS | WRITE_TOOLS <= set(tools)
     for name in READ_TOOLS | WRITE_TOOLS:
         assert tools[name].description and tools[name].description.strip(), name
-        assert "properties" in tools[name].inputSchema, name
+        assert "properties" in tools[name].input_schema, name
 
 
 def test_write_tools_take_a_confirm_code():
     tools = _tools()
     for name in WRITE_TOOLS:
-        assert "confirm" in tools[name].inputSchema["properties"], name
-    assert "agent_ids" in tools["restart_agents"].inputSchema["properties"]
+        assert "confirm" in tools[name].input_schema["properties"], name
+    assert "agent_ids" in tools["restart_agents"].input_schema["properties"]
     for p in ("agent_id", "group_id", "exclusive"):
-        assert p in tools["add_agent_to_group"].inputSchema["properties"]
+        assert p in tools["add_agent_to_group"].input_schema["properties"]
     for p in ("agent_ids", "command", "arguments", "alert_data"):
-        assert p in tools["run_active_response"].inputSchema["properties"]
+        assert p in tools["run_active_response"].input_schema["properties"]
 
 
 def _settings(monkeypatch, **env: str) -> Settings:
@@ -193,4 +193,4 @@ def test_version_is_reported():
 
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__
+    assert srv.mcp.version == __version__

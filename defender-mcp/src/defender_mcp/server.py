@@ -1,4 +1,4 @@
-"""FastMCP server exposing Microsoft Defender XDR tools (Microsoft Graph security API).
+"""MCP server exposing Microsoft Defender XDR tools (Microsoft Graph security API).
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
 always-on HTTP server. Read tools cover advanced hunting, incidents, alerts, devices,
@@ -24,7 +24,7 @@ import sys
 import time
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
@@ -32,7 +32,7 @@ from . import __version__, tokencache
 from .config import ConfigError, Settings
 from .graph import GraphClient, GraphError
 
-mcp = FastMCP(
+mcp = MCPServer(
     "defender-mcp",
     instructions=(
         "Write tools (update_incident/update_alert/add_incident_comment/add_alert_comment, create_case/"
@@ -42,10 +42,8 @@ mcp = FastMCP(
         "call with confirm=<code>. whoami shows whether calls run as a signed-in user or as the app; "
         "with a signed-in user, assigned_to='me' assigns to that user."
     ),
+    version=__version__,
 )
-# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
-# otherwise send the MCP SDK's version.
-mcp._mcp_server.version = __version__
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: GraphClient | None = None
@@ -1059,13 +1057,16 @@ def main() -> None:
     global _client
     _client = GraphClient(settings)
 
-    # FastMCP.run() ignores host/port — they must be set on the instance settings.
-    mcp.settings.host = settings.host
-    mcp.settings.port = settings.port
-    mcp.settings.transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-    )
-    mcp.run(transport=settings.transport)
+    if settings.transport == "streamable-http":
+        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
+        mcp.run(
+            transport="streamable-http",
+            host=settings.host,
+            port=settings.port,
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

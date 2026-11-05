@@ -1,4 +1,4 @@
-"""FastMCP server exposing Wazuh tools over stdio (or streamable-http).
+"""MCP server exposing Wazuh tools over stdio (or streamable-http).
 
 Events (alerts/archives/vulnerabilities) are queried from the Wazuh Indexer; agents,
 inventory, rules, SCA and status come from the Manager REST API. Two raw escape-hatch
@@ -21,7 +21,7 @@ import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
@@ -51,7 +51,7 @@ def indexer() -> IndexerClient:
 
 
 @asynccontextmanager
-async def lifespan(_server: FastMCP):
+async def lifespan(_server: MCPServer):
     try:
         yield {}
     finally:
@@ -61,7 +61,7 @@ async def lifespan(_server: FastMCP):
             await _indexer.aclose()
 
 
-mcp = FastMCP(
+mcp = MCPServer(
     "wazuh",
     instructions=(
         "Write tools (restart_agents, add_agent_to_group, remove_agent_from_group, run_active_response) "
@@ -70,12 +70,8 @@ mcp = FastMCP(
         "only after they say yes repeat the call with confirm=<code>."
     ),
     lifespan=lifespan,
-    host=settings.host,
-    port=settings.port,
+    version=__version__,
 )
-# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
-# otherwise send the MCP SDK's version.
-mcp._mcp_server.version = __version__
 
 
 # --------------------------------------------------------------------------- helpers
@@ -596,11 +592,16 @@ async def run_active_response(
 
 
 def main() -> None:
-    transport = "streamable-http" if settings.transport == "streamable-http" else "stdio"
-    mcp.settings.transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-    )
-    mcp.run(transport=transport)
+    if settings.transport == "streamable-http":
+        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
+        mcp.run(
+            transport="streamable-http",
+            host=settings.host,
+            port=settings.port,
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

@@ -49,21 +49,21 @@ def test_tools_have_descriptions_and_schemas():
         if name not in EXPECTED_TOOLS:
             continue
         assert tool.description and tool.description.strip(), f"{name} missing description"
-        assert tool.inputSchema and "properties" in tool.inputSchema, f"{name} missing schema"
+        assert tool.input_schema and "properties" in tool.input_schema, f"{name} missing schema"
 
 
 def test_required_params_present():
     tools = _tools()
-    assert "path" in tools["azdo_get"].inputSchema["properties"]
-    assert "wiql" in tools["query_work_items"].inputSchema["properties"]
-    assert "ids" in tools["get_work_items"].inputSchema["properties"]
-    assert "repository" in tools["list_branches"].inputSchema["properties"]
+    assert "path" in tools["azdo_get"].input_schema["properties"]
+    assert "wiql" in tools["query_work_items"].input_schema["properties"]
+    assert "ids" in tools["get_work_items"].input_schema["properties"]
+    assert "repository" in tools["list_branches"].input_schema["properties"]
     # write tools (always registered; gated at call time by AZDO_ALLOW_WRITE)
-    assert "work_item_type" in tools["create_work_item"].inputSchema["properties"]
-    assert "title" in tools["create_work_item"].inputSchema["properties"]
-    assert "id" in tools["update_work_item"].inputSchema["properties"]
+    assert "work_item_type" in tools["create_work_item"].input_schema["properties"]
+    assert "title" in tools["create_work_item"].input_schema["properties"]
+    assert "id" in tools["update_work_item"].input_schema["properties"]
     for p in ("wiki", "path", "content"):
-        assert p in tools["create_or_update_wiki_page"].inputSchema["properties"]
+        assert p in tools["create_or_update_wiki_page"].input_schema["properties"]
 
 
 def test_settings_requires_credentials():
@@ -127,7 +127,7 @@ CONFIRM_TOOLS = {'update_work_item', 'create_work_item', 'create_or_update_wiki_
 def test_write_tools_take_a_confirm_code_and_confirm_defaults_on():
     tools = _tools()
     for name in CONFIRM_TOOLS:
-        assert "confirm" in tools[name].inputSchema["properties"], name
+        assert "confirm" in tools[name].input_schema["properties"], name
     assert Settings.from_env(_base_env()).confirm_write is True
     env = _base_env()
     env["AZDO_CONFIRM_WRITE"] = "false"
@@ -175,4 +175,4 @@ def test_version_is_reported():
 
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__
+    assert srv.mcp.version == __version__

@@ -43,19 +43,19 @@ def test_tools_have_descriptions_and_schemas():
         if name not in EXPECTED_TOOLS:
             continue
         assert tool.description and tool.description.strip(), f"{name} missing description"
-        assert tool.inputSchema and "properties" in tool.inputSchema, f"{name} missing schema"
+        assert tool.input_schema and "properties" in tool.input_schema, f"{name} missing schema"
 
 
 def test_required_params_present():
     tools = _tools()
-    assert "path" in tools["snipeit_get"].inputSchema["properties"]
-    assert "kind" in tools["list_objects"].inputSchema["properties"]
-    assert "user_id" in tools["get_user_assets"].inputSchema["properties"]
+    assert "path" in tools["snipeit_get"].input_schema["properties"]
+    assert "kind" in tools["list_objects"].input_schema["properties"]
+    assert "user_id" in tools["get_user_assets"].input_schema["properties"]
     for p in ("asset_id", "to_type", "to_id"):
-        assert p in tools["checkout_asset"].inputSchema["properties"]
+        assert p in tools["checkout_asset"].input_schema["properties"]
     for p in ("asset_tag", "model_id", "status_id"):
-        assert p in tools["create_asset"].inputSchema["properties"]
-    assert "asset_tag" in tools["audit_asset"].inputSchema["properties"]
+        assert p in tools["create_asset"].input_schema["properties"]
+    assert "asset_tag" in tools["audit_asset"].input_schema["properties"]
 
 
 def test_settings_requires_credentials():
@@ -112,7 +112,7 @@ CONFIRM_TOOLS = {'checkin_asset', 'update_asset', 'audit_asset', 'create_asset',
 def test_write_tools_take_a_confirm_code_and_confirm_defaults_on():
     tools = _tools()
     for name in CONFIRM_TOOLS:
-        assert "confirm" in tools[name].inputSchema["properties"], name
+        assert "confirm" in tools[name].input_schema["properties"], name
     assert Settings.from_env(_base_env()).confirm_write is True
     env = _base_env()
     env["SNIPEIT_CONFIRM_WRITE"] = "false"
@@ -160,4 +160,4 @@ def test_version_is_reported():
 
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__
+    assert srv.mcp.version == __version__

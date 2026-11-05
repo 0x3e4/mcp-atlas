@@ -1,4 +1,4 @@
-"""FastMCP server exposing VMware vCenter (vSphere Automation API) tools.
+"""MCP server exposing VMware vCenter (vSphere Automation API) tools.
 
 Transport defaults to ``stdio`` (for Claude Code); set ``MCP_TRANSPORT=streamable-http`` for an
 always-on HTTP server. Read tools (GET) cover VMs, hosts, clusters, datastores, networks and appliance
@@ -20,7 +20,7 @@ import secrets
 import sys
 from typing import Annotated, Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
@@ -28,7 +28,7 @@ from . import __version__
 from .client import VCenterClient
 from .config import ConfigError, Settings
 
-mcp = FastMCP(
+mcp = MCPServer(
     "vcenter-mcp",
     instructions=(
         "Write tools (vm_power/vm_guest_power) need the user's confirmation: the first call changes "
@@ -36,10 +36,8 @@ mcp = FastMCP(
         "change, end with 'Confirm it?', and only after they say yes repeat the call with confirm=<code>. "
         "Prefer vm_guest_power (clean shutdown/reboot via VMware Tools) over the hard vm_power actions."
     ),
+    version=__version__,
 )
-# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
-# otherwise send the MCP SDK's version.
-mcp._mcp_server.version = __version__
 
 _client: VCenterClient | None = None
 
@@ -381,12 +379,16 @@ def main() -> None:
     global _client
     _client = VCenterClient(settings)
 
-    mcp.settings.host = settings.host
-    mcp.settings.port = settings.port
-    mcp.settings.transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-    )
-    mcp.run(transport=settings.transport)
+    if settings.transport == "streamable-http":
+        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
+        mcp.run(
+            transport="streamable-http",
+            host=settings.host,
+            port=settings.port,
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

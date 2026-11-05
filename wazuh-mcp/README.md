@@ -179,7 +179,6 @@ services:
     environment:
       MCP_TRANSPORT: streamable-http
       MCP_HOST: 0.0.0.0
-      FASTMCP_HOST: 0.0.0.0
       MCP_PORT: "8000"
     # no `ports:` — only the gateway reaches it, over atlas-net
     networks: [atlas-net]

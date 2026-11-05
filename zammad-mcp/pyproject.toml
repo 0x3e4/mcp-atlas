@@ -12,7 +12,7 @@ license = "MIT"
 authors = [{ name = "cai", email = "cai@nohub.lol" }]
 keywords = ["mcp", "zammad", "helpdesk", "ticketing", "support"]
 dependencies = [
-    "mcp[cli]>=1.30,<2",
+    "mcp[cli]>=2.3,<3",
     "httpx>=0.28",
     "pypdfium2>=5,<6",
     "olefile>=0.47",

@@ -56,26 +56,26 @@ def test_tools_have_descriptions_and_schemas():
         if name not in EXPECTED_TOOLS:
             continue
         assert tool.description and tool.description.strip(), f"{name} missing description"
-        assert tool.inputSchema and "properties" in tool.inputSchema, f"{name} missing schema"
+        assert tool.input_schema and "properties" in tool.input_schema, f"{name} missing schema"
 
 
 def test_required_params_present():
     tools = _tools()
-    assert "tree" in tools["fortios_get"].inputSchema["properties"]
-    assert "path" in tools["fortios_get"].inputSchema["properties"]
-    assert "ipv6" in tools["list_policies"].inputSchema["properties"]
-    assert "groups" in tools["list_addresses"].inputSchema["properties"]
+    assert "tree" in tools["fortios_get"].input_schema["properties"]
+    assert "path" in tools["fortios_get"].input_schema["properties"]
+    assert "ipv6" in tools["list_policies"].input_schema["properties"]
+    assert "groups" in tools["list_addresses"].input_schema["properties"]
     # write tools (always registered; gated at call time by FORTIGATE_ALLOW_WRITE)
     for p in ("name", "subnet", "fqdn", "start_ip", "end_ip", "comment", "vdom"):
-        assert p in tools["create_address"].inputSchema["properties"]
-        assert p in tools["update_address"].inputSchema["properties"]
+        assert p in tools["create_address"].input_schema["properties"]
+        assert p in tools["update_address"].input_schema["properties"]
     for name in ("add_to_address_group", "remove_from_address_group"):
         for p in ("group", "members", "vdom"):
-            assert p in tools[name].inputSchema["properties"]
+            assert p in tools[name].input_schema["properties"]
     for p in ("policy_id", "enabled", "comment", "vdom"):
-        assert p in tools["set_policy_status"].inputSchema["properties"]
+        assert p in tools["set_policy_status"].input_schema["properties"]
     for name in WRITE_TOOLS:
-        assert "confirm" in tools[name].inputSchema["properties"], name
+        assert "confirm" in tools[name].input_schema["properties"], name
 
 
 def test_settings_requires_credentials():
@@ -280,4 +280,4 @@ def test_version_is_reported():
 
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__
+    assert srv.mcp.version == __version__

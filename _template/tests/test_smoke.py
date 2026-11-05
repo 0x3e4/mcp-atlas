@@ -37,13 +37,13 @@ def test_tools_have_descriptions_and_schemas():
         if name not in EXPECTED_TOOLS:
             continue
         assert tool.description and tool.description.strip(), f"{name} missing description"
-        assert tool.inputSchema and "properties" in tool.inputSchema, f"{name} missing schema"
+        assert tool.input_schema and "properties" in tool.input_schema, f"{name} missing schema"
 
 
 def test_required_params_present():
     tools = _tools()
-    assert "item_id" in tools["get_item"].inputSchema["properties"]
-    assert "path" in tools["api_get"].inputSchema["properties"]
+    assert "item_id" in tools["get_item"].input_schema["properties"]
+    assert "path" in tools["api_get"].input_schema["properties"]
 
 
 def test_settings_requires_credentials():
@@ -82,7 +82,7 @@ def _write_env() -> dict[str, str]:
 def test_write_flags_default_to_off_and_confirm():
     s = Settings.from_env({"TEMPLATE_BASE_URL": "https://api.example.com", "TEMPLATE_API_KEY": "k"})
     assert s.allow_write is False and s.confirm_write is True
-    assert "confirm" in _tools()["update_item"].inputSchema["properties"]
+    assert "confirm" in _tools()["update_item"].input_schema["properties"]
 
 
 def test_write_refused_without_allow_write():
@@ -129,4 +129,4 @@ def test_version_is_reported():
 
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__
+    assert srv.mcp.version == __version__

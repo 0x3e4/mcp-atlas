@@ -61,24 +61,24 @@ def test_tools_have_descriptions_and_schemas():
         if name not in EXPECTED_TOOLS:
             continue
         assert tool.description and tool.description.strip(), f"{name} missing description"
-        assert tool.inputSchema and "properties" in tool.inputSchema, f"{name} missing schema"
+        assert tool.input_schema and "properties" in tool.input_schema, f"{name} missing schema"
 
 
 def test_required_params_present():
     tools = _tools()
-    assert "query" in tools["advanced_hunting"].inputSchema["properties"]
-    assert "incident_id" in tools["get_incident"].inputSchema["properties"]
-    assert "alert_id" in tools["get_alert"].inputSchema["properties"]
-    assert "kql" in tools["graph_hunt"].inputSchema["properties"]
-    assert "path" in tools["graph_get"].inputSchema["properties"]
+    assert "query" in tools["advanced_hunting"].input_schema["properties"]
+    assert "incident_id" in tools["get_incident"].input_schema["properties"]
+    assert "alert_id" in tools["get_alert"].input_schema["properties"]
+    assert "kql" in tools["graph_hunt"].input_schema["properties"]
+    assert "path" in tools["graph_get"].input_schema["properties"]
     for p in ("incident_id", "status", "assigned_to", "classification", "determination", "custom_tags"):
-        assert p in tools["update_incident"].inputSchema["properties"]
+        assert p in tools["update_incident"].input_schema["properties"]
     for p in ("alert_id", "status", "assigned_to", "classification", "determination"):
-        assert p in tools["update_alert"].inputSchema["properties"]
-    assert "comment" in tools["add_incident_comment"].inputSchema["properties"]
-    assert "comment" in tools["add_alert_comment"].inputSchema["properties"]
+        assert p in tools["update_alert"].input_schema["properties"]
+    assert "comment" in tools["add_incident_comment"].input_schema["properties"]
+    assert "comment" in tools["add_alert_comment"].input_schema["properties"]
     for name in WRITE_TOOLS:
-        assert "confirm" in tools[name].inputSchema["properties"], name
+        assert "confirm" in tools[name].input_schema["properties"], name
 
 
 def test_settings_requires_credentials():
@@ -270,4 +270,4 @@ def test_version_is_reported():
 
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__
+    assert srv.mcp.version == __version__

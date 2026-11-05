@@ -20,7 +20,7 @@ import zlib
 from html.parser import HTMLParser
 from typing import Any
 
-from mcp.server.fastmcp import Image
+from mcp.server.mcpserver import Image
 
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 MAX_IMAGE_BYTES = 3_750_000  # ≈ 5 MB once base64-encoded, the API's per-image limit
