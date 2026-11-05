@@ -390,3 +390,15 @@ def test_missing_lookup_argument_errors_point_to_args():
     assert "args" in _format_nitro_error({"errorcode": 1090, "message": "No such argument [arguid]"})
     # a write missing a body attribute isn't an args problem
     assert "args" not in _format_nitro_error({"errorcode": 1095, "message": "Required argument missing [name]"}, write=True)
+
+
+def test_version_is_reported():
+    """pyproject, __version__ and the MCP handshake's serverInfo.version agree."""
+    import pathlib
+    import tomllib
+
+    from netscaler_mcp import __version__, server as srv
+
+    pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    assert __version__ == pyproject["project"]["version"]
+    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__

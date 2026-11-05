@@ -1,6 +1,6 @@
 [project]
 name = "wazuh-mcp"
-version = "0.2.0"
+version = "1.0.0"
 description = "Lightweight MCP server for querying Wazuh alerts, archives, and management data, with opt-in agent write actions"
 authors = [{ name = "cai", email = "cai@nohub.lol" }]
 readme = "README.md"

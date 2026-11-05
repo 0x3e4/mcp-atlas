@@ -29,7 +29,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
-from . import attachments
+from . import __version__, attachments
 from .client import BookStackClient, BookStackError
 from .config import ConfigError, Settings
 from .drawio import embed_xml, extract_xml, normalize_xml
@@ -42,6 +42,9 @@ mcp = FastMCP(
         "change, end with 'Confirm it?', and only after they say yes repeat the call with confirm=<code>."
     ),
 )
+# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
+# otherwise send the MCP SDK's version.
+mcp._mcp_server.version = __version__
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: BookStackClient | None = None

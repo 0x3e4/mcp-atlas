@@ -44,6 +44,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Read the server version
+        id: version
+        run: echo "version=$(python3 -c 'import tomllib; print(tomllib.load(open("${{ matrix.server }}/pyproject.toml", "rb"))["project"]["version"])')" >> "$GITHUB_OUTPUT"
+
       - name: Build and push ${{ matrix.server }}
         uses: docker/build-push-action@v7
         with:
@@ -52,7 +56,9 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ matrix.server }}:latest
             ghcr.io/${{ github.repository_owner }}/${{ matrix.server }}:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.server }}:${{ steps.version.outputs.version }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
           cache-from: type=gha,scope=${{ matrix.server }}
           cache-to: type=gha,mode=max,scope=${{ matrix.server }}

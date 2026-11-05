@@ -644,3 +644,15 @@ def test_get_ticket_links_with_content_reads_the_linked_tickets():
     assert newest["body_truncated"] is True and newest["attachments"][0]["filename"] == "log.txt"
     parent = next(l for l in out["links"] if l["ticket_id"] == 44)
     assert parent["link_type"] == "parent" and "403" in parent["error"]
+
+
+def test_version_is_reported():
+    """pyproject, __version__ and the MCP handshake's serverInfo.version agree."""
+    import pathlib
+    import tomllib
+
+    from zammad_mcp import __version__, server as srv
+
+    pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    assert __version__ == pyproject["project"]["version"]
+    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__

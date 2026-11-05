@@ -28,7 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
-from . import tokencache
+from . import __version__, tokencache
 from .config import ConfigError, Settings
 from .graph import GraphClient, GraphError
 
@@ -43,6 +43,9 @@ mcp = FastMCP(
         "with a signed-in user, assigned_to='me' assigns to that user."
     ),
 )
+# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
+# otherwise send the MCP SDK's version.
+mcp._mcp_server.version = __version__
 
 # Lazily-built shared client so the module imports without credentials (e.g. for tests).
 _client: GraphClient | None = None

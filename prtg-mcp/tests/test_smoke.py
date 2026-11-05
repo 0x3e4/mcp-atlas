@@ -428,3 +428,15 @@ def test_tag_merge_is_bound_into_the_confirm_code():
         asyncio.run(calls())
     finally:
         server._client = None
+
+
+def test_version_is_reported():
+    """pyproject, __version__ and the MCP handshake's serverInfo.version agree."""
+    import pathlib
+    import tomllib
+
+    from prtg_mcp import __version__, server as srv
+
+    pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    assert __version__ == pyproject["project"]["version"]
+    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__

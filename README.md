@@ -169,6 +169,24 @@ The servers share a deliberate, lightweight design so they read and operate the 
 - Built on the official **MCP SDK (FastMCP)**, **Poetry** and **httpx**; **stdio** transport by
   default with an optional **streamable-http** mode; shipped as a slim, non-root **Docker** image.
 
+## Versioning
+
+Each server has its own version, following [Semantic Versioning](https://semver.org). All servers
+started at **1.0.0** on 2026-11-05.
+
+- **MAJOR**: a tool is removed or renamed, a parameter is removed or changes meaning, or an env var
+  changes incompatibly. Existing prompts, gateway configs or env files may break.
+- **MINOR**: new tools, new optional parameters or new env vars. Existing setups keep working.
+- **PATCH**: fixes, dependency and security updates, doc changes.
+
+The version lives in two places that must match: `version` in the server's `pyproject.toml` and
+`__version__` in `src/<package>/__init__.py`. A smoke test checks that they agree. Clients see the
+version as `serverInfo.version` in the MCP handshake.
+
+CI tags every image `:latest`, `:<git sha>` and `:<version>`. Until the version is bumped,
+`:<version>` follows the newest build of that version. Bump it in the same commit as the change, then
+pin `image: ghcr.io/<owner>/<server>:<version>` in `compose.yml` where you don't want `:latest`.
+
 ## Adding a server
 
 Copy [`_template/`](_template/) to a new `<name>-mcp/` folder and rename it. Pick a name (e.g.
@@ -182,7 +200,8 @@ Copy [`_template/`](_template/) to a new `<name>-mcp/` folder and rename it. Pic
    - `template.env` → `acme.env` — local env file
 3. Wire up `config.py` (required env vars), `client.py` (auth + error mapping) and `server.py`
    (replace the example tools; keep `api_get` as the raw escape hatch) for your API.
-4. Update `tests/test_smoke.py` (`EXPECTED_TOOLS`) and the server's own `README.md`.
+4. Update `tests/test_smoke.py` (`EXPECTED_TOOLS`) and the server's own `README.md`. Set the
+   version (`pyproject.toml` + `__init__.py`) to `0.1.0` until the first release, then `1.0.0`.
 5. Add a row for the new server to the table above.
 
 The [`_template/README.md`](_template/README.md) doubles as the per-server README skeleton — edit it

@@ -25,6 +25,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
+from . import __version__
 from .config import Settings, WazuhError
 from .indexer import IndexerClient
 from .manager import ManagerClient
@@ -72,6 +73,9 @@ mcp = FastMCP(
     host=settings.host,
     port=settings.port,
 )
+# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
+# otherwise send the MCP SDK's version.
+mcp._mcp_server.version = __version__
 
 
 # --------------------------------------------------------------------------- helpers

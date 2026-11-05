@@ -210,3 +210,15 @@ def test_writes_need_a_matching_confirm_code():
     finally:
         server._client = None
     assert [r for r in seen if r[0] == "POST"] == [("POST", "/api/vcenter/vm/vm-42/power", "action=stop")]
+
+
+def test_version_is_reported():
+    """pyproject, __version__ and the MCP handshake's serverInfo.version agree."""
+    import pathlib
+    import tomllib
+
+    from vcenter_mcp import __version__, server as srv
+
+    pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    assert __version__ == pyproject["project"]["version"]
+    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__

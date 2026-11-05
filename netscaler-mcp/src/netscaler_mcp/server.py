@@ -39,7 +39,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field, validate_call
 
-from . import bot, lb, waf
+from . import __version__, bot, lb, waf
 from .client import NitroClient, NitroError
 from .config import DEFAULT_INSTANCE, ConfigError, load_instances
 
@@ -56,6 +56,9 @@ mcp = FastMCP(
         "diffs configuration (e.g. GSLB) between them. Writes go to one named instance at a time."
     ),
 )
+# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
+# otherwise send the MCP SDK's version.
+mcp._mcp_server.version = __version__
 
 # Lazily-built clients, one per configured appliance, so the module imports without credentials (tests).
 _clients: dict[str, NitroClient] = {}

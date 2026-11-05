@@ -247,3 +247,15 @@ def test_writes_need_a_matching_confirm_code():
     finally:
         server._client = None
     assert sent == [("POST", "/api/ipam/prefixes/4/available-ips/")]
+
+
+def test_version_is_reported():
+    """pyproject, __version__ and the MCP handshake's serverInfo.version agree."""
+    import pathlib
+    import tomllib
+
+    from netbox_mcp import __version__, server as srv
+
+    pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    assert __version__ == pyproject["project"]["version"]
+    assert srv.mcp._mcp_server.create_initialization_options().server_version == __version__

@@ -24,6 +24,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
+from . import __version__
 from .client import VCenterClient
 from .config import ConfigError, Settings
 
@@ -36,6 +37,9 @@ mcp = FastMCP(
         "Prefer vm_guest_power (clean shutdown/reboot via VMware Tools) over the hard vm_power actions."
     ),
 )
+# Report this server's own version in the MCP handshake (serverInfo.version); FastMCP would
+# otherwise send the MCP SDK's version.
+mcp._mcp_server.version = __version__
 
 _client: VCenterClient | None = None
 
