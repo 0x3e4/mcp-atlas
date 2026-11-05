@@ -623,3 +623,84 @@ def test_upload_confirm_code_binds_the_file_content():
         assert other["status"] == "confirmation_required" and sent == []
     finally:
         server._client = None
+
+
+# ---- same user in the browser and through the token ------------------------
+
+def test_client_never_sends_cookies_back():
+    """A session cookie would make BookStack ignore the token (403 for everyone using the server)."""
+    from bookstack_mcp.client import no_cookies
+
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("cookie"))
+        return httpx.Response(200, json={}, headers={"set-cookie": "bookstack_session=abc; path=/; httponly"})
+
+    async def calls():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), cookies=no_cookies()) as client:
+            await client.get("https://docs.example.com/api/books")
+            await client.put("https://docs.example.com/api/pages/1", json={})
+
+    asyncio.run(calls())
+    assert seen == [None, None]
+
+
+def test_bookstack_get_reads_only_the_api():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"data": []})
+
+    server._client = _write_client(handler)
+    try:
+        asyncio.run(server.bookstack_get("https://docs.example.com/api/books"))
+        asyncio.run(server.bookstack_get("/api/users"))
+        for web in ("https://docs.example.com/link/12", "https://docs.example.com/uploads/images/x.png", "docs"):
+            with pytest.raises(ValueError):
+                asyncio.run(server.bookstack_get(web))
+    finally:
+        server._client = None
+    assert seen == ["/api/books", "/api/users"]
+
+
+def test_cookie_session_403_is_explained():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": {"code": 403, "message": (
+            "Only GET requests are allowed when using the API with cookie-based authentication")}})
+
+    server._client = _write_client(handler)
+    try:
+        with pytest.raises(BookStackError, match="browser session instead of the token"):
+            asyncio.run(server.create_book("x"))
+    finally:
+        server._client = None
+
+
+def test_body_update_confirm_code_is_tied_to_the_page_revision():
+    page = {"id": 12, "revision_count": 4, "updated_at": "2026-11-05T10:00:00.000000Z"}
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json=page)
+        return httpx.Response(200, json={"id": 12, "name": "Runbook", "slug": "runbook", "book_slug": "ops"})
+
+    server._client = _write_client(handler, confirm_write=True)
+
+    async def calls():
+        preview = await server.update_page(12, markdown="# New")
+        assert preview["change"]["page_revision"]["revision_count"] == 4
+        page.update(revision_count=5, updated_at="2026-11-05T10:05:00.000000Z")  # saved in the browser meanwhile
+        again = await server.update_page(12, markdown="# New", confirm=preview["confirm_code"])
+        assert again["status"] == "confirmation_required" and "did not match" in again["note"]
+        done = await server.update_page(12, markdown="# New", confirm=again["confirm_code"])
+        assert done["id"] == 12
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None
+    assert sent == ["GET", "GET", "GET", "PUT"]

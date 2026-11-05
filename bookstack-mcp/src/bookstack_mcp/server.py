@@ -450,7 +450,10 @@ async def update_page(
 
     PUTs /api/pages/{id}; only the fields you give change. A new body replaces the whole content
     (read it with get_page first to edit in place); BookStack keeps the old version as a revision.
-    Moving needs delete permission on the page.
+    Moving needs delete permission on the page. A body change's confirm code is tied to the page's
+    current revision, so if someone saves the page between preview and confirmation, it asks again.
+    If the token belongs to a person who has this page open in the web editor, the update discards
+    their unsaved editor draft (BookStack deletes the token user's own drafts on every update).
     """
     _require_write()
     if markdown is not None and html is not None:
@@ -463,7 +466,12 @@ async def update_page(
     )
     if not payload.keys() - {"changelog"}:
         raise ValueError("Nothing to update: provide name, markdown/html, tags or a move target.")
-    if preview := _confirm("update_page", {"id": id, **payload}, f"Update page {id}: {', '.join(payload)}.", confirm):
+    change: dict[str, Any] = {"id": id, **payload}
+    if _get_client().settings.confirm_write and (markdown is not None or html is not None):
+        # bind the code to the revision the user saw, so a save in the browser meanwhile needs a new yes
+        page = await _get_client().get(f"pages/{id}")
+        change["page_revision"] = {"revision_count": page.get("revision_count"), "updated_at": page.get("updated_at")}
+    if preview := _confirm("update_page", change, f"Update page {id}: {', '.join(payload)}.", confirm):
         return preview
     return _written("page", await _get_client().put(f"pages/{id}", json=payload))
 

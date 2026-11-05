@@ -6,10 +6,15 @@ sent as ``Authorization: Token <id>:<secret>`` on every request. List endpoints 
 return text. Failures become a clean ``BookStackError`` (with the per-field reasons of a 422) so
 tools never leak tracebacks to the model. Writes (POST/PUT JSON) are gated at the tool layer by
 ``BOOKSTACK_ALLOW_WRITE``.
+
+The client keeps **no cookies**: BookStack's API routes start a web session whenever a session cookie
+comes along and then ignore the token, so a ``bookstack_session`` cookie picked up once (e.g. from a
+web route) would turn every later call into a 403 for all users of this server.
 """
 
 from __future__ import annotations
 
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 
 import httpx
@@ -43,6 +48,7 @@ class BookStackClient:
             self._client = httpx.AsyncClient(
                 timeout=self._settings.timeout,
                 verify=self._settings.httpx_verify,
+                cookies=no_cookies(),
             )
         return self._client
 
@@ -110,19 +116,26 @@ class BookStackClient:
         return resp.content
 
     async def get_raw(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
-        """Escape hatch: GET an arbitrary ``/api/...`` path (or absolute URL on the same host)."""
+        """Escape hatch: GET an arbitrary ``/api/...`` path (or an absolute ``<base>/api/...`` URL).
+
+        Web pages (``/books/...``, ``/link/...``, ``/uploads/...``) and ``/api/docs`` are web routes, not
+        the API: they need a browser login and are refused here.
+        """
+        api = f"{self._settings.api_base}/"
         if path.startswith(("http://", "https://")):
-            if not path.startswith(self._settings.base_origin):
+            if not path.startswith(api):
                 raise ValueError(
-                    f"bookstack_get only allows the configured host ({self._settings.base_origin})."
+                    f"bookstack_get only reads the API ({api}...); web pages and file links need a browser "
+                    "login. Use get_page / get_attachment / get_image for content."
                 )
-            url = path
+            p = path[len(api):]
         else:
             p = path.lstrip("/")
             if p.startswith("api/"):
                 p = p[len("api/") :]
-            url = f"{self._settings.api_base}/{p}"
-        return await self._request("GET", url, params=params)
+        if p.split("?")[0].rstrip("/") == "docs":
+            raise ValueError("/api/docs is BookStack's HTML documentation page; use 'docs.json' for the API reference.")
+        return await self._request("GET", api + p, params=params)
 
     async def _request(
         self,
@@ -164,6 +177,11 @@ class BookStackClient:
         return data
 
 
+def no_cookies() -> CookieJar:
+    """A cookie jar that never stores anything (see the module docstring)."""
+    return CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
+
+
 def _try_json(resp: httpx.Response) -> Any:
     if not resp.content:
         return {}
@@ -201,6 +219,16 @@ def _format_error(status: int, data: Any, resp: httpx.Response) -> str:
             "BookStack 401 — token rejected. Check BOOKSTACK_TOKEN_ID / BOOKSTACK_TOKEN_SECRET and "
             "that the token's user has the 'Access System API' permission."
         )
+    if status == 403 and "cookie-based authentication" in msg:
+        return (
+            "BookStack 403 — the request was treated as a browser session instead of the token (a session "
+            f"cookie came along). Restart the server; if it persists, report it. {msg}"
+        ).rstrip()
+    if status == 403 and "permission to make API calls" in msg:
+        return (
+            "BookStack 403 — the token's user lacks the 'Access System API' role permission. "
+            f"{msg}"
+        ).rstrip()
     if status == 403:
         return (
             "BookStack 403 — the token's user lacks permission for this resource (writes need the "

@@ -121,6 +121,17 @@ System API"** role permission, and only sees content its permissions allow. You 
 For the **write** tools, give the token's user a role that may create/update the content it should
 edit (BookStack has no read-only tokens: the user's role decides).
 
+**Editing the same page in the browser at the same time.** BookStack treats a token update like an edit
+by the token's user. If that is you:
+
+- An update through the token **deletes your unsaved web-editor draft** of that page.
+- Your next save in the browser then overwrites the MCP change without a warning. BookStack's "page was
+  updated" and "someone else is editing" warnings ignore your own user.
+
+The API can't see drafts or open editors, so the server can't warn about this. Save or close the page in
+the browser before letting the agent change it. The server does tie a body update's confirm code to the
+page's current revision, so if the page is saved in between, it asks again.
+
 ## 2. Configure
 
 ```bash
