@@ -4,8 +4,11 @@ A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a 
 Claude Code) to a **NetScaler ADC** appliance (or HA pair) through the **NITRO REST API**. Ask about
 your load balancers in natural language — vservers and their up/down state, backend services/servers,
 SSL certificate expiry, HA status, and box CPU/memory/throughput — and, opt-in, **build and change load
-balancing and content switching**: vservers, services, service groups, servers, CS policies and actions,
-monitors and how they are bound together. Roll out the **Web App
+balancing, content switching and SSL**: vservers, services, service groups, servers, CS policies and
+actions, monitors, certificates (incl. upload to `/nsconfig/ssl`), SSL profiles and SNI, rewrite /
+responder policies, pattern sets, GSLB and DNS records, and how they are bound together; clone an existing
+app for a new hostname, run one change set on several appliances with one confirmation, and diagnose a
+CS → LB → backend path. Roll out the **Web App
 Firewall**: learned rules, the URL inventory, easy global rules, export/import between environments and
 hostname switching. **Bot management** gets the same treatment — allow/deny lists, rate limiting, TPS,
 CAPTCHA and IP reputation — and for both features: are the signatures current, which policy actually
@@ -57,32 +60,50 @@ Every tool except the two instance tools also takes `instance` (which appliance;
 Results are trimmed to the useful columns by default; pass `full=true` for the raw NITRO objects, and
 list results are capped (`NETSCALER_MAX_ROWS`, default 200) unless `full`.
 
-### Load balancing & content switching
+### Traffic management: LB, CS, SSL, rewrite / responder, GSLB, DNS
+
+The generic tools below cover every object type in one table (`kind`), so the same five tools create,
+change, enable/disable, bind and delete all of them.
+
+| Area | `kind` | Notes |
+|---|---|---|
+| Load balancing / CS | `lb_vserver`, `cs_vserver`, `service`, `service_group`, `server`, `cs_policy`, `cs_action`, `monitor` | |
+| SSL | `ssl_certkey`, `ssl_profile`, `ssl_policy`, `ssl_action`; `ssl_vserver`, `ssl_service`, `ssl_service_group` | The last three are the SSL side of a vserver / service / group (e.g. its `sslprofile`, `snienable`): update only. `ssl_certkey` cert / key / password changes go through `update ssl certKey`. |
+| Rewrite / responder | `rewrite_policy`, `rewrite_action`, `rewrite_policylabel`, `responder_policy`, `responder_action`, `responder_policylabel`, `responder_htmlpage` | An HTML page is added by import from a URL (`src`). |
+| Policy data | `policy_patset`, `policy_dataset`, `policy_stringmap`, `policy_expression` | |
+| GSLB | `gslb_vserver`, `gslb_service`, `gslb_site` | Reading GSLB also works through the list tools above. |
+| DNS records | `dns_a`, `dns_aaaa`, `dns_cname`, `dns_txt`, `dns_ns`, `dns_soa` | Several records may share a name; they are told apart by their value. |
 
 Reads (always available):
 
 | Tool | What it does |
 |---|---|
-| `get_object(kind, name, limit?, full?)` | One object with everything bound to it. `cs_vserver` → **routes**: its CS policies in priority order with rule, action and target LB vserver, plus the default LB vserver; `lb_vserver` → services / service groups with state and weight; `service_group` → members and monitors; `server` → the services / groups using it; `cs_policy` → the CS vservers it is bound to. |
-| `list_cs_policies(name?, limit?, full?)` | CS policies: rule, action, hits. |
-| `list_cs_actions(name?, limit?, full?)` | CS actions and the LB vserver (or expression) each targets. |
-| `list_lb_monitors(name?, limit?, full?)` | Health monitors: type, interval, timeouts, request / expected response. |
+| `get_object(kind, name, limit?, full?)` | One object with everything bound to it. `cs_vserver` → **routes**: its CS policies in priority order with rule, action and target LB vserver, plus the default LB vserver; `lb_vserver` → services / groups, policies per feature, analytics profiles; `ssl_vserver` → certificates (SNI or not), SSL policies, ciphers; `ssl_certkey` → expiry and linked CA; DNS kinds → every record under the name. |
+| `list_objects(kind, name_contains?, limit?, full?)` | Any kind as a list, e.g. all SSL profiles or rewrite actions. |
+| `list_cs_policies` / `list_cs_actions` / `list_lb_monitors` | Shortcuts for the common lists. |
+| `search_policy_objects(text, include_values?, limit?)` | Find pattern sets, data sets, string maps and named expressions together, by name, by a pattern / value they hold, or by expression text (e.g. what `CONTAINS_ANY("x")` refers to). |
+| `vserver_diagnose(name)` | One traffic path CS → LB → service groups / services → members with live state and counters. Warns about anything not UP, about members that are UP but handle no requests while the vserver gets traffic (typically broken backend TLS the monitor doesn't notice), and about SSL backends monitored only by TCP / `tcp-default`. |
 
-`kind` is one of `lb_vserver`, `cs_vserver`, `service`, `service_group`, `server`, `cs_policy`,
-`cs_action`, `monitor`. Writes (opt-in, see [Write tools](#write-tools-optional)):
+Writes (opt-in, see [Write tools](#write-tools-optional)):
 
 | Tool | What it does |
 |---|---|
-| `add_object(kind, name, settings, dry_run)` | Create an object; `settings` are the NITRO attributes (lower-case CLI option names), e.g. `lb_vserver` `{"servicetype": "HTTP", "ipv46": "10.0.0.20", "port": 80}`, `server` `{"ipaddress": "10.0.0.31"}`, `cs_policy` `{"rule": "HTTP.REQ.URL.STARTSWITH(\"/api\")", "action": "ca_api"}`. Existing objects are left alone. |
-| `update_object(kind, name, settings?, unset?, dry_run)` | Change attributes (before/after per attribute, only differing ones are sent) or reset them to their default (`unset`). |
-| `set_object_state(kind, names, enabled, members?, graceful?, delay_seconds?, dry_run)` | Enable / disable vservers, services, service groups, servers — or single group members (`members=['srv_web1:80']`), gracefully or after a delay. |
-| `delete_object(kind, names, dry_run)` | **Delete** objects, in the given order. The preview lists what is still bound to each one or uses it. The appliance refuses deletes that would leave dangling references (unbind first). Needs `NETSCALER_ALLOW_DELETE=true` on top of `NETSCALER_ALLOW_WRITE`, and **always** asks for confirmation, even with `NETSCALER_CONFIRM_WRITE=false`. |
-| `change_bindings(binding, name, add?, remove?, dry_run)` | Bind / unbind: `lb_vserver_service`, `lb_vserver_service_group`, `service_group_member` (`'srv:port'` or `'10.0.0.5:80'`), `service_monitor`, `service_group_monitor`, `cs_vserver_policy` (with `priority`), `cs_vserver_default`. Already-bound entries are skipped, changed weight / priority is re-bound, a new CS default replaces the old one. |
+| `add_object(kind, name, settings, dry_run)` | Create an object; `settings` are the NITRO attributes (lower-case CLI option names), e.g. `lb_vserver` `{"servicetype": "HTTP", "ipv46": "10.0.0.20", "port": 80}`, `ssl_certkey` `{"cert": "app.pem", "key": "app.key", "expirymonitor": "ENABLED", "notificationperiod": 30}`, `ssl_profile` `{"sslprofiletype": "BackEnd", "tls12": "DISABLED", "tls13": "ENABLED"}`. Existing objects (for DNS: the same record) are left alone. Passwords (`passplain`) are masked in every preview and result. |
+| `update_object(kind, name, settings?, unset?, dry_run)` | Change attributes (before/after per attribute, only differing ones are sent) or reset them (`unset`). E.g. `ssl_service_group` `{"sslprofile": "prof_backend_tls13"}`, or a certificate renewal `ssl_certkey` `{"cert": "app-2027.pem", "key": "app-2027.key"}`. |
+| `set_object_state(kind, names, enabled, members?, graceful?, delay_seconds?, dry_run)` | Enable / disable vservers (also GSLB), services, service groups, servers, or single group members (`members=['srv_web1:80']`), gracefully or after a delay. |
+| `change_bindings(binding, name?, add?, remove?, dry_run)` | Bind / unbind. LB/CS: `lb_vserver_service`, `lb_vserver_service_group`, `service_group_member` (`'srv:port'` or `'10.0.0.5:80'`), `service_monitor`, `service_group_monitor`, `cs_vserver_policy`, `cs_vserver_default`. Policies per feature: `lb_vserver_<f>_policy` / `cs_vserver_<f>_policy` with f = `responder`, `rewrite`, `appfw`, `bot`, `cache`, `cmp`, `transform` (priority, bindpoint, gotopriorityexpression, invoke, label), and `lb_vserver_analytics_profile` / `cs_vserver_analytics_profile`. SSL: `ssl_vserver_certkey` (`snicert`, `ca`, `crlcheck`, `ocspcheck`), `ssl_service_certkey`, `ssl_service_group_certkey`, `ssl_vserver_policy`, `ssl_profile_cipher`, `ssl_certkey_link` (CA). Global, without `name`: `rewrite_global_policy`, `responder_global_policy`. Labels: `rewrite_policylabel_policy`, `responder_policylabel_policy`. Data: `policy_patset_pattern`, `policy_dataset_value`, `policy_stringmap_pattern`. GSLB: `gslb_vserver_service`, `gslb_vserver_domain`. Already-bound entries are skipped; a changed weight / priority / flag is re-bound with the live binding's bindpoint and priority; a new single entry (CS default, CA link) replaces the old one. |
+| `delete_object(kind, names, dry_run)` | **Delete** objects, in the given order (DNS: a name deletes all its records, `{"hostname": …, "ipaddress": …}` only one). The preview lists what is still bound to each one. The appliance refuses deletes that would leave dangling references (unbind first). Needs `NETSCALER_ALLOW_DELETE=true` on top of `NETSCALER_ALLOW_WRITE`, and **always** asks for confirmation, even with `NETSCALER_CONFIRM_WRITE=false`. |
+| `upload_ssl_file(filename, text? \| content_base64? \| file?, overwrite?, dry_run)` | Upload a certificate / key / chain to **`/nsconfig/ssl` only** (no other path is possible). The preview shows size, SHA-256 and what the file contains, never the content. An identical file is skipped; a different one needs `overwrite=true`. `file=` reads from the mounted files directory (`NETSCALER_EXPORT_DIR`) so private keys never pass through the conversation. |
+| `sync_gslb_config(force_site?, save_on_sites?, dry_run)` | `sync gslb config` to the other sites; the preview lists local and target sites. |
+| `clone_app_setup(template_lb_vserver, template_hostname, new_hostname, backends, …, instances?, save?, dry_run)` | A new app from an existing one: servers, service group with its settings, monitors and SSL profile, LB vserver with its settings and every policy / analytics binding, CS action + policy for the new hostname at the next free priority, the SNI certificate. Names and the CS rule are the template's with the hostname swapped (`name_part` / `new_name_part` when the names use another part). One preview, one confirmation, optionally on several instances. |
 
-A whole setup — server → service group + members → LB vserver → CS action + policy → bound on the CS
-vserver — goes into one `apply_batch` with one confirmation. Tearing one down works the same way: unbind,
-then `delete_object` (policy before its action, vserver before its service group). A batch that
-contains a delete always asks for confirmation.
+A whole setup — certificate files → certkey → server → service group + members → LB vserver + policies →
+CS action + policy → SNI certificate — goes into one `apply_batch` with one confirmation. With
+`instances=["dc1", "dc2"]` the same batch runs on both standalone boxes: one preview per instance, one
+confirmation, applied instance by instance and stopped on the first failure (the second box is then not
+touched); afterwards the objects and bindings it touched are compared across the instances. Tearing a
+setup down works the same way: unbind, then `delete_object`. A batch that contains a delete always asks
+for confirmation.
 
 ### WAF rollout tools
 
@@ -351,6 +372,9 @@ In Claude Code, run `/mcp` to confirm the `netscaler` server connected, then ask
 - "Show the live request rate for lb vserver vs_web."
 - "Where does cs_app send /api traffic, and which backends are behind it?"
 - "Take srv_web1 out of sg_web gracefully, then put it back." (write tools)
+- "Why does app.example.com answer with 503? Diagnose cs_app." (`vserver_diagnose`)
+- "Upload the renewed certificate from the files directory and update cert_app with it." (write tools)
+- "Set up new.example.com like old.example.com, backend 10.0.0.71:443, on dc1 and dc2." (`clone_app_setup`)
 - "Create vs_app on 10.0.0.21:80 with servers 10.0.0.51 and 10.0.0.52 on port 8080, and route app.example.com to it from cs_app." (write tools, one confirmation)
 - "Which learned start URLs on WAF profile pr_app aren't covered by a rule yet?"
 - "Which WAF checks are firing on pr_app, and is anything already blocking?"
@@ -379,20 +403,33 @@ The load balancing / content switching tools, the WAF and Bot rollout tools, `up
    bind system user nsmcp-waf readonlypolicy 110
    ```
 
-   For the load balancing / content switching tools, a second policy covers what they send:
+   For the traffic-management tools (LB, CS, SSL, rewrite / responder, policy data, GSLB, DNS), a
+   second policy covers what they send:
 
    ```
-   add system cmdPolicy nsmcp-lb ALLOW "^((add|set|unset|enable|disable)\s+(lb\s+vserver|cs\s+vserver|cs\s+policy|cs\s+action|lb\s+monitor|service|serviceGroup|server)|(bind|unbind)\s+(lb\s+vserver|cs\s+vserver|service|serviceGroup))(\s+.*)?$|^save\s+ns\s+config$"
+   add system cmdPolicy nsmcp-lb ALLOW "(?i)^((add|set|unset|enable|disable)\s+(lb\s+(vserver|monitor)|cs\s+(vserver|policy|action)|service|serviceGroup|server|ssl\s+(certKey|vserver|service|serviceGroup|profile|policy|action)|(rewrite|responder)\s+(policy|action|policylabel)|policy\s+(patset|dataset|stringmap|expression)|gslb\s+(vserver|service|site)|dns\s+(addRec|aaaaRec|cnameRec|txtRec|nsRec|soaRec))|(bind|unbind)\s+(lb\s+vserver|cs\s+vserver|service|serviceGroup|ssl\s+(vserver|service|serviceGroup|profile)|(rewrite|responder)\s+(global|policylabel)|policy\s+(patset|dataset|stringmap)|gslb\s+vserver)|(update|link|unlink)\s+ssl\s+certKey|import\s+responder\s+htmlpage|sync\s+gslb\s+config)(\s+.*)?$|^save\s+ns\s+config$"
    bind system user nsmcp-waf nsmcp-lb 105
    ```
 
-   `delete_object` additionally needs the `rm` commands, e.g. as a third policy that you only bind
+   `upload_ssl_file` needs to add (and, with `overwrite`, remove) files in `/nsconfig/ssl` only. Keep it
+   in its own policy so no other path is writable:
+
+   ```
+   add system cmdPolicy nsmcp-sslfiles ALLOW "(?i)^(add|rm)\s+system\s+file\s+\S+\s+-fileLocation\s+\"?/nsconfig/ssl/?\"?(\s+.*)?$"
+   bind system user nsmcp-waf nsmcp-sslfiles 107
+   ```
+
+   `delete_object` additionally needs the `rm` commands, e.g. as a further policy that you only bind
    where deletes are wanted:
 
    ```
-   add system cmdPolicy nsmcp-lb-rm ALLOW "^rm\s+(lb\s+vserver|cs\s+vserver|cs\s+policy|cs\s+action|lb\s+monitor|service|serviceGroup|server)(\s+.*)?$"
+   add system cmdPolicy nsmcp-lb-rm ALLOW "(?i)^rm\s+(lb\s+(vserver|monitor)|cs\s+(vserver|policy|action)|service|serviceGroup|server|ssl\s+(certKey|profile|policy|action)|(rewrite|responder)\s+(policy|action|policylabel|htmlpage)|policy\s+(patset|dataset|stringmap|expression)|gslb\s+(vserver|service|site)|dns\s+(addRec|aaaaRec|cnameRec|txtRec|nsRec|soaRec))(\s+.*)?$"
    bind system user nsmcp-waf nsmcp-lb-rm 106
    ```
+
+   Look at how the appliance logs a call before relying on a regex (System → Auditing, or
+   `show audit messages`): NITRO calls are checked as the CLI command they map to, and the exact
+   spelling (e.g. of the `systemfile` upload) is what the policy must match.
 
    (Not yet checked against a live box: if a call answers "not authorized", look at the command the
    appliance logged for it and widen the regex.)
@@ -503,6 +540,12 @@ behind a block — the fastest way to tell a false positive from a real one.
 
 ### Behaviour & caveats
 
+- **Unverified against a live box (traffic management).** Checked against the NITRO reference and
+  the fake appliance only: `update` / `link` / `unlink` on `sslcertkey`, the `systemfile` upload and
+  how an existing file is detected, `Import` of a responder HTML page, `sync gslb config` via
+  `gslbconfig?action=sync`, the per-member stats `vserver_diagnose` reads
+  (`stat servicegroup?statbindings=yes`), and the unbind arguments of policy bindings (bindpoint,
+  priority, type). Try them on a test object first.
 - **Live immediately, persistent only after `save_config`.** Point `NETSCALER_BASE_URL` at the HA
   primary / management VIP.
 - **Traffic-safe order.** Import and rehost bind new rules first, then re-bind changed ones, and remove
@@ -553,11 +596,12 @@ poetry run mcp dev src/netscaler_mcp/server.py  # MCP Inspector to exercise tool
   attributes used here are stable across 13.0 / 13.1 / 14.1, so older builds work too — if a build
   lacks a projected attribute it simply comes back `null`; use `full=true` or `nitro_get` for the raw
   payload. (NITRO is served under a fixed `/nitro/v1` path — there is no api-version parameter.)
-- **Writes are opt-in**: LB / CS objects and their bindings, AppFw / Bot profiles, signature re-fetch
+- **Writes are opt-in**: traffic-management objects (LB, CS, SSL, rewrite / responder, policy data, GSLB,
+  DNS) and their bindings, certificate files in `/nsconfig/ssl`, AppFw / Bot profiles, signature re-fetch
   and `save ns config`. Reads are always available. The write tools refuse unless
   `NETSCALER_ALLOW_WRITE=true` and the account's command policy allows the change, and (unless
   `NETSCALER_CONFIRM_WRITE=false`) only apply with the confirm code from a preview you approved.
-  **Deletes** (`delete_object`, LB / CS objects only) additionally need `NETSCALER_ALLOW_DELETE=true`
+  **Deletes** (`delete_object`, traffic-management objects only) additionally need `NETSCALER_ALLOW_DELETE=true`
   and always need a confirmation. No tool deletes a WAF / Bot profile or policy or binds a policy to a
   vserver.
 - **Feature-gated resources** (GSLB, AppFW) return a clean "feature not enabled" error when the

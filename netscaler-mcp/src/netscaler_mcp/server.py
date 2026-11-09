@@ -22,6 +22,7 @@ The regex/host/plan logic lives in ``waf.py``.
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import hashlib
 import hmac
@@ -34,6 +35,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -138,6 +140,8 @@ def _tool(fn: Any) -> Any:
             if write:
                 raise ValueError("instance='all' is for reads; a write goes to one named instance at a time.")
             return {"instances": await _on_each(lambda: fn(*args, **kwargs))}
+        if write and not instance and kwargs.get("instances"):
+            instance = kwargs["instances"][0]  # apply_batch / clone_app_setup over several instances
         token = _instance.set(_resolve_instance(instance, write=write))
         try:
             return await fn(*args, **kwargs)
@@ -1691,95 +1695,27 @@ async def save_config(
     return {"saved": True}
 
 
-_BATCH_TOOL_KEYS = ("status", "confirm_code", "next", "note", "dry_run")
-
-
 @_tool
 async def apply_batch(
-    changes: Annotated[list[dict[str, Any]], Field(description="The changes in order, each {\"tool\": <write tool>, \"args\": {<that tool's arguments>}}, e.g. [{\"tool\": \"add_waf_rule\", \"args\": {\"profile\": \"pr_app\", \"rule\": \"allow_url\", \"host\": \"app.example.com\", \"path\": \"/api/\"}}, {\"tool\": \"set_waf_check_actions\", \"args\": {\"profile\": \"pr_app\", \"checks\": [\"sql_injection\"], \"add_actions\": [\"block\"]}}]. Any write tool except save_config / apply_batch; leave dry_run, confirm and instance out of args.", min_length=1, max_length=50)],
+    changes: Annotated[list[dict[str, Any]], Field(description="The changes in order, each {\"tool\": <write tool>, \"args\": {<that tool's arguments>}}, e.g. [{\"tool\": \"add_object\", \"args\": {\"kind\": \"server\", \"name\": \"srv_app1\", \"settings\": {\"ipaddress\": \"10.0.0.51\"}}}, {\"tool\": \"change_bindings\", \"args\": {\"binding\": \"lb_vserver_rewrite_policy\", \"name\": \"vs_app\", \"add\": [{\"policyname\": \"rw_404\", \"priority\": 100, \"bindpoint\": \"RESPONSE\"}]}}]. Any write tool except save_config / apply_batch / clone_app_setup; leave dry_run, confirm and instance out of args.", min_length=1, max_length=50)],
     save: Annotated[bool, Field(description="Save the running config (save ns config) once every step applied cleanly.")] = False,
+    instances: Annotated[list[str] | None, Field(description="Run the same steps on several appliances (names from list_instances), e.g. two standalone boxes: one preview per instance, ONE confirmation, applied instance by instance and stopped on the first failure; afterwards the touched objects and bindings are compared across them.")] = None,
     dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
     confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
-    """Several changes on one instance with ONE preview and ONE confirmation (WRITE — requires
-    NETSCALER_ALLOW_WRITE).
+    """Several changes with ONE preview and ONE confirmation — on one instance or the same changes on
+    several (WRITE — requires NETSCALER_ALLOW_WRITE).
 
-    Use this whenever the user wants more than one change — several rules, different actions for
-    different checks, bot entries plus detection switches, then save — instead of confirming each write
-    tool separately. Every step is previewed exactly as its own tool would preview it; the single
-    confirm code covers all of them. On apply, steps run in order and stop at the first failure (later
-    steps are reported 'not run', and nothing is saved). A step whose live plan no longer matches the
-    preview — for example because an earlier step in the same batch changed what it acts on — is not
-    applied either.
+    Use this whenever the user wants more than one change — a whole app setup, several rules, policies
+    plus bindings, then save — instead of confirming each write tool separately. Every step is previewed
+    exactly as its own tool would preview it; the single confirm code covers all of them (a batch with a
+    delete always asks). On apply, steps run in order and stop at the first failure (later steps are
+    reported 'not run', nothing is saved, and further instances are not touched). A step whose live plan
+    no longer matches the preview is not applied either.
     """
     args = _call_args(locals())
-    steps: list[tuple[str, dict[str, Any]]] = []
-    for i, item in enumerate(changes, 1):
-        name = str(item.get("tool") or "").strip()
-        sub = item.get("args") or {}
-        if name not in _WRITE_TOOLS or name in ("save_config", "apply_batch"):
-            usable = sorted(set(_WRITE_TOOLS) - {"save_config", "apply_batch"})
-            raise ValueError(f"Step {i}: tool must be one of {usable} (save with save=true); got {name!r}.")
-        if not isinstance(sub, dict):
-            raise ValueError(f"Step {i}: args must be an object of {name}'s arguments.")
-        if reserved := sorted(set(sub) & {"dry_run", "confirm", "instance"}):
-            raise ValueError(f"Step {i}: leave {reserved} out of args; apply_batch sets them for every step.")
-        steps.append((name, sub))
-    if not dry_run:
-        _require_write()
-
-    async def run(apply: bool) -> tuple[list[dict[str, Any]], bool]:
-        done: list[dict[str, Any]] = []
-        for i, (name, sub) in enumerate(steps, 1):
-            try:
-                result = await _WRITE_TOOLS[name](**sub, dry_run=not apply)
-            except (NitroError, ValueError) as exc:
-                done.append({"step": i, "tool": name, "error": str(exc)})
-                break
-            if apply and result.get("status") == "confirmation_required":
-                done.append({"step": i, "tool": name, "error": (
-                    "Its live plan differs from the confirmed preview (an earlier step or someone else changed "
-                    "it), so it was not applied. Preview the remaining steps again."
-                ), "plan_now": {k: v for k, v in result.items() if k not in _BATCH_TOOL_KEYS}})
-                break
-            done.append({"step": i, "tool": name, **{k: v for k, v in result.items() if k not in _BATCH_TOOL_KEYS}})
-        done += [{"step": j, "tool": n, "status": "not run"} for j, (n, _) in enumerate(steps, 1) if j > len(done)]
-        return done, all("error" not in s and "status" not in s for s in done)
-
-    batch = {"record": []}
-    token = _batch.set(batch)
-    try:
-        preview_steps, ok = await run(apply=False)
-    finally:
-        _batch.reset(token)
-    if not ok:
-        return {
-            "dry_run": True, **_instance_note(), "steps": preview_steps,
-            "error": "A step failed in the preview; fix it and preview the batch again. Nothing was applied.",
-        }
-    parts = [s.get("change_summary") or s.get("summary") for s in preview_steps]
-    summary = f"{len(steps)} step(s): " + " ".join(p for p in parts if isinstance(p, str))
-    if save:
-        summary += " Then save the running configuration."
-    preview = {"dry_run": dry_run, **_instance_note(), "steps": preview_steps, "save": save}
-    change = {"args": args, "plans": batch["record"]}
-    deletes = any(name in _DELETE_TOOLS for name, _ in steps)
-    if not _gate("apply_batch", change, summary, preview, dry_run=dry_run, confirm=confirm,
-                 writes=bool(batch["record"]) or save, always=deletes):
-        return preview
-
-    token = _batch.set({"approved": list(batch["record"])})
-    try:
-        applied, ok = await run(apply=True)
-    finally:
-        _batch.reset(token)
-    out: dict[str, Any] = {"dry_run": False, **_instance_note(), "steps": applied, "saved": False}
-    if save and ok:
-        await _get_client().action("nsconfig", "save")
-        out["saved"] = True
-    elif save:
-        out["note"] = "Not saved because a step failed; the applied steps are live but unsaved (save_config)."
-    return out
+    return await _run_batch("apply_batch", changes, save=save, dry_run=dry_run, confirm=confirm, args=args,
+                            instances=instances)
 
 
 # ---- tools: Bot management rollout ---------------------------------------
@@ -2517,17 +2453,30 @@ async def compare_instances(
     return out
 
 
-# ---- tools: load balancing & content switching ---------------------------
+# ---- tools: traffic management objects (LB, CS, SSL, rewrite/responder, GSLB, DNS) -------
 
 _KIND_DESC = (
-    "Object type: lb_vserver, cs_vserver, service, service_group, server, cs_policy, cs_action or monitor."
+    "Object type. LB/CS: lb_vserver, cs_vserver, service, service_group, server, cs_policy, cs_action, monitor. "
+    "SSL: ssl_certkey, ssl_vserver / ssl_service / ssl_service_group (the SSL side of a vserver / service; "
+    "update only), ssl_profile, ssl_policy, ssl_action. Rewrite/responder: rewrite_policy, rewrite_action, "
+    "rewrite_policylabel, responder_policy, responder_action, responder_policylabel, responder_htmlpage. "
+    "Policy data: policy_patset, policy_dataset, policy_stringmap, policy_expression. GSLB: gslb_vserver, "
+    "gslb_service, gslb_site. DNS: dns_a, dns_aaaa, dns_cname, dns_txt, dns_ns, dns_soa."
 )
-_STATE_KIND_DESC = "Object type: lb_vserver, cs_vserver, service, service_group or server."
+_STATE_KIND_DESC = "Object type: lb_vserver, cs_vserver, service, service_group, server or gslb_vserver."
 _BINDING_DESC = (
-    "Which relation: lb_vserver_service (LB vserver ← service), lb_vserver_service_group (LB vserver ← "
-    "service group), service_group_member (service group ← server:port), service_monitor / "
-    "service_group_monitor (← monitor), cs_vserver_policy (CS vserver ← CS policy, with priority), "
-    "cs_vserver_default (CS vserver → default LB vserver, one at most)."
+    "Which relation. LB/CS: lb_vserver_service, lb_vserver_service_group, service_group_member (server:port), "
+    "service_monitor, service_group_monitor, cs_vserver_policy (CS policies, with priority), cs_vserver_default "
+    "(default LB vserver). Policies per feature on a vserver: lb_vserver_<f>_policy / cs_vserver_<f>_policy with "
+    "f = responder, rewrite, appfw, bot, cache, cmp, transform (priority; bindpoint REQUEST/RESPONSE; "
+    "gotopriorityexpression, invoke, labeltype, labelname); lb_vserver_analytics_profile, "
+    "cs_vserver_analytics_profile. SSL: ssl_vserver_certkey (snicert, ca, crlcheck, ocspcheck), "
+    "ssl_service_certkey, ssl_service_group_certkey, ssl_vserver_policy, ssl_profile_cipher (cipherpriority), "
+    "ssl_certkey_link (certificate → CA certificate, one at most). Global (no name): rewrite_global_policy, "
+    "responder_global_policy (priority, type e.g. REQ_DEFAULT / RES_DEFAULT). Labels: "
+    "rewrite_policylabel_policy, responder_policylabel_policy. Data: policy_patset_pattern (String), "
+    "policy_dataset_value (value), policy_stringmap_pattern (key + value). GSLB: gslb_vserver_service, "
+    "gslb_vserver_domain."
 )
 _DRY_RUN_DESC = (
     "Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless "
@@ -2536,6 +2485,15 @@ _DRY_RUN_DESC = (
 _CSPOLICY_FIELDS = lb.KINDS["cs_policy"].fields
 _CSACTION_FIELDS = lb.KINDS["cs_action"].fields
 _LBMONITOR_FIELDS = lb.KINDS["monitor"].fields
+# Runtime values that legitimately differ between appliances; left out of the post-batch comparison.
+_RUNTIME = frozenset({"curstate", "effectivestate", "svrstate", "state", "status", "hits", "daystoexpiration",
+                      "servicegroupeffectivestate", "referencecount", "monstate", "undefhits", "clientcertnotafter"})
+
+
+def _batch_preview() -> bool:
+    """Whether this call is apply_batch's preview pass (earlier steps have not run yet)."""
+    batch = _batch.get()
+    return batch is not None and "record" in batch
 
 
 async def _object(k: lb.Kind, name: str) -> dict[str, Any] | None:
@@ -2549,10 +2507,25 @@ async def _object(k: lb.Kind, name: str) -> dict[str, Any] | None:
     return _one(env, k.resource) or None
 
 
-async def _bound_rows(b: lb.Binding, name: str) -> list[dict[str, Any]]:
-    """The live rows of one binding type; [] when nothing is bound or the parent doesn't exist (yet)."""
+async def _records(k: lb.Kind, name: str) -> list[dict[str, Any]]:
+    """Every live record under a name (DNS kinds keep several); [] when there is none."""
     try:
-        env = await _get_client().get("config", b.resource, resource_name=name)
+        env = await _get_client().get("config", k.resource, resource_name=name)
+    except NitroError as exc:
+        if _is_missing(exc):
+            return []
+        raise
+    return _rows(env, k.resource)
+
+
+async def _bound_rows(b: lb.Binding, name: str | None) -> list[dict[str, Any]]:
+    """The live rows of one binding type; [] when nothing is bound or the parent doesn't exist (yet)."""
+    if b.link:
+        obj = await _object(lb.KINDS[b.parent], name or "")
+        linked = (obj or {}).get("linkcertkeyname")
+        return [{"linkcertkeyname": linked}] if linked else []
+    try:
+        env = await _get_client().get("config", b.resource, resource_name=name or None)
     except NitroError as exc:
         if _is_missing(exc):
             return []
@@ -2580,6 +2553,8 @@ async def _cs_routes(rows: list[dict[str, Any]], limit: int) -> list[dict[str, A
             "priority": row.get("priority"), "policy": row.get("policyname"), "rule": policy.get("rule"),
             "action": policy.get("action"), "target": target, "hits": row.get("hits", policy.get("hits")),
             "gotopriorityexpression": row.get("gotopriorityexpression"),
+            "target_via": "binding" if row.get("targetlbvserver") else "action",
+            "lb_target": row.get("targetlbvserver") or action.get("targetlbvserver"),
         })
     return routes
 
@@ -2587,23 +2562,29 @@ async def _cs_routes(rows: list[dict[str, Any]], limit: int) -> list[dict[str, A
 @_tool
 async def get_object(
     kind: Annotated[str, Field(description=_KIND_DESC)],
-    name: Annotated[str, Field(description="The object's name (policyname for cs_policy, monitorname for monitor).")],
+    name: Annotated[str, Field(description="The object's name (its key: policyname for cs_policy, monitorname for monitor, certkey for ssl_certkey, vservername for ssl_vserver, hostname / domain / aliasname for DNS records).")],
     limit: Annotated[int, Field(description="Max rows per binding type.", ge=1, le=500)] = 100,
     full: Annotated[bool, Field(description="Return the raw object and binding rows instead of a trimmed view.")] = False,
 ) -> dict[str, Any]:
-    """One LB / CS object with everything bound to it (config tree, <resource> + <resource>_binding).
+    """One traffic-management object with everything bound to it (config tree, <resource> + <resource>_binding).
 
-    lb_vserver → its services and service groups (with state and weight) and bound policies;
-    cs_vserver → 'routes': the CS policies in priority order with each rule, action and target LB vserver,
-    plus the default LB vserver; service_group → members and monitors; service → monitors; server →
-    the services / groups using it; cs_policy → the CS vservers it is bound to. Use list_* tools to
-    find names, vserver_stats for live counters.
+    lb_vserver → services / service groups (state, weight), bound policies per feature and analytics
+    profiles; cs_vserver → 'routes': the CS policies in priority order with rule, action and target LB
+    vserver, plus the default LB vserver; service_group → members and monitors; ssl_vserver → certificates
+    (SNI or not), SSL policies, ciphers; ssl_certkey → expiry and the linked CA; DNS kinds → every record
+    under the name. Passwords are never shown. Use list_objects to find names, vserver_diagnose for a
+    path's live health.
     """
     k = lb.kind(kind)
+    if k.multi:
+        rows = await _records(k, name)
+        if not rows:
+            raise ValueError(f"No {k.name} record named {name!r} (NITRO {k.resource}).")
+        return {"kind": k.name, "count": len(rows), k.resource: lb.mask(rows if full else [_pick(r, k.fields) for r in rows])}
     obj = await _object(k, name)
     if obj is None:
         raise ValueError(f"No {k.name} named {name!r} (NITRO {k.resource}).")
-    out: dict[str, Any] = {"kind": k.name, k.resource: obj if full else _pick(obj, k.fields)}
+    out: dict[str, Any] = {"kind": k.name, k.resource: lb.mask(obj if full else _pick(obj, k.fields))}
     try:
         aggregate = _one(await _get_client().get("config", k.aggregate, resource_name=name), k.aggregate)
     except NitroError as exc:
@@ -2624,6 +2605,28 @@ async def get_object(
         default = aggregate.get("csvserver_lbvserver_binding") or []
         out["default_lb_vserver"] = default[0].get("lbvserver") if default else None
     return out
+
+
+@_tool
+async def list_objects(
+    kind: Annotated[str, Field(description=_KIND_DESC)],
+    name_contains: Annotated[str | None, Field(description="Case-insensitive substring of the name (key) to keep.")] = None,
+    limit: Annotated[int, Field(description="Max objects to return.", ge=1, le=500)] = 50,
+    full: Annotated[bool, Field(description="Return full objects instead of a trimmed summary.")] = False,
+) -> dict[str, Any]:
+    """List objects of any kind above (config tree), e.g. every SSL profile, rewrite action or DNS A record.
+
+    With name_contains the first 500 objects are fetched and filtered here. Passwords are never shown.
+    """
+    k = lb.kind(kind)
+    fetch = 500 if name_contains else limit
+    result = await _get_list("config", k.resource, k.fields, limit=fetch, full=full)
+    rows = result.get(k.resource) or []
+    if name_contains:
+        needle = name_contains.lower()
+        rows = [r for r in rows if needle in str(r.get(k.key, "")).lower()]
+    rows = rows[: _clamp(limit)]
+    return {"kind": k.name, "count": len(rows), k.resource: lb.mask(rows)}
 
 
 @_tool
@@ -2662,36 +2665,43 @@ async def list_lb_monitors(
 @_tool
 async def add_object(
     kind: Annotated[str, Field(description=_KIND_DESC)],
-    name: Annotated[str, Field(description="Name of the new object.")],
-    settings: Annotated[dict[str, Any], Field(description="Its NITRO attributes (the CLI option names, lower case), e.g. lb_vserver {\"servicetype\": \"HTTP\", \"ipv46\": \"10.0.0.20\", \"port\": 80, \"lbmethod\": \"LEASTCONNECTION\"}; service {\"servername\": \"srv_web1\", \"servicetype\": \"HTTP\", \"port\": 80}; server {\"ipaddress\": \"10.0.0.31\"}; service_group {\"servicetype\": \"HTTP\"}; cs_action {\"targetlbvserver\": \"vs_api\"}; cs_policy {\"rule\": \"HTTP.REQ.URL.STARTSWITH(\\\"/api\\\")\", \"action\": \"ca_api\"}; monitor {\"type\": \"HTTP\", \"httprequest\": \"GET /health\", \"respcode\": [\"200\"]}.")],
+    name: Annotated[str, Field(description="Name (key) of the new object; for DNS records the host / domain / alias name.")],
+    settings: Annotated[dict[str, Any], Field(description="Its NITRO attributes (the CLI option names, lower case), e.g. lb_vserver {\"servicetype\": \"HTTP\", \"ipv46\": \"10.0.0.20\", \"port\": 80}; server {\"ipaddress\": \"10.0.0.31\"}; cs_policy {\"rule\": \"HTTP.REQ.HOSTNAME.EQ(\\\"app.example.com\\\")\", \"action\": \"ca_app\"}; ssl_certkey {\"cert\": \"app.example.com.pem\", \"key\": \"app.example.com.key\", \"inform\": \"PEM\", \"expirymonitor\": \"ENABLED\", \"notificationperiod\": 30} (PFX: inform PFX + passplain); ssl_profile {\"sslprofiletype\": \"BackEnd\", \"tls12\": \"DISABLED\", \"tls13\": \"ENABLED\"}; rewrite_action {\"type\": \"replace\", \"target\": \"...\", \"stringbuilderexpr\": \"...\"}; responder_htmlpage {\"src\": \"http://...\"}; policy_dataset {\"type\": \"ipv4\"}; gslb_service {\"servicetype\": \"HTTP\", \"ip\": \"10.0.0.40\", \"port\": 80, \"sitename\": \"site_a\"}; dns_a {\"ipaddress\": \"10.0.0.50\", \"ttl\": 300}.")],
     dry_run: Annotated[bool, Field(description=_DRY_RUN_DESC)] = True,
     confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
-    """Create an LB vserver, CS vserver, service, service group, server, CS policy, CS action or monitor
-    (WRITE — requires NETSCALER_ALLOW_WRITE).
+    """Create any traffic-management object listed under kind (WRITE — requires NETSCALER_ALLOW_WRITE).
 
-    Previews the exact NITRO body by default. An object that already exists is left alone (use
-    update_object). Bind things together with change_bindings; to build a whole setup (server → service
-    group + members → LB vserver → CS policy) with one confirmation, put the steps into apply_batch.
-    Live immediately once applied; persist with save_config.
+    Previews the exact NITRO body by default (passwords masked). An object that already exists — for DNS
+    kinds, a record with the same value — is left alone (use update_object). Certificate files must be on
+    the appliance first (upload_ssl_file). Bind things together with change_bindings; put a whole setup
+    into apply_batch for one confirmation. Live immediately once applied; persist with save_config.
     """
     args = _call_args(locals())
-    k = lb.kind(kind)
+    k = lb.kind(kind, operation="add")
     body = lb.add_body(k, name, settings)
     if not dry_run:
         _require_write()
-    exists = await _object(k, name) is not None
+    if k.multi:
+        exists = any(lb.same_record(k, r, body) for r in await _records(k, name))
+    else:
+        exists = await _object(k, name) is not None
     out: dict[str, Any] = {
         "kind": k.name, "name": name, "dry_run": dry_run,
         "result": "exists: nothing to add (change it with update_object)" if exists else "would add",
-        "nitro": {k.resource: body},
+        "nitro": {k.resource: lb.mask(body)},
     }
+    if k.add_action:
+        out["nitro_action"] = k.add_action
     summary = f"Add {k.name} '{name}'."
     if not _gate("add_object", {"args": args, "plan": None if exists else body}, summary, out,
                  dry_run=dry_run, confirm=confirm, writes=not exists):
         return out
     if not exists:
-        await _get_client().add(k.resource, body)
+        if k.add_action:
+            await _get_client().action(k.resource, k.add_action, body)
+        else:
+            await _get_client().add(k.resource, body)
         out["result"] = "added"
     return out
 
@@ -2699,37 +2709,48 @@ async def add_object(
 @_tool
 async def update_object(
     kind: Annotated[str, Field(description=_KIND_DESC)],
-    name: Annotated[str, Field(description="The object's name.")],
-    settings: Annotated[dict[str, Any] | None, Field(description="Attributes to set, e.g. {\"lbmethod\": \"ROUNDROBIN\", \"persistencetype\": \"COOKIEINSERT\", \"timeout\": 30} or {\"rule\": \"HTTP.REQ.HOSTNAME.EQ(\\\"app.example.com\\\")\"}.")] = None,
+    name: Annotated[str, Field(description="The object's name (key).")],
+    settings: Annotated[dict[str, Any] | None, Field(description="Attributes to set, e.g. {\"lbmethod\": \"ROUNDROBIN\"}; ssl_service_group {\"sslprofile\": \"prof_backend_tls13\"}; ssl_certkey {\"cert\": \"app-2027.pem\", \"key\": \"app-2027.key\"} replaces the certificate (update ssl certKey; nodomaincheck true if the new one has other names).")] = None,
     unset: Annotated[list[str] | None, Field(description="Attributes to reset to their default (NITRO unset), e.g. [\"persistencetype\", \"comment\"].")] = None,
     dry_run: Annotated[bool, Field(description=_DRY_RUN_DESC)] = True,
     confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
-    """Change settings of an LB vserver, CS vserver, service, service group, server, CS policy, CS action
-    or monitor (WRITE — requires NETSCALER_ALLOW_WRITE).
+    """Change settings of any traffic-management object listed under kind, e.g. assign an SSL profile to
+    a vserver's / service group's SSL side or renew a certificate (WRITE — requires NETSCALER_ALLOW_WRITE).
 
-    Shows before/after per attribute and only sends attributes whose value differs. Attributes NetScaler
-    can't change in place (e.g. servicetype) are rejected by the appliance; the result then names them.
-    Previews by default. Live immediately once applied; persist with save_config.
+    Shows before/after per attribute and only sends attributes whose value differs. ssl_certkey cert / key /
+    password / inform go through 'update ssl certKey' and are always sent (a renewed file often keeps its
+    name). Attributes NetScaler can't change in place are rejected by the appliance and named in the
+    result. Inside apply_batch, an object created by an earlier step may not exist yet in the preview.
+    Passwords are masked. Previews by default. Live immediately once applied; persist with save_config.
     """
     args = _call_args(locals())
-    k = lb.kind(kind)
+    k = lb.kind(kind, operation="update")
     if not settings and not unset:
         raise ValueError("Pass settings and/or unset.")
     if not dry_run:
         _require_write()
     current = await _object(k, name)
-    if current is None:
+    pending = current is None and _batch_preview()
+    if current is None and not pending:
         raise ValueError(f"No {k.name} named {name!r} (NITRO {k.resource}).")
-    changes, reset, table = lb.update_plan(k, current, settings, unset)
+    changes, action, reset, table = lb.update_plan(k, current or {}, settings, unset)
     out: dict[str, Any] = {"kind": k.name, "name": name, "dry_run": dry_run, "changes": table,
-                           "unchanged": sorted(set(settings or {}) - set(changes))}
+                           "unchanged": sorted(set(settings or {}) - set(changes) - set(action))}
+    if pending:
+        out["note"] = f"{k.name} '{name}' does not exist yet; an earlier step of this batch is expected to create it."
     summary = f"Change {len(table)} setting(s) of {k.name} '{name}'."
-    if not _gate("update_object", {"args": args, "plan": {"set": changes, "unset": reset}}, summary, out,
-                 dry_run=dry_run, confirm=confirm, writes=bool(table)):
+    # bound to the request itself: inside a batch the object may only exist once earlier steps ran
+    if not _gate("update_object", {"args": args}, summary, out, dry_run=dry_run, confirm=confirm,
+                 writes=bool(table)):
         return out
-    ident = {k.key: name, **{a: current.get(a) for a in k.ident_extra}}
+    ident = {k.key: name, **{a: (current or {}).get(a) for a in k.ident_extra}}
     errors = await _update_attrs(k.resource, ident, changes) if changes else []
+    if action:
+        try:
+            await _get_client().action(k.resource, "update", {k.key: name, **action})
+        except NitroError as exc:
+            errors.append(f"{k.resource} update: {exc}")
     if reset:
         try:
             await _get_client().action(k.resource, "unset", {**ident, **{a: True for a in reset}})
@@ -2751,7 +2772,7 @@ async def set_object_state(
     dry_run: Annotated[bool, Field(description=_DRY_RUN_DESC)] = True,
     confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
-    """Enable or disable LB/CS vservers, services, service groups (or single members) and servers
+    """Enable or disable LB/CS/GSLB vservers, services, service groups (or single members) and servers
     (WRITE — requires NETSCALER_ALLOW_WRITE).
 
     Disabling a server takes it out of every service and group that uses it; disabling a group member
@@ -2813,25 +2834,31 @@ async def set_object_state(
 @_tool
 async def change_bindings(
     binding: Annotated[str, Field(description=_BINDING_DESC)],
-    name: Annotated[str, Field(description="The object entries are bound to: the LB vserver, service group, service or CS vserver.")],
-    add: Annotated[list[dict[str, Any] | str] | None, Field(description="Entries to bind. A string is the plain name ('svc_web1', 'mon_http', 'vs_web') or for members '<server or IP>:<port>'; an object adds attributes, e.g. {\"servicename\": \"svc_web1\", \"weight\": 2}, {\"servername\": \"srv_web3\", \"port\": 8080}, {\"policyname\": \"cp_api\", \"priority\": 100}.")] = None,
-    remove: Annotated[list[dict[str, Any] | str] | None, Field(description="Entries to unbind, same forms (attributes beyond the identity are ignored).")] = None,
+    name: Annotated[str | None, Field(description="The object entries are bound to (LB/CS vserver, service group, service, SSL vserver = the vserver's name, SSL profile, certificate, policy label, pattern set, GSLB vserver). Omit for the global bindings.")] = None,
+    add: Annotated[list[dict[str, Any] | str] | None, Field(description="Entries to bind. A string is the plain name ('svc_web1', 'mon_http', a certkey, a pattern) or for members '<server or IP>:<port>'; an object adds attributes, e.g. {\"servicename\": \"svc_web1\", \"weight\": 2}, {\"policyname\": \"cp_api\", \"priority\": 100}, {\"policyname\": \"rw_404\", \"priority\": 100, \"bindpoint\": \"RESPONSE\"}, {\"certkeyname\": \"app.example.com\", \"snicert\": true}, {\"ciphername\": \"TLS1.3-AES256-GCM-SHA384\", \"cipherpriority\": 1}.")] = None,
+    remove: Annotated[list[dict[str, Any] | str] | None, Field(description="Entries to unbind, same forms (the live binding supplies bindpoint / priority / SNI flags).")] = None,
     dry_run: Annotated[bool, Field(description=_DRY_RUN_DESC)] = True,
     confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
-    """Bind / unbind services, service groups, group members, monitors, CS policies and the CS default
-    LB vserver (WRITE — requires NETSCALER_ALLOW_WRITE).
+    """Bind / unbind anything listed under binding: services and members, monitors, CS policies, feature
+    policies (responder, rewrite, appfw, bot, …) and analytics profiles on vservers, certificates (SNI)
+    and SSL policies on SSL vservers / services, ciphers on SSL profiles, the CA link of a certificate,
+    global rewrite / responder policies, patterns of pattern sets / data sets / string maps, GSLB services
+    and domains (WRITE — requires NETSCALER_ALLOW_WRITE).
 
     Plans against the live bindings: entries already bound the same way are skipped, an entry bound with
-    a different weight / priority / target is re-bound (unbind + bind, so it is briefly out of rotation),
-    and a new CS default replaces the old one. Order keeps traffic flowing: new binds first, removals
-    last. Previews by default. Live immediately once applied; persist with save_config.
+    a different weight / priority / flag is re-bound (unbind + bind, so it is briefly out of effect), and a
+    new single entry (CS default, CA link) replaces the old one. Order keeps traffic flowing: new binds
+    first, removals last. Previews by default. Live immediately once applied; persist with save_config.
     """
     args = _call_args(locals())
     b = lb.binding(binding)
+    if b.parent is None and name:
+        raise ValueError(f"{b.name} is a global binding; leave name out.")
+    if b.parent is not None and not (name or "").strip():
+        raise ValueError(f"{b.name} needs name: the {b.parent} the entries are bound to.")
     adds = [lb.entry(b, e) for e in add or []]
-    removes = [{b.identity[0]: e.strip()} if isinstance(e, str) and b.name != "service_group_member"
-               else lb.entry(b, e) for e in remove or []]
+    removes = [lb.removal(b, e) for e in remove or []]
     if not adds and not removes:
         raise ValueError("Pass add and/or remove.")
     for item in adds:
@@ -2843,27 +2870,35 @@ async def change_bindings(
     steps = lb.plan_bindings(b, rows, adds, removes)
     ops = [s for s in steps if s["op"]]
     counts = {op: sum(s["op"] == op for s in ops) for op in ("bind", "rebind", "unbind")}
+    where = {b.parent_attr: name} if b.parent else {"scope": "global"}
     out: dict[str, Any] = {
-        "binding": b.name, b.parent_attr: name, "dry_run": dry_run, "counts": counts,
-        "steps": [{k: v for k, v in s.items() if k != "op"} for s in steps],
+        "binding": b.name, **where, "dry_run": dry_run, "counts": counts,
+        "steps": [{k: v for k, v in s.items() if k not in ("op", "unbind")} for s in steps],
     }
-    summary = (f"{b.name} on '{name}': bind {counts['bind']}, re-bind {counts['rebind']}, "
+    target = f"'{name}'" if b.parent else "global"
+    summary = (f"{b.name} on {target}: bind {counts['bind']}, re-bind {counts['rebind']}, "
                f"unbind {counts['unbind']}.")
-    change = {"args": args, "plan": [[s["op"], s["entry"]] for s in ops]}
+    change = {"args": args, "plan": [[s["op"], s["entry"], s.get("unbind")] for s in ops]}
     if not _gate("change_bindings", change, summary, out, dry_run=dry_run, confirm=confirm, writes=bool(ops)):
         return out
     client = _get_client()
 
     async def bind(item: dict[str, Any]) -> str:
         try:
-            await client.update(b.resource, {b.parent_attr: name, **item})
+            if b.link:
+                await client.action(b.resource, "link", {b.parent_attr: name, **item})
+            else:
+                await client.update(b.resource, {b.parent_attr: name, **item} if b.parent else item)
             return "bound"
         except NitroError as exc:
             return "exists" if _is_exists(exc) else f"error: {exc}"
 
     async def unbind(item: dict[str, Any]) -> str:
         try:
-            await client.delete(b.resource, name, args=lb.delete_args(b, item))
+            if b.link:
+                await client.action(b.resource, "unlink", {b.parent_attr: name})
+            else:
+                await client.delete(b.resource, name or None, args=lb.delete_args(b, item))
             return "unbound"
         except NitroError as exc:
             return "absent" if _is_missing(exc) else f"error: {exc}"
@@ -2874,7 +2909,7 @@ async def change_bindings(
         elif step["op"] == "unbind":
             shown["status"] = await unbind(step["entry"])
         elif step["op"] == "rebind":
-            status = await unbind(step["entry"])
+            status = await unbind(step["unbind"])
             if status in ("unbound", "absent"):
                 status = await bind(step["entry"])
             shown["status"] = "rebound" if status == "bound" else f"rebind failed: {status}"
@@ -2886,12 +2921,12 @@ async def change_bindings(
 @_tool
 async def delete_object(
     kind: Annotated[str, Field(description=_KIND_DESC)],
-    names: Annotated[list[str], Field(description="Objects to delete, in this order, e.g. [\"cp_old\", \"ca_old\"] (a policy before the action it uses).", min_length=1, max_length=50)],
+    names: Annotated[list[str | dict[str, Any]], Field(description="Objects to delete, in this order, e.g. [\"cp_old\", \"ca_old\"] (a policy before the action it uses). DNS kinds: a name deletes every record under it; {\"hostname\": \"app.example.com\", \"ipaddress\": \"10.0.0.50\"} only the matching one.", min_length=1, max_length=50)],
     dry_run: Annotated[bool, Field(description="Preview only (default). Set false to delete; needs NETSCALER_ALLOW_WRITE and NETSCALER_ALLOW_DELETE, and always the confirm code from the preview.")] = True,
     confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
 ) -> dict[str, Any]:
-    """Delete LB/CS vservers, services, service groups, servers, CS policies, CS actions or monitors
-    (WRITE, DELETE — requires NETSCALER_ALLOW_WRITE and NETSCALER_ALLOW_DELETE; always confirmed).
+    """Delete traffic-management objects of any deletable kind listed under kind (WRITE, DELETE — requires
+    NETSCALER_ALLOW_WRITE and NETSCALER_ALLOW_DELETE; always confirmed).
 
     The preview lists, per object, what is still bound to it or uses it — e.g. the services on a server,
     the CS vservers a policy is bound to — so the user sees what goes with it or what blocks it. The
@@ -2901,13 +2936,35 @@ async def delete_object(
     persist with save_config (until then a reboot without save brings it back).
     """
     args = _call_args(locals())
-    k = lb.kind(kind)
+    k = lb.kind(kind, operation="delete")
     if not dry_run:
         _require_delete()
-    names = list(dict.fromkeys(n.strip() for n in names if n and n.strip()))
     targets: list[dict[str, Any]] = []
     plan: list[dict[str, Any]] = []
-    for name in names:
+    seen: set[str] = set()
+    for raw in names:
+        want = raw if isinstance(raw, dict) else {k.key: str(raw).strip()}
+        name = str(want.get(k.key) or "").strip()
+        if not name:
+            raise ValueError(f"Each entry needs the {k.key}; got {raw!r}.")
+        if k.multi:
+            records = [r for r in await _records(k, name)
+                       if all(lb._norm(r.get(a)) == lb._norm(v) for a, v in want.items() if a != k.key)]
+            if not records:
+                targets.append({"name": name, "result": "not found"})
+            for r in records:
+                del_args = {a: r.get(a) for a in k.delete_by}
+                label = json.dumps([name, del_args], sort_keys=True, default=str)
+                if label in seen:
+                    continue
+                seen.add(label)
+                shown = {a: r.get(a) for a in k.multi}
+                targets.append({"name": name, **shown, "args": del_args, "result": "would delete"})
+                plan.append({"name": name, **shown, "args": del_args})
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
         obj = await _object(k, name)
         if obj is None:
             targets.append({"name": name, "result": "not found"})
@@ -2920,12 +2977,13 @@ async def delete_object(
             pass
         if waf.as_int(obj.get("referencecount")):
             refs["referencecount"] = waf.as_int(obj.get("referencecount"))
-        extra = {a: obj.get(a) for a in k.ident_extra}
-        targets.append({"name": name, **extra, "bound": refs, "result": "would delete"})
-        plan.append({"name": name, **extra, "bound": refs})
+        del_args = {a: obj.get(a) for a in k.delete_by}
+        targets.append({"name": name, **({"args": del_args} if del_args else {}), "bound": refs,
+                        "result": "would delete"})
+        plan.append({"name": name, "args": del_args, "bound": refs})
     out: dict[str, Any] = {"kind": k.name, "dry_run": dry_run, "targets": targets}
     summary = f"DELETE {len(plan)} {k.name}(s): {', '.join(p['name'] for p in plan)}."
-    if any(p["bound"] for p in plan):
+    if any(p.get("bound") for p in plan):
         summary += " Some still have bindings or references (see targets)."
     if not _gate("delete_object", {"args": args, "plan": plan}, summary, out, dry_run=dry_run, confirm=confirm,
                  writes=bool(plan), always=True):
@@ -2935,9 +2993,7 @@ async def delete_object(
         if target["result"] != "would delete":
             continue
         try:
-            await _get_client().delete(
-                k.resource, target["name"], args={a: target[a] for a in k.ident_extra} or None
-            )
+            await _get_client().delete(k.resource, target["name"], args=target.get("args") or None)
             target["result"] = "deleted"
         except NitroError as exc:
             target["result"] = f"error: {exc}"
@@ -2945,6 +3001,688 @@ async def delete_object(
     if failed:
         out["error"] = f"{failed} delete(s) failed; see targets."
     return out
+
+
+# ---- SSL files -------------------------------------------------------------
+
+_SSL_DIR = "/nsconfig/ssl"
+_SSL_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,250}")
+
+
+def _ssl_content(data: bytes) -> dict[str, Any]:
+    """What a certificate / key file looks like, without showing it."""
+    head = data[:4096].decode("ascii", "ignore")
+    found = [label for marker, label in (
+        ("BEGIN CERTIFICATE", "certificate"), ("PRIVATE KEY", "private key"),
+        ("BEGIN CERTIFICATE REQUEST", "CSR"), ("BEGIN X509 CRL", "CRL"),
+    ) if marker in head]
+    if found:
+        return {"format": "PEM", "contains": found}
+    if data[:1] == b"\x30":
+        return {"format": "DER or PFX (binary)", "contains": []}
+    return {"format": "unknown", "contains": []}
+
+
+def _drop_file(name: str) -> bytes:
+    """Read a bare file name from NETSCALER_EXPORT_DIR (the files directory; nothing outside it)."""
+    base = _get_client().settings.export_dir
+    if not base:
+        raise ValueError("file= needs NETSCALER_EXPORT_DIR (a mounted files directory); pass text or content_base64 instead.")
+    if not _SSL_FILE.fullmatch(name or "") or ".." in name:
+        raise ValueError(f"file must be a bare name in the files directory; got {name!r}.")
+    path = Path(base) / name
+    if not path.is_file():
+        raise ValueError(f"{name!r} is not in the files directory.")
+    return path.read_bytes()
+
+
+async def _ssl_file(name: str) -> bytes | None:
+    """The bytes of /nsconfig/ssl/<name> on the appliance, or None when there is no such file."""
+    try:
+        env = await _get_client().get("config", "systemfile", args={"filelocation": _SSL_DIR, "filename": name})
+    except NitroError as exc:
+        message = (exc.nitro_message or "").lower()
+        if _is_missing(exc) or "not exist" in message or "no such file" in message:
+            return None
+        raise
+    row = _one(env, "systemfile")
+    if not row:
+        return None
+    try:
+        return base64.b64decode(row.get("filecontent") or "")
+    except ValueError:
+        return b""
+
+
+@_tool
+async def upload_ssl_file(
+    filename: Annotated[str, Field(description="Bare file name in /nsconfig/ssl, e.g. 'app.example.com-2027.pem' (letters, digits, '.', '_', '-').")],
+    text: Annotated[str | None, Field(description="The file as text (PEM certificate, chain or key).")] = None,
+    content_base64: Annotated[str | None, Field(description="Or the file as base64 (DER, PFX).")] = None,
+    file: Annotated[str | None, Field(description="Or a bare file name in NETSCALER_EXPORT_DIR (the mounted files directory): keeps private keys out of the conversation.")] = None,
+    overwrite: Annotated[bool, Field(description="Replace an existing file of that name with different content (delete + upload).")] = False,
+    dry_run: Annotated[bool, Field(description=_DRY_RUN_DESC)] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Upload a certificate / key / chain file to /nsconfig/ssl — and only there (WRITE — requires
+    NETSCALER_ALLOW_WRITE).
+
+    For add_object / update_object kind ssl_certkey, which reference files in /nsconfig/ssl. The preview
+    shows name, size, SHA-256 and what the file contains, never its content. An identical file is left
+    alone; a different one needs overwrite=true. Private keys sent as text pass through the conversation:
+    prefer file= with a mounted files directory.
+    """
+    name = (filename or "").strip()
+    if not _SSL_FILE.fullmatch(name) or ".." in name:
+        raise ValueError(f"filename must be a bare name like 'app.example.com.pem'; got {filename!r}.")
+    if sum(v is not None for v in (text, content_base64, file)) != 1:
+        raise ValueError("Pass exactly one of text, content_base64 or file.")
+    if text is not None:
+        data = text.encode("utf-8")
+    elif content_base64 is not None:
+        try:
+            data = base64.b64decode(content_base64.split(",", 1)[-1], validate=True)
+        except ValueError as exc:
+            raise ValueError(f"content_base64 is not valid base64: {exc}") from None
+    else:
+        data = _drop_file(file.strip())
+    if not data:
+        raise ValueError("The file is empty.")
+    if not dry_run:
+        _require_write()
+    digest = hashlib.sha256(data).hexdigest()
+    existing = await _ssl_file(name)
+    if existing is None:
+        result, ops = "would upload", ["upload"]
+    elif hashlib.sha256(existing).hexdigest() == digest:
+        result, ops = "identical file already there: nothing to do", []
+    elif overwrite:
+        result, ops = "would replace the existing file", ["delete", "upload"]
+    else:
+        result, ops = "a different file of that name exists: pass overwrite=true to replace it", []
+    out: dict[str, Any] = {
+        "filename": name, "filelocation": _SSL_DIR, "size": len(data), "sha256": digest,
+        **_ssl_content(data), "dry_run": dry_run, "result": result,
+    }
+    # arguments without the content: the code binds the file by its digest
+    change = {"args": {"filename": name, "overwrite": overwrite, "sha256": digest}, "plan": ops}
+    summary = f"Upload {name} ({len(data)} bytes) to {_SSL_DIR}" + (" replacing the existing file." if "delete" in ops else ".")
+    if not _gate("upload_ssl_file", change, summary, out, dry_run=dry_run, confirm=confirm, writes=bool(ops)):
+        return out
+    client = _get_client()
+    if "delete" in ops:
+        await client.delete("systemfile", args={"filename": name, "filelocation": _SSL_DIR})
+    if "upload" in ops:
+        await client.add("systemfile", {
+            "filename": name, "filelocation": _SSL_DIR, "fileencoding": "BASE64",
+            "filecontent": base64.b64encode(data).decode("ascii"),
+        })
+        out["result"] = "replaced" if "delete" in ops else "uploaded"
+    return out
+
+
+# ---- pattern sets, data sets, string maps, expressions --------------------
+
+_SEARCHABLE = (
+    ("policy_patset", "policy_patset_pattern"), ("policy_dataset", "policy_dataset_value"),
+    ("policy_stringmap", "policy_stringmap_pattern"), ("policy_expression", None),
+)
+
+
+@_tool
+async def search_policy_objects(
+    text: Annotated[str, Field(description="Case-insensitive text to find in names, patterns / values / keys and expressions, e.g. the name inside CONTAINS_ANY(\"...\").", min_length=1)],
+    include_values: Annotated[bool, Field(description="Also search the patterns / values bound to each pattern set, data set and string map (one request per object).")] = True,
+    limit: Annotated[int, Field(description="Max matches to return.", ge=1, le=500)] = 50,
+) -> dict[str, Any]:
+    """Find pattern sets, data sets, string maps and named expressions together — by name, by a pattern /
+    value / key they hold, or by expression text (config tree).
+
+    Policy rules like CONTAINS_ANY("x") may refer to a pattern set or a data set; this searches both.
+    Name matches list the object's first 20 values.
+    """
+    needle = text.lower()
+    matches: list[dict[str, Any]] = []
+    searched: dict[str, int] = {}
+    for kind_name, binding_name in _SEARCHABLE:
+        k = lb.KINDS[kind_name]
+        try:
+            rows = (await _get_list("config", k.resource, k.fields, limit=500)).get(k.resource) or []
+        except NitroError as exc:
+            searched[kind_name] = 0
+            matches.append({"kind": kind_name, "error": str(exc)})
+            continue
+        searched[kind_name] = len(rows)
+        for row in rows:
+            name = str(row.get(k.key, ""))
+            hit_name = needle in name.lower()
+            hit_expr = kind_name == "policy_expression" and needle in str(row.get("value", "")).lower()
+            values: list[dict[str, Any]] = []
+            if binding_name and (include_values or hit_name):
+                b = lb.BINDINGS[binding_name]
+                values = [lb.trim_row(v, b.fields, b.parent_attr) for v in await _bound_rows(b, name)]
+            hit_values = [v for v in values if any(needle in str(x).lower() for x in v.values())]
+            if hit_name:
+                matches.append({"kind": kind_name, "name": name, "match": "name", **_pick(row, k.fields),
+                                "values": values[:20], "values_total": len(values)})
+            elif hit_expr:
+                matches.append({"kind": kind_name, "name": name, "match": "expression", "value": row.get("value")})
+            elif hit_values and include_values:
+                matches.append({"kind": kind_name, "name": name, "match": "value", "values": hit_values[:20]})
+            if len(matches) >= limit:
+                break
+    return {"text": text, "count": len(matches[:limit]), "matches": matches[:limit], "searched": searched}
+
+
+# ---- GSLB sync ---------------------------------------------------------------
+
+@_tool
+async def sync_gslb_config(
+    force_site: Annotated[str | None, Field(description="Force a full sync to this one site (sync gslb config -forceSync <site>).")] = None,
+    save_on_sites: Annotated[bool, Field(description="Have each site save its config after the sync (-saveconfig).")] = False,
+    dry_run: Annotated[bool, Field(description=_DRY_RUN_DESC)] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Push this appliance's GSLB configuration to the other GSLB sites with sync gslb config (WRITE —
+    requires NETSCALER_ALLOW_WRITE).
+
+    The preview lists the local and the target (remote) sites. The sync overwrites the GSLB configuration
+    on the targets, so run it from the site that holds the intended state; compare_instances shows
+    differences first when the sites are configured as instances. Batchable, e.g. as the last step after
+    GSLB changes.
+    """
+    args = _call_args(locals())
+    if not dry_run:
+        _require_write()
+    rows = (await _get_list("config", "gslbsite", _GSLBSITE_FIELDS + ("status",), limit=500)).get("gslbsite") or []
+    local = [r for r in rows if str(r.get("sitetype", "")).upper() == "LOCAL"]
+    remote = [r for r in rows if str(r.get("sitetype", "")).upper() == "REMOTE"]
+    if force_site and force_site not in {r.get("sitename") for r in remote}:
+        raise ValueError(f"force_site must be one of the remote sites {[r.get('sitename') for r in remote]}.")
+    body: dict[str, Any] = {"nowarn": True}
+    if force_site:
+        body["forcesync"] = force_site
+    if save_on_sites:
+        body["saveconfig"] = True
+    targets = [r for r in remote if not force_site or r.get("sitename") == force_site]
+    out: dict[str, Any] = {"dry_run": dry_run, "local": local, "targets": targets, "nitro": {"gslbconfig": body},
+                           "result": "would sync" if targets else "no remote site: nothing to sync"}
+    summary = (f"Sync the GSLB configuration from {', '.join(r.get('sitename', '?') for r in local) or 'this site'} "
+               f"to {', '.join(r.get('sitename', '?') for r in targets) or 'no site'}.")
+    if not _gate("sync_gslb_config", {"args": args, "plan": [r.get("sitename") for r in targets]}, summary, out,
+                 dry_run=dry_run, confirm=confirm, writes=bool(targets)):
+        return out
+    if targets:
+        env = await _get_client().action("gslbconfig", "sync", body)
+        out["result"] = "synced"
+        if env.get("message"):
+            out["message"] = env["message"]
+    return out
+
+
+# ---- diagnosis ----------------------------------------------------------------
+
+_SSL_TYPES = ("SSL", "SSL_BRIDGE", "SSL_TCP", "DTLS", "SSL_DIAMETER", "SSL_PUSH")
+_MEMBER_STAT_FIELDS = ("servername", "primaryipaddress", "primaryport", "state", "svrstate", "totalrequests",
+                       "totalresponses", "curclntconnections", "cursrvrconnections", "svrestablishedconn",
+                       "totalsvrbusyerr", "avgsvrttfb")
+
+
+async def _stat(resource: str, name: str) -> dict[str, Any]:
+    try:
+        return _one(await _get_client().get("stat", resource, resource_name=name), resource)
+    except NitroError as exc:
+        return {"error": str(exc)}
+
+
+async def _monitor_view(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    views = []
+    for row in rows:
+        name = row.get("monitor_name") or row.get("monitorname")
+        mon = await _object(lb.KINDS["monitor"], name) if name else None
+        views.append({"monitor": name, "type": (mon or {}).get("type") or ("TCP" if name == "tcp-default" else None),
+                      "monstate": row.get("monstate")})
+    return views
+
+
+_TCP_ONLY_MONITORS = ("TCP", "TCP-ECV", "PING", "UDP", "UDP-ECV", "ARP")
+
+
+def _tls_unchecked(servicetype: str, monitors: list[dict[str, Any]]) -> bool:
+    """An SSL backend whose monitors (or the implicit tcp-default) never complete a TLS handshake."""
+    if str(servicetype).upper() not in _SSL_TYPES:
+        return False
+    return all(str(m.get("type") or "").upper() in _TCP_ONLY_MONITORS for m in monitors)
+
+
+async def _diag_group(name: str, lb_requests: int, warnings: list[str]) -> dict[str, Any]:
+    config = await _object(lb.KINDS["service_group"], name) or {}
+    monitors = await _monitor_view(await _bound_rows(lb.BINDINGS["service_group_monitor"], name))
+    try:
+        env = await _get_client().get_raw(f"stat/servicegroup/{quote(name, safe='')}", params={"statbindings": "yes"})
+        stat = _one(env, "servicegroup")
+    except NitroError as exc:
+        stat = {"error": str(exc)}
+    members = [_pick(m, _MEMBER_STAT_FIELDS) for m in _rows(stat, "servicegroupmember")] if "error" not in stat else []
+    members = [{k: v for k, v in m.items() if v is not None} for m in members]
+    if not members and "error" not in stat:
+        warnings.append(f"service group {name}: no members.")
+    for m in members:
+        label = f"{name} {m.get('servername') or m.get('primaryipaddress')}:{m.get('primaryport')}"
+        state = str(m.get("state") or m.get("svrstate") or "").upper()
+        if state and state != "UP":
+            warnings.append(f"member {label} is {state}.")
+        elif (lb_requests and not waf.as_int(m.get("svrestablishedconn"))
+              and not waf.as_int(m.get("totalrequests"))):
+            warnings.append(f"member {label} is UP but has handled no requests and has no established "
+                            "connections while the vserver gets traffic: check the backend protocol / TLS.")
+    if _tls_unchecked(config.get("servicetype", ""), monitors):
+        warnings.append(f"service group {name} is {config.get('servicetype')} but its monitors "
+                        f"({', '.join(m['monitor'] for m in monitors) or 'none: tcp-default'}) only check TCP, "
+                        "not the TLS handshake; bind an HTTPS / SSL-ECV monitor (secure YES).")
+    return {"name": name, "servicetype": config.get("servicetype"), "state": config.get("state"),
+            "monitors": monitors, "members": members, **({"stat_error": stat["error"]} if "error" in stat else {})}
+
+
+async def _diag_service(name: str, warnings: list[str]) -> dict[str, Any]:
+    config = await _object(lb.KINDS["service"], name) or {}
+    monitors = await _monitor_view(await _bound_rows(lb.BINDINGS["service_monitor"], name))
+    stat = await _stat("service", name)
+    state = str(stat.get("state") or config.get("svrstate") or "").upper()
+    if state and state != "UP":
+        warnings.append(f"service {name} is {state}.")
+    if _tls_unchecked(config.get("servicetype", ""), monitors):
+        warnings.append(f"service {name} is {config.get('servicetype')} but its monitors only check TCP, "
+                        "not the TLS handshake.")
+    return {"name": name, "servicetype": config.get("servicetype"), "state": state or None, "monitors": monitors,
+            "stat": _pick(stat, ("totalrequests", "curclntconnections", "cursrvrconnections", "svrestablishedconn"))}
+
+
+async def _diag_lb(name: str, warnings: list[str]) -> dict[str, Any]:
+    config = await _object(lb.KINDS["lb_vserver"], name)
+    if config is None:
+        warnings.append(f"LB vserver {name} does not exist.")
+        return {"name": name, "error": "not found"}
+    stat = await _stat("lbvserver", name)
+    requests = waf.as_int(stat.get("totalrequests")) or 0
+    state = str(stat.get("state") or config.get("curstate") or "").upper()
+    if state and state != "UP":
+        warnings.append(f"LB vserver {name} is {state} (effective state {config.get('effectivestate')}).")
+    groups = await _bound_rows(lb.BINDINGS["lb_vserver_service_group"], name)
+    services = await _bound_rows(lb.BINDINGS["lb_vserver_service"], name)
+    if not groups and not services:
+        warnings.append(f"LB vserver {name} has no service or service group bound.")
+    return {
+        "name": name, "state": state or None, "servicetype": config.get("servicetype"),
+        "stat": _pick(stat, ("vslbhealth", "totalrequests", "totalresponses", "curclntconnections",
+                              "cursrvrconnections", "hitsrate")),
+        "service_groups": [await _diag_group(g.get("servicegroupname"), requests, warnings) for g in groups],
+        "services": [await _diag_service(s.get("servicename"), warnings) for s in services],
+    }
+
+
+@_tool
+async def vserver_diagnose(
+    name: Annotated[str, Field(description="A CS vserver (checks every LB vserver it routes to) or an LB vserver.")],
+) -> dict[str, Any]:
+    """Health of one traffic path: CS vserver → its routes → LB vservers → service groups / services →
+    members, with live state and counters and warnings (stat + config trees).
+
+    Warns about vservers or members not UP, members that are UP but handle no requests while the vserver
+    gets traffic (typically a broken backend protocol or TLS that the monitor does not notice), SSL
+    backends monitored only by TCP / tcp-default (no TLS handshake checked), and empty groups.
+    """
+    warnings: list[str] = []
+    out: dict[str, Any] = {"name": name}
+    cs = await _object(lb.KINDS["cs_vserver"], name)
+    if cs is not None:
+        stat = await _stat("csvserver", name)
+        routes = await _cs_routes(await _bound_rows(lb.BINDINGS["cs_vserver_policy"], name), 200)
+        default = await _bound_rows(lb.BINDINGS["cs_vserver_default"], name)
+        state = str(stat.get("state") or cs.get("curstate") or "").upper()
+        if state and state != "UP":
+            warnings.append(f"CS vserver {name} is {state}.")
+        targets = list(dict.fromkeys([r["lb_target"] for r in routes if r["lb_target"]]
+                                     + [d.get("lbvserver") for d in default if d.get("lbvserver")]))
+        out["cs_vserver"] = {"state": state or None, "stat": _pick(stat, ("totalrequests", "curclntconnections")),
+                             "routes": routes, "default_lb_vserver": default[0].get("lbvserver") if default else None}
+        lb_names = targets
+    elif await _object(lb.KINDS["lb_vserver"], name) is not None:
+        lb_names = [name]
+    else:
+        raise ValueError(f"No CS or LB vserver named {name!r}.")
+    out["lb_vservers"] = [await _diag_lb(n, warnings) for n in lb_names]
+    out["warnings"] = warnings
+    out["healthy"] = not warnings
+    return out
+
+
+# ---- clone an application setup ------------------------------------------------
+
+_BATCH_EXCLUDED = ("save_config", "apply_batch", "clone_app_setup")
+
+
+def _swap(text: str, old: str, new: str, what: str) -> str:
+    if old.lower() not in text.lower():
+        raise ValueError(f"{what} {text!r} does not contain {old!r}, so its new name / rule can't be derived; "
+                         "pass name_part / new_name_part that it does contain.")
+    return re.sub(re.escape(old), new.replace("\\", "\\\\"), text, flags=re.I)
+
+
+async def _template_route(template: str, cs_vserver: str | None) -> tuple[str, dict[str, Any], list[dict[str, Any]]] | None:
+    """(CS vserver, the route to the template LB vserver, all routes of that CS vserver), or None."""
+    names = [cs_vserver] if cs_vserver else [
+        r.get("name") for r in (await _get_list("config", "csvserver", ("name",), limit=200)).get("csvserver") or []]
+    for cs in names:
+        routes = await _cs_routes(await _bound_rows(lb.BINDINGS["cs_vserver_policy"], cs), 500)
+        for route in routes:
+            if route["target"] == template:
+                return cs, route, routes
+    return None
+
+
+def _free_priority(routes: list[dict[str, Any]], after: int) -> int:
+    taken = {waf.as_int(r.get("priority")) for r in routes}
+    p = after + 1
+    while p in taken:
+        p += 1
+    return p
+
+
+def _backend(entry: str) -> tuple[str | None, dict[str, Any]]:
+    """'name=10.0.0.5:443' (new named server) / '10.0.0.5:443' / 'srv_existing:443' → (server to add, member)."""
+    named, sep, rest = entry.partition("=")
+    if sep:
+        member = lb.entry(lb.BINDINGS["service_group_member"], rest.strip())
+        if "ip" not in member:
+            raise ValueError(f"'name=ip:port' needs an IP after '='; got {entry!r}.")
+        return named.strip(), {"servername": named.strip(), "port": member["port"], "_ip": member["ip"]}
+    return None, lb.entry(lb.BINDINGS["service_group_member"], entry.strip())
+
+
+@_tool
+async def clone_app_setup(
+    template_lb_vserver: Annotated[str, Field(description="LB vserver of the existing app to copy.")],
+    template_hostname: Annotated[str, Field(description="Hostname the template's CS policy rule matches, e.g. 'old.example.com'.")],
+    new_hostname: Annotated[str, Field(description="Hostname for the new app, e.g. 'new.example.com'.")],
+    backends: Annotated[list[str], Field(description="Backend members: '10.0.0.5:443', an existing server 'srv_x:443', or 'srv_new=10.0.0.5:443' to create a named server.", min_length=1, max_length=50)],
+    name_part: Annotated[str | None, Field(description="Text in the template's object names to replace (default: template_hostname).")] = None,
+    new_name_part: Annotated[str | None, Field(description="Replacement in the new object names (default: new_hostname).")] = None,
+    cs_vserver: Annotated[str | None, Field(description="CS vserver that routes to the template (default: found by searching every CS vserver).")] = None,
+    certkey: Annotated[str | None, Field(description="Certificate to bind as SNI certificate on the CS vserver (an existing ssl_certkey).")] = None,
+    ssl_profile: Annotated[str | None, Field(description="SSL profile for the new service group's SSL side (default: the template's).")] = None,
+    lb_ip: Annotated[str | None, Field(description="VIP for the new LB vserver when the template LB vserver is directly addressable.")] = None,
+    lb_port: Annotated[int | None, Field(description="Port for the new LB vserver when lb_ip is given.")] = None,
+    instances: Annotated[list[str] | None, Field(description="Apply the same setup to several appliances (names from list_instances) with one confirmation; the template is read from the first.")] = None,
+    save: Annotated[bool, Field(description="Save the running config once everything applied cleanly.")] = False,
+    dry_run: Annotated[bool, Field(description=_DRY_RUN_DESC)] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Create a new application from an existing one as template — server(s), service group with its
+    settings, monitors and SSL profile, LB vserver with its settings and every policy / analytics binding,
+    CS action + policy for the new hostname at the next free priority, and the SNI certificate (WRITE —
+    requires NETSCALER_ALLOW_WRITE).
+
+    Object names and the CS rule are the template's with the hostname (or name_part) swapped. Builds an
+    apply_batch plan from the live template, previews every step and applies it with one confirmation,
+    optionally on several instances.
+    """
+    args = _call_args(locals())
+    old = name_part or template_hostname
+    new = new_name_part or new_hostname
+    template = await _object(lb.KINDS["lb_vserver"], template_lb_vserver)
+    if template is None:
+        raise ValueError(f"No LB vserver named {template_lb_vserver!r}.")
+    steps: list[dict[str, Any]] = []
+    plan: dict[str, Any] = {}
+    new_lb = _swap(template_lb_vserver, old, new, "LB vserver")
+    plan["lb_vserver"] = new_lb
+
+    # backend: service group, members, monitors, SSL side
+    groups = await _bound_rows(lb.BINDINGS["lb_vserver_service_group"], template_lb_vserver)
+    if len(groups) != 1:
+        raise ValueError(f"The template LB vserver needs exactly one service group; it has {len(groups)}.")
+    tmpl_sg = groups[0].get("servicegroupname")
+    sg_conf = await _object(lb.KINDS["service_group"], tmpl_sg) or {}
+    new_sg = _swap(tmpl_sg, old, new, "service group")
+    plan["service_group"] = new_sg
+    sg_settings = {a: sg_conf[a] for a in lb.COPY_ATTRS["service_group"] if sg_conf.get(a) not in (None, "")}
+    members = []
+    for raw in backends:
+        server, member = _backend(raw)
+        if server:
+            steps.append({"tool": "add_object", "args": {"kind": "server", "name": server,
+                                                          "settings": {"ipaddress": member.pop("_ip")}}})
+        members.append(member)
+    steps.append({"tool": "add_object", "args": {"kind": "service_group", "name": new_sg, "settings": sg_settings}})
+    steps.append({"tool": "change_bindings", "args": {"binding": "service_group_member", "name": new_sg,
+                                                      "add": members}})
+    monitors = [r.get("monitor_name") for r in await _bound_rows(lb.BINDINGS["service_group_monitor"], tmpl_sg)]
+    if monitors:
+        steps.append({"tool": "change_bindings", "args": {"binding": "service_group_monitor", "name": new_sg,
+                                                          "add": monitors}})
+    if str(sg_conf.get("servicetype", "")).upper() in _SSL_TYPES:
+        ssl_side = await _object(lb.KINDS["ssl_service_group"], tmpl_sg) or {}
+        profile = ssl_profile or ssl_side.get("sslprofile")
+        if profile:
+            steps.append({"tool": "update_object", "args": {"kind": "ssl_service_group", "name": new_sg,
+                                                            "settings": {"sslprofile": profile}}})
+        certs = await _bound_rows(lb.BINDINGS["ssl_service_group_certkey"], tmpl_sg)
+        if certs:
+            b = lb.BINDINGS["ssl_service_group_certkey"]
+            steps.append({"tool": "change_bindings", "args": {"binding": b.name, "name": new_sg, "add": [
+                lb.trim_row(c, b.fields, b.parent_attr) for c in certs]}})
+
+    # LB vserver, its policies and analytics profiles
+    lb_settings = {a: template[a] for a in lb.COPY_ATTRS["lb_vserver"] if template.get(a) not in (None, "")}
+    addressable = str(template.get("ipv46") or "0.0.0.0") not in ("0.0.0.0", "::")
+    if addressable and not lb_ip:
+        raise ValueError("The template LB vserver has its own VIP; pass lb_ip (and lb_port) for the new one.")
+    if lb_ip:
+        lb_settings.update(ipv46=lb_ip, port=lb_port or template.get("port"))
+    steps.append({"tool": "add_object", "args": {"kind": "lb_vserver", "name": new_lb, "settings": lb_settings}})
+    steps.append({"tool": "change_bindings", "args": {"binding": "lb_vserver_service_group", "name": new_lb,
+                                                      "add": [new_sg]}})
+    aggregate = _one(await _get_client().get("config", "lbvserver_binding", resource_name=template_lb_vserver),
+                     "lbvserver_binding")
+    for b in lb.BINDINGS.values():
+        if b.parent != "lb_vserver" or b.name in ("lb_vserver_service", "lb_vserver_service_group"):
+            continue
+        rows = aggregate.get(b.resource) or []
+        if rows:
+            entries = [{k: v for k, v in lb.trim_row(r, b.fields, b.parent_attr).items() if k != "hits"} for r in rows]
+            steps.append({"tool": "change_bindings", "args": {"binding": b.name, "name": new_lb, "add": entries}})
+    if str(template.get("servicetype", "")).upper() in _SSL_TYPES:
+        ssl_vs = await _object(lb.KINDS["ssl_vserver"], template_lb_vserver) or {}
+        if ssl_vs.get("sslprofile"):
+            steps.append({"tool": "update_object", "args": {"kind": "ssl_vserver", "name": new_lb,
+                                                            "settings": {"sslprofile": ssl_vs["sslprofile"]}}})
+        if lb_ip and certkey:
+            steps.append({"tool": "change_bindings", "args": {"binding": "ssl_vserver_certkey", "name": new_lb,
+                                                              "add": [certkey]}})
+
+    # content switching: action, policy at the next free priority, SNI certificate
+    found = await _template_route(template_lb_vserver, cs_vserver)
+    if found:
+        cs, route, routes = found
+        rule = _swap(route["rule"] or "", template_hostname, new_hostname, "CS policy rule")
+        new_policy = _swap(route["policy"], old, new, "CS policy")
+        priority = _free_priority(routes, waf.as_int(route["priority"]) or 0)
+        bind_entry: dict[str, Any] = {"policyname": new_policy, "priority": priority}
+        if route.get("gotopriorityexpression"):
+            bind_entry["gotopriorityexpression"] = route["gotopriorityexpression"]
+        policy_settings: dict[str, Any] = {"rule": rule}
+        if route["target_via"] == "action" and route.get("action"):
+            new_action = _swap(route["action"], old, new, "CS action")
+            steps.append({"tool": "add_object", "args": {"kind": "cs_action", "name": new_action,
+                                                         "settings": {"targetlbvserver": new_lb}}})
+            policy_settings["action"] = new_action
+            plan["cs_action"] = new_action
+        else:
+            bind_entry["targetlbvserver"] = new_lb
+        steps.append({"tool": "add_object", "args": {"kind": "cs_policy", "name": new_policy, "settings": policy_settings}})
+        steps.append({"tool": "change_bindings", "args": {"binding": "cs_vserver_policy", "name": cs, "add": [bind_entry]}})
+        plan.update(cs_vserver=cs, cs_policy=new_policy, priority=priority, rule=rule)
+        if certkey:
+            steps.append({"tool": "change_bindings", "args": {"binding": "ssl_vserver_certkey", "name": cs,
+                                                              "add": [{"certkeyname": certkey, "snicert": True}]}})
+    else:
+        plan["cs_vserver"] = None
+        plan["note"] = "No CS vserver routes to the template; only the LB part is created."
+    return await _run_batch("clone_app_setup", steps, save=save, dry_run=dry_run, confirm=confirm, args=args,
+                            instances=instances, extra={"template": template_lb_vserver, "new": plan})
+
+
+# ---- batches: one confirmation, one or several instances -----------------------
+
+_BATCH_TOOL_KEYS = ("status", "confirm_code", "next", "note", "dry_run")
+
+
+async def _compare_after(steps: list[tuple[str, dict[str, Any]]], names: list[str]) -> dict[str, Any]:
+    """After a batch on several instances: do the objects and bindings it touched now match everywhere?"""
+    differences: list[dict[str, Any]] = []
+    for tool, sub in steps:
+        if tool == "add_object":
+            k = lb.KINDS.get(str(sub.get("kind")))
+            if not k or k.multi:
+                continue
+            found = await _on_each(lambda k=k, n=sub["name"]: _object(k, n), names)
+            views = {i: {f: v for f, v in _pick(o or {}, k.fields).items() if f not in _RUNTIME} if isinstance(o, dict)
+                     else o for i, o in found.items()}
+            if len({json.dumps(v, sort_keys=True, default=str) for v in views.values()}) > 1:
+                differences.append({"kind": k.name, "name": sub["name"], "per_instance": views})
+        elif tool == "change_bindings":
+            b = lb.BINDINGS.get(str(sub.get("binding")))
+            if not b:
+                continue
+            found = await _on_each(lambda b=b, n=sub.get("name"): _bound_rows(b, n), names)
+            views = {i: sorted(json.dumps(lb.identity(b, r), sort_keys=True, default=str) for r in rows)
+                     if isinstance(rows, list) else rows for i, rows in found.items()}
+            if len({json.dumps(v, sort_keys=True) for v in views.values()}) > 1:
+                differences.append({"binding": b.name, "name": sub.get("name"), "per_instance": views})
+    return {"instances": names, "identical": not differences, "differences": differences}
+
+
+async def _run_batch(
+    tool: str,
+    changes: list[dict[str, Any]],
+    *,
+    save: bool,
+    dry_run: bool,
+    confirm: str | None,
+    args: dict[str, Any],
+    instances: list[str] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The engine behind apply_batch and clone_app_setup: preview every step (on every instance), one
+    confirmation for all, then apply in order and stop at the first failure."""
+    steps: list[tuple[str, dict[str, Any]]] = []
+    for i, item in enumerate(changes, 1):
+        name = str(item.get("tool") or "").strip()
+        sub = item.get("args") or {}
+        if name not in _WRITE_TOOLS or name in _BATCH_EXCLUDED:
+            usable = sorted(set(_WRITE_TOOLS) - set(_BATCH_EXCLUDED))
+            raise ValueError(f"Step {i}: tool must be one of {usable} (save with save=true); got {name!r}.")
+        if not isinstance(sub, dict):
+            raise ValueError(f"Step {i}: args must be an object of {name}'s arguments.")
+        if reserved := sorted(set(sub) & {"dry_run", "confirm", "instance"}):
+            raise ValueError(f"Step {i}: leave {reserved} out of args; apply_batch sets them for every step.")
+        steps.append((name, sub))
+    multi = bool(instances)
+    names = [_resolve_instance(n, write=True) for n in instances] if multi else [_instance.get() or _default_instance]
+    if len(set(names)) != len(names):
+        raise ValueError("instances lists an appliance twice.")
+    if not dry_run:
+        for n in names:
+            token = _instance.set(n)
+            try:
+                _require_write()
+            finally:
+                _instance.reset(token)
+
+    async def run(apply: bool) -> tuple[list[dict[str, Any]], bool]:
+        done: list[dict[str, Any]] = []
+        for i, (name, sub) in enumerate(steps, 1):
+            try:
+                result = await _WRITE_TOOLS[name](**sub, dry_run=not apply)
+            except (NitroError, ValueError) as exc:
+                done.append({"step": i, "tool": name, "error": str(exc)})
+                break
+            if apply and result.get("status") == "confirmation_required":
+                done.append({"step": i, "tool": name, "error": (
+                    "Its live plan differs from the confirmed preview (an earlier step or someone else changed "
+                    "it), so it was not applied. Preview the remaining steps again."
+                ), "plan_now": {k: v for k, v in result.items() if k not in _BATCH_TOOL_KEYS}})
+                break
+            done.append({"step": i, "tool": name, **{k: v for k, v in result.items() if k not in _BATCH_TOOL_KEYS}})
+        done += [{"step": j, "tool": n, "status": "not run"} for j, (n, _) in enumerate(steps, 1) if j > len(done)]
+        return done, all("error" not in s and "status" not in s for s in done)
+
+    async def on(instance: str, apply: bool) -> tuple[list[dict[str, Any]], bool]:
+        token = _instance.set(instance)
+        try:
+            return await run(apply)
+        finally:
+            _instance.reset(token)
+
+    def shaped(per: dict[str, Any]) -> dict[str, Any]:
+        return {"instances": per} if multi else {**_instance_note(), "steps": per[names[0]]}
+
+    batch: dict[str, list[str]] = {"record": []}
+    token = _batch.set(batch)
+    try:
+        previews, ok = {}, True
+        for n in names:
+            previews[n], fine = await on(n, apply=False)
+            ok = ok and fine
+    finally:
+        _batch.reset(token)
+    if not ok:
+        return {"dry_run": True, **shaped(previews), **(extra or {}),
+                "error": "A step failed in the preview; fix it and preview the batch again. Nothing was applied."}
+    first = previews[names[0]]
+    parts = [s.get("change_summary") or s.get("summary") for s in first]
+    summary = f"{len(steps)} step(s)" + (f" on each of {', '.join(names)}" if multi else "") + ": " + " ".join(
+        p for p in parts if isinstance(p, str))
+    if save:
+        summary += " Then save the running configuration."
+    preview = {"dry_run": dry_run, **shaped(previews), "save": save, **(extra or {})}
+    change = {"args": args, "plans": batch["record"]}
+    deletes = any(name in _DELETE_TOOLS for name, _ in steps)
+    if not _gate(tool, change, summary, preview, dry_run=dry_run, confirm=confirm,
+                 writes=bool(batch["record"]) or save, always=deletes):
+        return preview
+
+    token = _batch.set({"approved": list(batch["record"])})
+    results: dict[str, Any] = {}
+    all_ok = True
+    try:
+        for idx, n in enumerate(names):
+            applied, ok = await on(n, apply=True)
+            entry: dict[str, Any] = {"steps": applied, "saved": False}
+            if save and ok:
+                inner = _instance.set(n)
+                try:
+                    await _get_client().action("nsconfig", "save")
+                finally:
+                    _instance.reset(inner)
+                entry["saved"] = True
+            elif save:
+                entry["note"] = "Not saved because a step failed; the applied steps are live but unsaved (save_config)."
+            results[n] = entry
+            if not ok:
+                all_ok = False
+                for rest in names[idx + 1:]:
+                    results[rest] = {"status": "not run", "note": f"Stopped: a step failed on {n}."}
+                break
+    finally:
+        _batch.reset(token)
+    if multi:
+        out: dict[str, Any] = {"dry_run": False, "instances": results, **(extra or {})}
+        if all_ok:
+            out["comparison"] = await _compare_after(steps, names)
+        return out
+    return {"dry_run": False, **_instance_note(), **results[names[0]], **(extra or {})}
 
 
 # ---- tool: raw escape hatch ---------------------------------------------

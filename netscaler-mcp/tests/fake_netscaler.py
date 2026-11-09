@@ -79,7 +79,17 @@ AUDIT_MESSAGES = [
 LB_OBJECTS = {
     "lbvserver": "name", "csvserver": "name", "service": "name", "servicegroup": "servicegroupname",
     "server": "name", "cspolicy": "policyname", "csaction": "name", "lbmonitor": "monitorname",
+    "sslcertkey": "certkey", "sslvserver": "vservername", "sslservice": "servicename",
+    "sslservicegroup": "servicegroupname", "sslprofile": "name", "sslpolicy": "name", "sslaction": "name",
+    "rewritepolicy": "name", "rewriteaction": "name", "rewritepolicylabel": "labelname",
+    "responderpolicy": "name", "responderaction": "name", "responderpolicylabel": "labelname",
+    "responderhtmlpage": "name", "policypatset": "name", "policydataset": "name", "policystringmap": "name",
+    "policyexpression": "name", "gslbvserver": "name", "gslbservice": "servicename", "gslbsite": "sitename",
+    "dnsaddrec": "hostname", "dnscnamerec": "aliasname", "dnstxtrec": "domain", "dnsnsrec": "domain",
+    "dnssoarec": "domain", "dnsaaaarec": "hostname",
 }
+# Record types that keep several records under one name: resource -> attribute telling them apart.
+LB_MULTI = {"dnsaddrec": "ipaddress", "dnsaaaarec": "ipv6address", "dnstxtrec": "recordid", "dnsnsrec": "nameserver"}
 LB_BINDINGS = {
     "lbvserver_service_binding": ("lbvserver", "name", ("servicename",)),
     "lbvserver_servicegroup_binding": ("lbvserver", "name", ("servicegroupname",)),
@@ -88,12 +98,25 @@ LB_BINDINGS = {
     "servicegroup_lbmonitor_binding": ("servicegroup", "servicegroupname", ("monitor_name",)),
     "csvserver_cspolicy_binding": ("csvserver", "name", ("policyname",)),
     "csvserver_lbvserver_binding": ("csvserver", "name", ("lbvserver",)),
+    "lbvserver_rewritepolicy_binding": ("lbvserver", "name", ("policyname",)),
+    "lbvserver_responderpolicy_binding": ("lbvserver", "name", ("policyname",)),
+    "lbvserver_analyticsprofile_binding": ("lbvserver", "name", ("analyticsprofile",)),
+    "csvserver_responderpolicy_binding": ("csvserver", "name", ("policyname",)),
+    "sslvserver_sslcertkey_binding": ("sslvserver", "vservername", ("certkeyname", "snicert")),
+    "sslservicegroup_sslcertkey_binding": ("sslservicegroup", "servicegroupname", ("certkeyname", "snicert")),
+    "sslvserver_sslpolicy_binding": ("sslvserver", "vservername", ("policyname",)),
+    "sslprofile_sslcipher_binding": ("sslprofile", "name", ("ciphername",)),
+    "rewriteglobal_rewritepolicy_binding": (None, None, ("policyname",)),
+    "policypatset_pattern_binding": ("policypatset", "name", ("String",)),
+    "policydataset_value_binding": ("policydataset", "name", ("value",)),
+    "policystringmap_pattern_binding": ("policystringmap", "name", ("key",)),
+    "gslbvserver_gslbservice_binding": ("gslbvserver", "name", ("servicename",)),
 }
 # Where enable/disable shows: (attribute, enabled value, disabled value).
 LB_STATE = {
     "lbvserver": ("curstate", "UP", "OUT OF SERVICE"), "csvserver": ("curstate", "UP", "OUT OF SERVICE"),
     "service": ("svrstate", "UP", "OUT OF SERVICE"), "servicegroup": ("state", "ENABLED", "DISABLED"),
-    "server": ("state", "ENABLED", "DISABLED"),
+    "server": ("state", "ENABLED", "DISABLED"), "gslbvserver": ("curstate", "UP", "OUT OF SERVICE"),
 }
 LB_NOT_SETTABLE = {"servicetype"}
 
@@ -215,7 +238,58 @@ class FakeNetScaler:
                 "ca_api": {"name": "ca_api", "targetlbvserver": "vs_api"},
                 "ca_web": {"name": "ca_web", "targetlbvserver": "vs_web"},
             },
-            "lbmonitor": {"mon_http": {"monitorname": "mon_http", "type": "HTTP", "interval": 5, "respcode": ["200"]}},
+            "lbmonitor": {
+                "mon_http": {"monitorname": "mon_http", "type": "HTTP", "interval": 5, "respcode": ["200"]},
+                "mon_https": {"monitorname": "mon_https", "type": "HTTP", "secure": "YES", "respcode": ["200"]},
+            },
+        }
+        tmpl = "tmpl.example.com"
+        self.lb["csvserver"]["cs_ssl"] = {"name": "cs_ssl", "servicetype": "SSL", "ipv46": "10.0.0.11", "port": 443,
+                                          "curstate": "UP"}
+        self.lb["lbvserver"][f"lb_{tmpl}"] = {
+            "name": f"lb_{tmpl}", "servicetype": "HTTP", "ipv46": "0.0.0.0", "port": 0, "lbmethod": "LEASTCONNECTION",
+            "persistencetype": "NONE", "curstate": "UP", "effectivestate": "UP", "clttimeout": 180}
+        self.lb["servicegroup"][f"svg_{tmpl}"] = {"servicegroupname": f"svg_{tmpl}", "servicetype": "SSL",
+                                                  "state": "ENABLED", "usip": "NO", "cip": "ENABLED",
+                                                  "cipheader": "X-Forwarded-For"}
+        self.lb["cspolicy"][f"cp_{tmpl}"] = {"policyname": f"cp_{tmpl}", "rule": f'HTTP.REQ.HOSTNAME.EQ("{tmpl}")',
+                                             "action": f"ca_{tmpl}"}
+        self.lb["csaction"][f"ca_{tmpl}"] = {"name": f"ca_{tmpl}", "targetlbvserver": f"lb_{tmpl}"}
+        self.lb.update({
+            "sslcertkey": {
+                "cert_wild": {"certkey": "cert_wild", "cert": "wild.pem", "key": "wild.key", "inform": "PEM",
+                              "status": "Valid", "daystoexpiration": "31"},
+                "ca_root": {"certkey": "ca_root", "cert": "root.pem", "inform": "PEM", "status": "Valid"},
+            },
+            "sslvserver": {"cs_ssl": {"vservername": "cs_ssl", "sslprofile": "ns_default_ssl_profile_frontend"}},
+            "sslservice": {},
+            "sslservicegroup": {f"svg_{tmpl}": {"servicegroupname": f"svg_{tmpl}", "sslprofile": "prof_backend"}},
+            "sslprofile": {"prof_backend": {"name": "prof_backend", "sslprofiletype": "BackEnd", "tls12": "ENABLED",
+                                            "tls13": "DISABLED"}},
+            "sslpolicy": {}, "sslaction": {},
+            "rewritepolicy": {"rw_404": {"name": "rw_404", "rule": "HTTP.RES.STATUS.EQ(404)", "action": "rwa_404"}},
+            "rewriteaction": {}, "rewritepolicylabel": {}, "responderpolicy": {}, "responderaction": {},
+            "responderpolicylabel": {}, "responderhtmlpage": {},
+            "policypatset": {"ps_internal": {"name": "ps_internal"}, "ps_other": {"name": "ps_other"}},
+            "policydataset": {"ds_nets": {"name": "ds_nets", "type": "ipv4"}},
+            "policystringmap": {}, "policyexpression": {
+                "ex_lan": {"name": "ex_lan", "value": 'CLIENT.IP.SRC.IN_SUBNET(10.0.0.0/8) || "internal"'}},
+            "gslbvserver": {}, "gslbservice": {},
+            "gslbsite": {"site_a": {"sitename": "site_a", "sitetype": "LOCAL", "siteipaddress": "10.0.1.1"},
+                         "site_b": {"sitename": "site_b", "sitetype": "REMOTE", "siteipaddress": "10.0.2.1"}},
+            "dnsaddrec": {"app.example.com": [
+                {"hostname": "app.example.com", "ipaddress": "10.0.0.50", "ttl": 300},
+                {"hostname": "app.example.com", "ipaddress": "10.0.0.51", "ttl": 300}]},
+            "dnsaaaarec": {}, "dnscnamerec": {}, "dnstxtrec": {}, "dnsnsrec": {}, "dnssoarec": {},
+        })
+        self.files: dict[str, bytes] = {}
+        self.actions: list[tuple[str, str, dict[str, Any]]] = []
+        self.lb_stats = {
+            "lbvserver": {f"lb_{tmpl}": {"name": f"lb_{tmpl}", "state": "UP", "vslbhealth": "100", "totalrequests": "120"}},
+            "csvserver": {"cs_ssl": {"name": "cs_ssl", "state": "UP", "totalrequests": "130"}},
+            "servicegroup": {f"svg_{tmpl}": {"servicegroupname": f"svg_{tmpl}", "servicegroupmember": [
+                {"servername": "10.0.0.61", "primaryipaddress": "10.0.0.61", "primaryport": 443, "state": "UP",
+                 "totalrequests": "0", "svrestablishedconn": "0"}]}},
         }
         self.lb_bindings: dict[str, dict[str, list[dict[str, Any]]]] = {
             "lbvserver_servicegroup_binding": {"vs_web": [
@@ -238,6 +312,38 @@ class FakeNetScaler:
             ]},
             "csvserver_lbvserver_binding": {"cs_app": [{"name": "cs_app", "lbvserver": "vs_web"}]},
         }
+        self.lb_bindings["csvserver_cspolicy_binding"]["cs_ssl"] = [
+            {"name": "cs_ssl", "policyname": f"cp_{tmpl}", "priority": "300", "gotopriorityexpression": "END"},
+            {"name": "cs_ssl", "policyname": "cp_api", "priority": "301", "gotopriorityexpression": "END"},
+        ]
+        self.lb_bindings["lbvserver_servicegroup_binding"][f"lb_{tmpl}"] = [
+            {"name": f"lb_{tmpl}", "servicegroupname": f"svg_{tmpl}"}]
+        self.lb_bindings["servicegroup_servicegroupmember_binding"][f"svg_{tmpl}"] = [
+            {"servicegroupname": f"svg_{tmpl}", "servername": "10.0.0.61", "ip": "10.0.0.61", "port": 443,
+             "state": "ENABLED", "svrstate": "UP"}]
+        self.lb_bindings["servicegroup_lbmonitor_binding"][f"svg_{tmpl}"] = [
+            {"servicegroupname": f"svg_{tmpl}", "monitor_name": "mon_https"}]
+        self.lb_bindings.update({
+            "lbvserver_rewritepolicy_binding": {f"lb_{tmpl}": [
+                {"name": f"lb_{tmpl}", "policyname": "rw_404", "priority": "100", "bindpoint": "RESPONSE",
+                 "gotopriorityexpression": "NEXT", "hits": "4"},
+                {"name": f"lb_{tmpl}", "policyname": "rw_500", "priority": "110", "bindpoint": "RESPONSE",
+                 "gotopriorityexpression": "END"}]},
+            "lbvserver_responderpolicy_binding": {f"lb_{tmpl}": [
+                {"name": f"lb_{tmpl}", "policyname": "log_req", "priority": "100", "bindpoint": "REQUEST",
+                 "gotopriorityexpression": "NEXT"}]},
+            "lbvserver_analyticsprofile_binding": {f"lb_{tmpl}": [{"name": f"lb_{tmpl}", "analyticsprofile": "ana_web"}]},
+            "sslvserver_sslcertkey_binding": {"cs_ssl": [{"vservername": "cs_ssl", "certkeyname": "cert_wild"}]},
+            "sslprofile_sslcipher_binding": {"prof_backend": [
+                {"name": "prof_backend", "ciphername": "DEFAULT_BACKEND", "cipherpriority": "1"}]},
+            "rewriteglobal_rewritepolicy_binding": {"": [
+                {"policyname": "rw_404", "priority": "500", "type": "RES_DEFAULT", "gotopriorityexpression": "END"}]},
+            "policypatset_pattern_binding": {"ps_internal": [
+                {"name": "ps_internal", "String": "internal", "index": "1"},
+                {"name": "ps_internal", "String": "intranet", "index": "2"}],
+                "ps_other": [{"name": "ps_other", "String": "corp-internal-app", "index": "1"}]},
+            "policydataset_value_binding": {"ds_nets": [{"name": "ds_nets", "value": "10.0.0.0/8", "index": "1"}]},
+        })
         self.settings = {
             "appfwsettings": {"signatureautoupdate": "OFF", "signatureurl": "https://sig.example/waf.xml",
                               "learning": "ON", "sessiontimeout": 900, "builtin": ["MODIFIABLE"]},
@@ -307,6 +413,11 @@ class FakeNetScaler:
         if resource == "nsconfig":
             self.saved = params.get("action") == "save"
             return reply()
+        if resource == "systemfile":
+            return self._file_api(method, args, body.get("systemfile") or {})
+        if resource == "gslbconfig":
+            self.actions.append(("gslbconfig", params.get("action"), body.get("gslbconfig") or {}))
+            return reply()
         if resource in ("appfwprofile", "botprofile"):
             return self._profile_api(method, resource, name, body.get(resource) or {})
         if resource == "appfwlearningsettings":
@@ -350,6 +461,9 @@ class FakeNetScaler:
             return reply(appfwprofile=[{"name": name, **per_profile(APPFW_STATS)}])
         if resource == "botprofile":
             return reply(botprofile=[{"name": name, **per_profile(BOT_STATS)}])
+        if resource in self.lb_stats:
+            row = self.lb_stats[resource].get(name)
+            return reply(**{resource: [row]}) if row else reply(**{resource: [{"name": name, "state": "UP"}]})
         return reply(404, 258, f"unhandled stat {resource}")
 
     def _profile_api(self, method: str, resource: str, name: str | None, obj: dict[str, Any]) -> httpx.Response:
@@ -416,10 +530,29 @@ class FakeNetScaler:
         args: dict[str, str] | None = None,
     ) -> httpx.Response:
         store, key = self.lb[resource], LB_OBJECTS[resource]
+        if resource in LB_MULTI:
+            return self._records_api(method, resource, name, obj, args or {})
         if method == "GET":
             if name is None:
                 return reply(**{resource: list(store.values())})
             return reply(**{resource: [store[name]]}) if name in store else reply(404, 258, "No such resource")
+        if action in ("update", "link", "unlink", "Import"):
+            self.actions.append((resource, action, dict(obj)))
+            if action == "Import":
+                store[obj[key]] = {k: v for k, v in obj.items() if k != "src"}
+                return reply(201)
+            if obj.get(key) not in store:
+                return reply(404, 258, "No such resource")
+            target = store[obj[key]]
+            if action == "update":
+                target.update({k: v for k, v in obj.items() if k not in ("password", "passplain")})
+            elif action == "link":
+                if obj.get("linkcertkeyname") not in store:
+                    return reply(404, 1540, "Certificate does not exist")
+                target["linkcertkeyname"] = obj["linkcertkeyname"]
+            else:
+                target.pop("linkcertkeyname", None)
+            return reply()
         if method == "DELETE":
             if name not in store:
                 return reply(404, 258, "No such resource")
@@ -462,6 +595,12 @@ class FakeNetScaler:
                 field, on, _ = LB_STATE[resource]
                 new.setdefault(field, on)
             store[obj[key]] = new
+            ssl_side = {"lbvserver": "sslvserver", "csvserver": "sslvserver", "service": "sslservice",
+                        "servicegroup": "sslservicegroup"}.get(resource)
+            if ssl_side and str(obj.get("servicetype", "")).upper().startswith("SSL"):
+                side_key = LB_OBJECTS[ssl_side]
+                self.lb[ssl_side][obj[key]] = {side_key: obj[key], "sslprofile": "ns_default_ssl_profile_backend"
+                                               if ssl_side != "sslvserver" else "ns_default_ssl_profile_frontend"}
             return reply(201)
         if target is None:
             return reply(404, 258, "No such resource")
@@ -483,8 +622,8 @@ class FakeNetScaler:
                       if p == parent and self.lb_rows(b, name)}
             return reply(**{binding: [{LB_OBJECTS[parent]: name, **arrays}]})
         parent, attr, ident = LB_BINDINGS[binding]
-        owner = name or obj.get(attr)
-        if owner not in self.lb[parent]:
+        owner = "" if parent is None else (name or obj.get(attr))
+        if parent is not None and owner not in self.lb[parent]:
             return reply(404, 258, "No such resource")
         rows = self.lb_bindings.setdefault(binding, {}).setdefault(owner, [])
         if method == "GET":
@@ -513,3 +652,49 @@ class FakeNetScaler:
         if resource == "csaction":
             return any(p.get("action") == name for p in self.lb["cspolicy"].values())
         return False
+
+    def _records_api(
+        self, method: str, resource: str, name: str | None, obj: dict[str, Any], args: dict[str, str]
+    ) -> httpx.Response:
+        """DNS-style records: several under one name, told apart by LB_MULTI[resource]."""
+        store, key, value = self.lb[resource], LB_OBJECTS[resource], LB_MULTI[resource]
+        if method == "GET":
+            if name is None:
+                return reply(**{resource: [r for rows in store.values() for r in rows]})
+            return reply(**{resource: store[name]}) if store.get(name) else reply(404, 258, "No such resource")
+        if method == "POST":
+            rows = store.setdefault(obj[key], [])
+            if resource == "dnstxtrec":
+                obj = {**obj, "recordid": len(rows) + 1}
+            elif any(as_arg(r.get(value)) == as_arg(obj.get(value)) for r in rows):
+                return reply(409, 273, "Resource already exists")
+            rows.append(dict(obj))
+            return reply(201)
+        rows = store.get(name or "", [])
+        keep = [r for r in rows if not all(as_arg(r.get(k, "")) == v for k, v in args.items())] if args else []
+        if len(keep) == len(rows):
+            return reply(404, 258, "No such resource")
+        store[name] = keep
+        return reply()
+
+    def _file_api(self, method: str, args: dict[str, str], obj: dict[str, Any]) -> httpx.Response:
+        """systemfile, limited to what the tools use: /nsconfig/ssl files as base64."""
+        import base64
+
+        if method == "GET":
+            data = self.files.get(args.get("filename", ""))
+            if data is None:
+                return reply(404, 258, "No such resource")
+            return reply(systemfile=[{"filename": args["filename"], "filelocation": args.get("filelocation"),
+                                      "filecontent": base64.b64encode(data).decode()}])
+        if method == "POST":
+            if obj.get("filelocation") != "/nsconfig/ssl":
+                return reply(400, 278, "Invalid argument [filelocation]")
+            if obj["filename"] in self.files:
+                return reply(409, 273, "File already exists")
+            self.files[obj["filename"]] = base64.b64decode(obj["filecontent"])
+            return reply(201)
+        if args.get("filename") not in self.files:
+            return reply(404, 258, "No such resource")
+        del self.files[args["filename"]]
+        return reply()

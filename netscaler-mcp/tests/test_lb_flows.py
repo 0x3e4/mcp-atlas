@@ -36,7 +36,7 @@ def test_service_group_shows_members_and_monitors(ns):
 
 
 def test_list_reads(ns):
-    assert run(server.list_cs_policies())["count"] == 2
+    assert run(server.list_cs_policies())["count"] == 3
     assert run(server.list_cs_actions(name="ca_api"))["csaction"][0]["targetlbvserver"] == "vs_api"
     assert run(server.list_lb_monitors())["lbmonitor"][0]["type"] == "HTTP"
 
@@ -55,7 +55,7 @@ def test_add_object_previews_then_adds_and_skips_existing(ns):
     with pytest.raises(ValueError, match="exactly one of ip, servername"):
         run(server.add_object("service", "svc_x", {"servicetype": "HTTP", "port": 80}))
     with pytest.raises(ValueError, match="kind must be one of"):
-        run(server.add_object("gslb_vserver", "x", {}))
+        run(server.add_object("nonsense", "x", {}))
 
 
 def test_update_object_sends_only_changes_and_unsets(ns):

@@ -80,6 +80,12 @@ EXPECTED_TOOLS = {
     "set_object_state",
     "change_bindings",
     "delete_object",
+    "list_objects",
+    "upload_ssl_file",
+    "search_policy_objects",
+    "sync_gslb_config",
+    "vserver_diagnose",
+    "clone_app_setup",
 }
 
 
@@ -314,6 +320,7 @@ WRITE_TOOLS = {
     "add_bot_rule", "remove_bot_rule", "set_bot_detections", "import_bot_profile", "rehost_bot_profile",
     "update_signatures", "apply_batch",
     "add_object", "update_object", "set_object_state", "change_bindings", "delete_object",
+    "upload_ssl_file", "sync_gslb_config", "clone_app_setup",
 }
 
 
