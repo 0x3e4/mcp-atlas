@@ -187,6 +187,18 @@ CI tags every image `:latest`, `:<git sha>` and `:<version>`. Until the version 
 `:<version>` follows the newest build of that version. Bump it in the same commit as the change, then
 pin `image: ghcr.io/<owner>/<server>:<version>` in `compose.yml` where you don't want `:latest`.
 
+Every server has a `CHANGELOG.md` ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/)). Every
+change gets an entry under the new version in the same commit, and the server's README and
+`.env.example` are updated along with the code.
+
+### Dependency updates
+
+Updates are manual (`poetry update` per server, then rebuild) and checked as a whole each time: every
+locked package (direct and transitive), the Poetry version in the Dockerfiles, and the GitHub Actions
+in CI, plus `pip-audit` for known vulnerabilities. **A new release is adopted only once it is at least
+7 days old**, so a compromised or broken release has time to be spotted and yanked first; this holds for
+security fixes too. The CI actions are pinned to exact releases for the same reason.
+
 ## Adding a server
 
 Copy [`_template/`](_template/) to a new `<name>-mcp/` folder and rename it. Pick a name (e.g.
@@ -201,7 +213,8 @@ Copy [`_template/`](_template/) to a new `<name>-mcp/` folder and rename it. Pic
 3. Wire up `config.py` (required env vars), `client.py` (auth + error mapping) and `server.py`
    (replace the example tools; keep `api_get` as the raw escape hatch) for your API.
 4. Update `tests/test_smoke.py` (`EXPECTED_TOOLS`) and the server's own `README.md`. Set the
-   version (`pyproject.toml` + `__init__.py`) to `0.1.0` until the first release, then `1.0.0`.
+   version (`pyproject.toml` + `__init__.py`) to `0.1.0` until the first release, then `1.0.0`, and
+   keep the `CHANGELOG.md` the template brings along.
 5. Add a row for the new server to the table above.
 
 The [`_template/README.md`](_template/README.md) doubles as the per-server README skeleton — edit it

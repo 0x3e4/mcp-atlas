@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "zammad-mcp"
-version = "1.0.0"
+version = "1.0.1"
 description = "Zammad helpdesk MCP server (read + opt-in write) — tickets, articles, users, search"
 readme = "README.md"
 requires-python = ">=3.14"
