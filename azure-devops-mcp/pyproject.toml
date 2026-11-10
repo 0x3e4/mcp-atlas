@@ -4,8 +4,8 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "azure-devops-mcp"
-version = "1.1.0"
-description = "Read-only Azure DevOps Server (on-prem) MCP server — projects, repos, PRs, work items, builds"
+version = "1.2.0"
+description = "Azure DevOps Server (on-prem) MCP server — repos, PRs, work items, wiki, builds, releases; reads by default, opt-in writes"
 readme = "README.md"
 requires-python = ">=3.14"
 license = "MIT"

@@ -30,6 +30,14 @@ class Settings:
     project: str = ""
     allow_write: bool = False
     allow_delete: bool = False
+    # Sensitive extras, each on top of allow_write (all off by default, set per instance):
+    allow_push: bool = False                 # commit_files: push commits to a branch
+    allow_push_default_branch: bool = False  # ... including the repository's default branch
+    allow_pr_merge: bool = False             # complete_pull_request (merge now / auto-complete)
+    allow_pr_vote: bool = False              # vote_pull_request (approve / reject as the PAT's user)
+    allow_policy_bypass: bool = False        # complete_pull_request(bypass_policy=true)
+    allow_pipelines: bool = False            # queue_build / cancel_build
+    allow_releases: bool = False             # create_release / deploy_release_stage
     confirm_write: bool = True
     transport: str = "stdio"
     host: str = "127.0.0.1"
@@ -69,6 +77,13 @@ class Settings:
             project=env.get("AZDO_PROJECT", "").strip(),
             allow_write=_bool_env(env, "AZDO_ALLOW_WRITE", False),
             allow_delete=_bool_env(env, "AZDO_ALLOW_DELETE", False),
+            allow_push=_bool_env(env, "AZDO_ALLOW_PUSH", False),
+            allow_push_default_branch=_bool_env(env, "AZDO_ALLOW_PUSH_DEFAULT_BRANCH", False),
+            allow_pr_merge=_bool_env(env, "AZDO_ALLOW_PR_MERGE", False),
+            allow_pr_vote=_bool_env(env, "AZDO_ALLOW_PR_VOTE", False),
+            allow_policy_bypass=_bool_env(env, "AZDO_ALLOW_POLICY_BYPASS", False),
+            allow_pipelines=_bool_env(env, "AZDO_ALLOW_PIPELINES", False),
+            allow_releases=_bool_env(env, "AZDO_ALLOW_RELEASES", False),
             confirm_write=_bool_env(env, "AZDO_CONFIRM_WRITE", True),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),

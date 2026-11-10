@@ -38,10 +38,29 @@ class AzdoClient:
         self._settings = settings
         self._client: httpx.AsyncClient | None = None
         self._auth = base64.b64encode(f":{settings.pat}".encode("utf-8")).decode("ascii")
+        self._me: dict[str, Any] | None = None
 
     @property
     def settings(self) -> Settings:
         return self._settings
+
+    @property
+    def preview_version(self) -> str:
+        """``<api-version>-preview``: for resources that are preview on older servers (search, release
+        stages, page moves, recycle bin, identities). A released resource also answers a -preview
+        request, so this works on 2019 through 2022."""
+        v = self._settings.api_version
+        return v if "-" in v else f"{v}-preview"
+
+    async def me(self) -> dict[str, Any]:
+        """The PAT's user (id + display name), from ``_apis/connectionData``; cached."""
+        if self._me is None:
+            data = await self.get("_apis/connectionData", params={"api-version": self.preview_version})
+            user = (data.get("authenticatedUser") or {}) if isinstance(data, dict) else {}
+            if not user.get("id"):
+                raise AzdoError("Could not determine the PAT's user from _apis/connectionData.")
+            self._me = {"id": user["id"], "name": user.get("providerDisplayName") or user.get("customDisplayName")}
+        return self._me
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -131,8 +150,34 @@ class AzdoClient:
     async def post(
         self, path: str, *, project: str | None = None, params: dict[str, Any] | None = None, json: Any | None = None
     ) -> Any:
-        """POST a read-only query (e.g. WIQL) and return the parsed JSON body."""
+        """POST a JSON body (a read-only query like WIQL or search, or a gated write) and return the JSON."""
         return self._json(await self._send("POST", self._url(path, project), params=params, json=json))
+
+    async def send_json(
+        self, method: str, path: str, body: Any, *, project: str | None = None, params: dict[str, Any] | None = None
+    ) -> Any:
+        """PATCH/PUT a JSON body (gated writes) and return the JSON answer ({} if none)."""
+        return self._json(await self._send(method, self._url(path, project), params=params, json=body))
+
+    async def post_bytes(
+        self, path: str, data: bytes, *, project: str | None = None, params: dict[str, Any] | None = None
+    ) -> Any:
+        """POST raw bytes as application/octet-stream (work item attachment upload)."""
+        resp = await self._send(
+            "POST", self._url(path, project), params=params, content=data,
+            extra_headers={"Content-Type": "application/octet-stream"},
+        )
+        return self._json(resp)
+
+    async def get_lines(
+        self, path: str, *, project: str | None = None, params: dict[str, Any] | None = None
+    ) -> list[str]:
+        """GET a log: JSON ``{"value": [lines]}`` (what Accept: application/json returns) or plain text."""
+        resp = await self._send("GET", self._url(path, project), params=params)
+        data = _try_json(resp)
+        if isinstance(data, dict) and isinstance(data.get("value"), list):
+            return [str(line) for line in data["value"]]
+        return resp.text.splitlines()
 
     async def get_raw(self, path: str, *, project: str | None = None, params: dict[str, Any] | None = None) -> Any:
         """Escape hatch: GET an arbitrary ``_apis/...`` path (or absolute URL on the same host)."""
@@ -197,8 +242,9 @@ def _format_error(status: int, data: Any, resp: httpx.Response) -> str:
     if status == 401:
         return (
             "Azure DevOps 401 — authentication failed. Check AZDO_PAT and that it has the needed "
-            "scopes (reads: Code/Work Items/Build, Project & Team; writes: Work Items 'Read & write', Wiki "
-            "'Read & write'; deleting work items: Work Items 'Read, write, & manage')."
+            "scopes (reads: Code/Work Items/Build/Release, Project & Team; writes: Work Items 'Read & write', "
+            "Wiki 'Read & write', Code 'Read & write' for branches/PRs/pushes; deleting work items: Work Items "
+            "'Read, write, & manage'; builds: Build 'Read & execute'; releases: Release 'Read, write, & execute')."
         )
     if status == 403:
         return f"Azure DevOps 403 — the PAT lacks permission for this resource. {msg}".rstrip()

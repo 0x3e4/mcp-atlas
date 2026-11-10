@@ -2,13 +2,17 @@
 
 A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
 Claude Code) to an **on-prem Azure DevOps Server** (formerly TFS) through its REST API. Ask about your
-projects in natural language — repositories, branches, commits, pull requests, work items (WIQL),
-builds/pipelines, releases and the wiki — and, opt-in, **create/update work items and wiki pages**.
+projects in natural language — repositories (files, commits, diffs, branches, tags), pull requests
+(threads, files, votes), work items (WIQL, links, history), builds and their logs, releases, the wiki
+and search — and, opt-in, **work with them**: create and edit work items of any type (PBI, Bug,
+Issue, Task …) and link them, write and move wiki pages, open, review, comment on and merge pull
+requests, create branches and push commits, queue builds and deploy releases.
 
 - One shared `httpx.AsyncClient`; **PAT** auth over HTTP Basic, `Accept: application/json`.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
-- **Read-only by default**; write tools are **opt-in** behind `AZDO_ALLOW_WRITE`, delete tools
-  additionally behind `AZDO_ALLOW_DELETE` (see below).
+- **Read-only by default**; write tools are **opt-in** behind `AZDO_ALLOW_WRITE`, and the sensitive
+  ones (deletes, pushes, merges, votes, pipelines, releases) each behind a switch of their own (see
+  below). Every write shows a preview and asks first.
 - A raw escape-hatch tool (`azdo_get`) so any `_apis/...` resource stays reachable.
 
 Targets **on-prem** Azure DevOps Server (the base URL includes a **collection**), not cloud
@@ -17,26 +21,42 @@ Targets **on-prem** Azure DevOps Server (the base URL includes a **collection**)
 
 ## Tools
 
+### Read
+
 | Tool | What it does |
 |---|---|
+| `server_info()` | The PAT's user, collection, api-version and which write switches are on. |
 | `list_projects(limit?, full?)` | Team projects in the collection. |
 | `list_teams(project?, limit?, full?)` | Teams collection-wide, or for one project. |
 | `list_repositories(project?, limit?, full?)` | Git repositories in a project. |
 | `list_branches(repository, project?, limit?, full?)` | Branches (refs under `refs/heads/`). |
-| `list_commits(repository, project?, branch?, author?, limit?, full?)` | Commit history (capped; no file diffs). |
-| `list_pull_requests(repository, project?, status?, limit?, full?)` | Pull requests by status. |
+| `list_tags(repository, project?, limit?)` | Tags with the commit each points at. |
+| `list_files(repository, path?, version?, version_type?, recursive?, project?, limit?)` | Files and folders at a branch / tag / commit. |
+| `get_file(repository, path, version?, version_type?, project?, max_chars?)` | A text file's content (binary files: metadata only). |
+| `list_commits(repository, project?, branch?, author?, limit?, full?)` | Commit history (capped). |
+| `get_commit(repository, commit_id, project?, include_changes?, limit?)` | One commit with the files it changed. |
+| `compare_versions(repository, base, target, base_type?, target_type?, path?, project?, limit?)` | Two branches / tags / commits compared like a PR (from the merge base): ahead / behind, changed files, and a unified diff of one file with `path`. |
+| `search(text, kind?, project?, repository?, branch?, path?, limit?)` | Full-text search over `code`, `wiki` or `work_items` (needs Search configured on the server). |
+| `list_pull_requests(repository?, project?, status?, mine?, target_branch?, source_branch?, limit?, full?)` | Pull requests of one repository or the whole project; `mine="created"` / `"reviewing"`. |
+| `get_pull_request(pull_request_id, repository?, project?, include_threads?, include_files?, include_commits?, include_system_comments?)` | A PR in full: description, reviewers and votes, linked work items, comment threads (file + line), changed files, commits. |
 | `query_work_items(wiql, project?, limit?)` | Run a WIQL query and hydrate the results' key fields. |
 | `get_work_items(ids, fields?, full?)` | Fetch work items by id with selected fields. |
+| `get_work_item(id, include_history?, history_limit?)` | One work item in full: all fields, links (parent, children, related, PRs, commits, branches, attachments) and the discussion. |
+| `list_work_item_types(project?)` | The project's work item types (depends on the process) and their states. |
+| `list_iterations(project?, team?, timeframe?, depth?)` | Iteration paths / sprints with dates; with `team`, that team's sprints (`timeframe="current"`). |
+| `list_areas(project?, depth?)` | Area paths. |
 | `list_build_definitions(project?, name?, limit?, full?)` | Build/pipeline definitions. |
 | `list_builds(project?, definition_id?, status?, result?, limit?, full?)` | Build/pipeline runs, newest first. |
+| `get_build(build_id, project?, include_logs?, log_lines?)` | A run with its errors, failed tasks and the tail of their logs. |
 | `list_releases(project?, definition_id?, status?, limit?, full?)` | Releases, newest first. |
 | `list_wikis(project?, full?)` | Wikis in a project. |
+| `list_wiki_pages(wiki, path?, project?, limit?)` | The page tree of a wiki (or below one page). |
 | `get_wiki_page(wiki, path, project?, include_content?, full?)` | A wiki page's path + markdown content. |
 | `azdo_get(path, project?, params?)` | Escape hatch: raw read-only GET against any `_apis/...` path. |
 
 Results are trimmed to the useful fields by default; pass `full=true` for raw objects, and lists are
 capped (`AZDO_MAX_ROWS`, default 200) unless `full`. Project-scoped tools use `project=…` or the
-`AZDO_PROJECT` default.
+`AZDO_PROJECT` default. People (reviewers) can be given as email, account name, display name or `me`.
 
 ### Write tools (opt-in)
 
@@ -46,34 +66,63 @@ effectively read-only.
 
 | Tool | What it does |
 |---|---|
-| `create_work_item(work_item_type, title, project?, description?, assigned_to?, area_path?, iteration_path?, fields?)` | Create a work item (Bug/Task/User Story/…) via JSON-Patch. |
-| `update_work_item(id, title?, state?, assigned_to?, comment?, fields?)` | Update fields and/or add a discussion comment (`System.History`). Pass only `comment` to just comment. |
-| `create_or_update_wiki_page(wiki, path, content, project?)` | Create a wiki page, or replace its content if it exists (uses the page's ETag with `If-Match`, so a concurrent edit fails cleanly instead of clobbering). |
+| `create_work_item(work_item_type, title, project?, description?, assigned_to?, area_path?, iteration_path?, parent_id?, tags?, fields?)` | Create a work item of any type (Product Backlog Item, Bug, Issue, Task, User Story, Feature, Epic …), optionally as a child of `parent_id`. |
+| `update_work_item(id, title?, state?, assigned_to?, description?, area_path?, iteration_path?, add_tags?, remove_tags?, comment?, fields?)` | Update fields and/or add a discussion comment (`System.History`). Pass only `comment` to just comment. |
+| `link_work_items(id, add?, remove?)` | Add / remove links: parent, child, related, predecessor, successor, duplicate, tests, pull request, commit, branch, hyperlink. Existing links are skipped; tied to the item's revision. |
+| `add_work_item_attachment(id, file_name, content? \| content_base64?, comment?)` | Attach a file (text or base64, up to 20 MB). |
+| `restore_work_items(ids, project?)` | Restore deleted work items from the Recycle Bin. |
+| `create_or_update_wiki_page(wiki, path, content, project?, comment?)` | Create a wiki page, or replace its content if it exists (uses the page's ETag with `If-Match`, so a concurrent edit fails cleanly instead of clobbering). |
+| `move_wiki_page(wiki, path, new_path, project?, comment?)` | Move or rename a page with its sub-pages (links in other pages are not rewritten). |
+| `create_pull_request(repository, source_branch, title, target_branch?, description?, reviewers?, required_reviewers?, work_item_ids?, draft?, project?)` | Open a PR (target defaults to the default branch). |
+| `update_pull_request(pull_request_id, repository?, title?, description?, status?, draft?, target_branch?, project?)` | Edit, publish a draft, retarget, abandon or reactivate a PR. |
+| `set_pull_request_reviewers(pull_request_id, repository?, add?, add_required?, remove?, project?)` | Add / remove reviewers (existing reviewers keep their vote). |
+| `comment_pull_request(pull_request_id, content?, repository?, thread_id?, file_path?, line?, thread_status?, project?)` | Start a thread (optionally on a file and line), reply, or resolve / reopen a thread. |
+| `create_branch(repository, name, source, project?)` | Create a branch from a branch, tag or commit. |
 
-Deletes (opt-in on top of writes: **`AZDO_ALLOW_DELETE=true`** as well; always confirmed):
+Sensitive writes need **a second switch** on top of `AZDO_ALLOW_WRITE` (all default `false`):
 
-| Tool | What it does |
-|---|---|
-| `delete_work_items(ids, destroy?)` | Move work items to the Recycle Bin (restorable in the web portal), or delete them permanently with `destroy=true`. The preview names each item; unknown ids are skipped. |
-| `delete_wiki_page(wiki, path, project?, comment?)` | Delete a wiki page **with all its sub-pages**; the preview lists them, and the code is tied to the page's current version. The wiki's git history keeps the old content. |
+| Switch | Tools | Always confirmed |
+|---|---|---|
+| `AZDO_ALLOW_DELETE` | `delete_work_items(ids, destroy?)` (Recycle Bin, or permanently with `destroy=true`), `delete_wiki_page(wiki, path, project?, comment?)` (with all sub-pages), `delete_branch(repository, name, project?)` (never the default branch) | yes |
+| `AZDO_ALLOW_PUSH` | `commit_files(repository, branch, message, changes, create_branch_from?, project?)` — one commit of adds / edits / deletes / renames, pushed without a local clone; the preview shows a diff of every edited file. Pushes to any branch **except** the default branch. | no |
+| `AZDO_ALLOW_PUSH_DEFAULT_BRANCH` | `commit_files` may also push to the repository's default branch (otherwise: commit to a new branch and open a PR). | yes |
+| `AZDO_ALLOW_PR_MERGE` | `complete_pull_request(pull_request_id, repository?, merge_strategy?, delete_source_branch?, transition_work_items?, merge_commit_message?, auto_complete?, …)` — merge now or set auto-complete; `delete_source_branch` also needs `AZDO_ALLOW_DELETE`. | yes |
+| `AZDO_ALLOW_POLICY_BYPASS` | `complete_pull_request(bypass_policy=true, bypass_reason=…)` — merge despite failing branch policies (also needs the server's *Bypass policies* permission). | yes |
+| `AZDO_ALLOW_PR_VOTE` | `vote_pull_request(pull_request_id, vote, …)` — approve, approve with suggestions, wait for author, reject, reset — as the PAT's user. | no |
+| `AZDO_ALLOW_PIPELINES` | `queue_build(definition_id, branch?, parameters?, project?)`, `cancel_build(build_id, project?)` | no |
+| `AZDO_ALLOW_RELEASES` | `create_release(definition_id, description?, artifacts?, project?)`, `deploy_release_stage(release_id, stage, comment?, project?)` (approvals and gates still apply) | deploys: yes |
 
-Both always ask for confirmation, even with `AZDO_CONFIRM_WRITE=false`. Because the switch is read
-from each instance's env file, deletes can be on for one user's instance and off for everyone else
-(see [Multiple instances](#multiple-instances-one-image-several-env-files)).
+"Always confirmed" means the tool asks even with `AZDO_CONFIRM_WRITE=false`. Every switch is read
+from the instance's env file, so they can be on for one user's instance and off for everyone else
+(see [Multiple instances](#multiple-instances-one-image-several-env-files)). Branch policies,
+permissions and approvals configured on the server still apply on top.
 
 **Confirmation before every write** (`AZDO_CONFIRM_WRITE`, default `true`): a write tool's first
 call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
 and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
-code is tied to those exact arguments, so a changed request needs a fresh confirmation (codes also
-expire when the server restarts). Set `AZDO_CONFIRM_WRITE=false` to let writes run directly.
+code is tied to those exact arguments — and, where it matters, to the live state shown in the preview
+(a branch's commit, a PR's source commit, a wiki page's version) — so a changed request or a change in
+between needs a fresh confirmation (codes also expire when the server restarts). Set
+`AZDO_CONFIRM_WRITE=false` to let the other writes run directly.
 
 ## 1. Create a PAT
 
 In the web portal (`https://<server>/<collection>`): **User settings → Personal Access Tokens →
 New Token**. For read-only use, scope it to *Code (Read)*, *Work Items (Read)*, *Build (Read)*,
-*Project and Team (Read)*. If you enable writes (below), use *Work Items (Read & write)* and
-*Wiki (Read & write)* as well; deleting work items needs *Work Items (Read, write, & manage)*. Copy
-the token — it's `AZDO_PAT`.
+*Release (Read)*, *Wiki (Read)*, *Project and Team (Read)* (and *Identity (Read)* to name reviewers).
+For writes add only what you enable:
+
+| Enabled | PAT scope |
+|---|---|
+| work items, links, attachments, restore | *Work Items (Read & write)* |
+| deleting work items | *Work Items (Read, write, & manage)* |
+| wiki pages | *Wiki (Read & write)* |
+| branches, pull requests, comments, votes, merges, pushes | *Code (Read & write)* |
+| queue / cancel builds | *Build (Read & execute)* |
+| releases | *Release (Read, write, & execute)* |
+
+Copy the token — it's `AZDO_PAT`. The PAT acts as its user: everything the server does (comments,
+votes, commits, merges) shows up under that user's name, within that user's permissions.
 
 > Azure DevOps requires **HTTPS** for PAT auth. On a bad token the server returns an HTML sign-in
 > page rather than a clean 401; this server detects that and reports an auth error.
@@ -202,8 +251,10 @@ networks:
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
   env/instance_a.env`) with instance a's PAT and `AZDO_ALLOW_WRITE=true`. The shared instance keeps
   the flag off. Every write still asks for confirmation first unless
-  `AZDO_CONFIRM_WRITE=false`. Add `AZDO_ALLOW_DELETE=true` to an instance's env file to let that user
-  delete work items and wiki pages; deletes always ask first. `*.env` is gitignored, so it stays local.
+  `AZDO_CONFIRM_WRITE=false`. The sensitive switches go per instance too — e.g. `AZDO_ALLOW_DELETE`,
+  `AZDO_ALLOW_PUSH`, `AZDO_ALLOW_PR_MERGE` only in the env file of the user who should have them;
+  deletes, merges, default-branch pushes and deploys always ask first. `*.env` is gitignored, so it
+  stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 
@@ -226,20 +277,38 @@ In Claude Code, run `/mcp` to confirm the `azuredevops` server connected, then a
 - "Run a WIQL query for active bugs assigned to me."
 - "What were the last 10 builds for project Platform and did any fail?"
 - "List branches of the `web` repository."
+- "Show PR 57 with its open comments and changed files."
+- "What changed between `main` and `feature/login`? Show me the diff of `src/auth.py`."
+- "Why did build 1234 fail?"
+- "Which PBIs are in the current sprint of team Web?"
 
 With `AZDO_ALLOW_WRITE=true` you can also:
 
 - "Create a Bug titled 'Login 500 on submit' in project Platform, assigned to me."
+- "Create three Tasks under PBI 1200 for backend, frontend and tests, in the current sprint."
 - "Add a comment to work item 1423 saying the fix is deployed, and set its state to Resolved."
+- "Link PR 57 in the `api` repo to work item 1423."
 - "Update the wiki page /Runbooks/Deploy in the Platform wiki with this content: …"
+- "Open a PR from `feature/login` with Dev Two as required reviewer and link work item 1423."
+- "Reply on PR 57's thread about the timeout and resolve it."
+- "Fix the typo in README.md on a new branch `fix/readme-typo` and open a PR." (with `AZDO_ALLOW_PUSH=true`)
+- "Approve PR 57." (with `AZDO_ALLOW_PR_VOTE=true`) · "Squash-merge PR 57." (with `AZDO_ALLOW_PR_MERGE=true`)
+- "Run the api-ci pipeline on `feature/login`." (with `AZDO_ALLOW_PIPELINES=true`)
 - "Delete work items 1501 and 1502, they were test entries." (with `AZDO_ALLOW_DELETE=true`)
 
 ## Notes & scope
 
 - **Writes are opt-in.** Reads are always available; the write tools refuse unless
   `AZDO_ALLOW_WRITE=true` and the PAT carries the matching write scopes. Leave the flag unset for a
-  read-only deployment. Deletes (work items, wiki pages) additionally need `AZDO_ALLOW_DELETE=true` and
-  always ask for confirmation.
+  read-only deployment. Deletes, pushes, merges, votes, pipelines and releases additionally need their
+  own switch (see [Write tools](#write-tools-opt-in)).
+- **Content is data.** File contents, PR comments, work item text and wiki pages are written by other
+  people; the server tells the agent to treat them as data, and every write still needs your
+  confirmation.
+- **Search** (`search`) needs Search installed and configured on Azure DevOps Server (code search: the
+  Code Search extension). Without it, use WIQL (`query_work_items`) for work items.
+- **Preview APIs:** search, release stages, wiki page moves, the Recycle Bin and identity lookups are
+  called with `<AZDO_API_VERSION>-preview`, which Azure DevOps Server 2019–2022 accepts.
 - **api-version** is global (`AZDO_API_VERSION`); a single tool can override it via
   `azdo_get(..., params={"api-version": "6.0"})`.
 - **Large lists** (commits, builds, work items) are capped — widen with `limit` or filter (branch,

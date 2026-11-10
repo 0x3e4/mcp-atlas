@@ -5,6 +5,41 @@ All notable changes to azure-devops-mcp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-10
+
+### Added
+
+- Repository reads: `list_files`, `get_file`, `get_commit` (with changed files), `compare_versions`
+  (ahead / behind, changed files, unified diff of one file, from the merge base), `list_tags`.
+- `search` over code, wiki and work items (needs Search on the server).
+- Pull requests: `get_pull_request` (reviewers and votes, linked work items, comment threads with file
+  and line, changed files, commits); `list_pull_requests` without a repository (whole project), with
+  `mine`, `target_branch` and `source_branch` filters. Writes: `create_pull_request`,
+  `update_pull_request` (edit, publish draft, retarget, abandon / reactivate),
+  `set_pull_request_reviewers`, `comment_pull_request` (new thread on a file / line, reply, resolve).
+- Branches and pushes: `create_branch`, `delete_branch`, `commit_files` (one commit of adds / edits /
+  deletes / renames without a clone; the preview shows a diff of each edited file).
+- Work items: `get_work_item` (all fields, links, discussion), `list_work_item_types`,
+  `list_iterations` (also a team's current sprint), `list_areas`, `link_work_items` (parent / child,
+  related, dependencies, duplicates, tests, PRs, commits, branches, hyperlinks),
+  `add_work_item_attachment`, `restore_work_items`; `create_work_item` takes `parent_id` and `tags`,
+  `update_work_item` takes `description`, `area_path`, `iteration_path`, `add_tags`, `remove_tags`.
+- Wiki: `list_wiki_pages`, `move_wiki_page`; `create_or_update_wiki_page` takes a `comment`.
+- Builds and releases: `get_build` (errors, failed tasks and their log tail), `queue_build`,
+  `cancel_build`, `create_release`, `deploy_release_stage`.
+- `server_info`: the PAT's user and which write switches are on.
+- New switches for the sensitive writes, each on top of `AZDO_ALLOW_WRITE`, all off by default and read
+  per instance: `AZDO_ALLOW_PUSH`, `AZDO_ALLOW_PUSH_DEFAULT_BRANCH`, `AZDO_ALLOW_PR_MERGE`,
+  `AZDO_ALLOW_POLICY_BYPASS`, `AZDO_ALLOW_PR_VOTE`, `AZDO_ALLOW_PIPELINES`, `AZDO_ALLOW_RELEASES`;
+  `delete_branch` uses `AZDO_ALLOW_DELETE`. Merges, policy bypasses, pushes to a default branch and
+  release deployments always ask for confirmation; their codes are tied to the live state (the PR's
+  source commit, the branch's commit).
+
+### Fixed
+
+- `create_work_item` failed with `NameError: name 'quote' is not defined` once confirmed (missing
+  import since it was added); it is covered by a test now.
+
 ## [1.1.0] - 2026-11-10
 
 ### Added
