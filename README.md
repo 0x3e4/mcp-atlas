@@ -48,9 +48,11 @@ Every server has a small set of **opt-in write tools**, configured per server in
 The confirm code is enforced by the server, not just requested from the agent: it is bound to the
 exact tool and arguments it was issued for, so the change that runs is the one you confirmed, and a
 changed request needs a fresh confirmation (codes also expire when the server restarts). The
-credential still needs write rights upstream — each README lists them. Only netscaler-mcp can delete
-(traffic-management objects: LB, CS, SSL, rewrite / responder, GSLB, DNS), behind its own `NETSCALER_ALLOW_DELETE` switch, and a delete always asks for
-confirmation, even with `NETSCALER_CONFIRM_WRITE=false`.
+credential still needs write rights upstream — each README lists them. Only two servers can delete,
+each behind its own switch on top of the write switch: netscaler-mcp (traffic-management objects: LB,
+CS, SSL, rewrite / responder, GSLB, DNS; `NETSCALER_ALLOW_DELETE`) and azure-devops-mcp (work items,
+wiki pages; `AZDO_ALLOW_DELETE`). A delete always asks for confirmation, even with
+`<PREFIX>_CONFIRM_WRITE=false`, and the switch is per instance, so it can be on for one user only.
 Run a read-only and a write-enabled instance side by side if you want both (see below).
 
 ## Using with other clients & gateways
@@ -159,8 +161,8 @@ print(resp.output_text)
 The servers share a deliberate, lightweight design so they read and operate the same way:
 
 - **Read-only by default** — write tools only behind `<PREFIX>_ALLOW_WRITE`, each confirmed by the
-  user first (`<PREFIX>_CONFIRM_WRITE`); no delete tools, except netscaler-mcp's opt-in
-  `delete_object` (`NETSCALER_ALLOW_DELETE`, always confirmed).
+  user first (`<PREFIX>_CONFIRM_WRITE`); no delete tools, except the opt-in deletes of
+  netscaler-mcp (`NETSCALER_ALLOW_DELETE`) and azure-devops-mcp (`AZDO_ALLOW_DELETE`), always confirmed.
 - **Curated tools + a raw escape hatch** — high-value tools for the common questions, plus a raw
   `*_get` tool so anything the API exposes stays reachable.
 - **Trimmed results** — responses are projected to the useful fields and row-capped; pass

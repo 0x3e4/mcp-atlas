@@ -7,7 +7,8 @@ else.
 
 Write tools (work items: create/update/comment; wiki: create-or-update page) are **opt-in**: they
 refuse unless ``AZDO_ALLOW_WRITE=true``, and need a PAT with the matching write scopes. With the flag
-off the server is effectively read-only.
+off the server is effectively read-only. Delete tools (work items, wiki pages) additionally need
+``AZDO_ALLOW_DELETE=true`` and always ask for confirmation, even with ``AZDO_CONFIRM_WRITE=false``.
 """
 
 from __future__ import annotations
@@ -32,7 +33,8 @@ mcp = MCPServer(
     instructions=(
         "Write tools need the user's confirmation: the first call changes nothing and returns a preview "
         "with a confirm_code. Show the user a short overview of what will change, end with 'Confirm it?', "
-        "and only after they say yes repeat the call with confirm=<code>."
+        "and only after they say yes repeat the call with confirm=<code>. Delete tools (delete_work_items, "
+        "delete_wiki_page) always ask this way."
     ),
     version=__version__,
 )
@@ -56,6 +58,16 @@ def _proj(project: str | None) -> str:
     return p
 
 
+def _require_delete() -> None:
+    """Deletes need AZDO_ALLOW_DELETE on top of AZDO_ALLOW_WRITE (set per instance, e.g. per user)."""
+    _require_write()
+    if not _get_client().settings.allow_delete:
+        raise ValueError(
+            "Delete tools are disabled. Set AZDO_ALLOW_DELETE=true (in addition to AZDO_ALLOW_WRITE=true) "
+            "in this instance's env file to delete work items or wiki pages. Previews still work."
+        )
+
+
 def _require_write() -> None:
     """Gate write tools behind the opt-in AZDO_ALLOW_WRITE flag."""
     if not _get_client().settings.allow_write:
@@ -72,13 +84,15 @@ _CONFIRM_DESC = (
 )
 
 
-def _confirm(tool: str, change: dict[str, Any], summary: str, code: str | None) -> dict[str, Any] | None:
+def _confirm(
+    tool: str, change: dict[str, Any], summary: str, code: str | None, *, always: bool = False
+) -> dict[str, Any] | None:
     """Return a preview the agent must confirm with the user, or None when the write may run.
 
-    Writes run straight away when AZDO_CONFIRM_WRITE=false, or when ``code`` matches this exact
-    tool + change (so what runs is what the user saw).
+    Writes run straight away when AZDO_CONFIRM_WRITE=false (unless ``always``: deletes), or when
+    ``code`` matches this exact tool + change (so what runs is what the user saw).
     """
-    if not _get_client().settings.confirm_write:
+    if not always and not _get_client().settings.confirm_write:
         return None
     raw = json.dumps([tool, change], sort_keys=True, default=str).encode()
     expected = hmac.new(_CONFIRM_KEY, raw, hashlib.sha256).hexdigest()[:12]
@@ -511,6 +525,102 @@ async def create_or_update_wiki_page(
     if isinstance(result, dict):
         out["page"] = _pick(result, ("id", "path", "gitItemPath", "order"))
     return out
+
+
+# ---- tools: deletes (gated by AZDO_ALLOW_WRITE + AZDO_ALLOW_DELETE, always confirmed) ----
+
+_DELETE_FIELDS = "System.Title,System.WorkItemType,System.State,System.TeamProject"
+
+
+def _subpages(page: dict[str, Any]) -> list[str]:
+    """Every page below ``page`` (paths), depth first."""
+    out: list[str] = []
+    for sub in page.get("subPages") or []:
+        out.append(sub.get("path"))
+        out += _subpages(sub)
+    return out
+
+
+@mcp.tool()
+async def delete_work_items(
+    ids: Annotated[list[int], Field(description="Work item ids to delete, e.g. [1423, 1424].", min_length=1, max_length=50)],
+    destroy: Annotated[bool, Field(description="Delete permanently instead of moving to the Recycle Bin (needs the 'Permanently delete work items' permission; cannot be undone).")] = False,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Delete work items — to the Recycle Bin, or permanently with destroy=true (WRITE, DELETE — requires
+    AZDO_ALLOW_WRITE and AZDO_ALLOW_DELETE; always confirmed).
+
+    The preview names each item (type, title, state, project) and skips ids that don't exist or this PAT
+    can't see. Items in the Recycle Bin can be restored in the web portal. Unlike other writes this
+    always asks for confirmation, even with AZDO_CONFIRM_WRITE=false. DELETEs _apis/wit/workitems/{id}.
+    """
+    _require_delete()
+    ids = list(dict.fromkeys(ids))
+    data = await _get_client().get(
+        "_apis/wit/workitems",
+        params={"ids": ",".join(map(str, ids)), "fields": _DELETE_FIELDS, "errorPolicy": "omit"},
+    )
+    found = {item["id"]: item.get("fields") or {} for item in data.get("value") or [] if isinstance(item, dict)}
+    targets = [{"id": i, "type": found[i].get("System.WorkItemType"), "title": found[i].get("System.Title"),
+                "state": found[i].get("System.State"), "project": found[i].get("System.TeamProject")}
+               for i in ids if i in found]
+    missing = [i for i in ids if i not in found]
+    if not targets:
+        return {"deleted": [], "not_found": missing, "note": "None of these work items exist or are visible to this PAT."}
+    how = "PERMANENTLY delete" if destroy else "Move to the Recycle Bin"
+    summary = f"{how} {len(targets)} work item(s): " + "; ".join(f"#{t['id']} {t['type']} '{t['title']}'" for t in targets) + "."
+    if preview := _confirm("delete_work_items", {"targets": targets, "destroy": destroy}, summary, confirm, always=True):
+        return {**preview, "not_found": missing}
+    results = []
+    for t in targets:
+        try:
+            await _get_client().delete(f"_apis/wit/workitems/{t['id']}", params={"destroy": "true"} if destroy else None)
+            results.append({**t, "result": "destroyed" if destroy else "in recycle bin"})
+        except AzdoError as exc:
+            results.append({**t, "result": f"error: {exc}"})
+    out: dict[str, Any] = {"deleted": results, "not_found": missing}
+    if failed := [r for r in results if r["result"].startswith("error")]:
+        out["error"] = f"{len(failed)} of {len(results)} delete(s) failed; see deleted."
+    return out
+
+
+@mcp.tool()
+async def delete_wiki_page(
+    wiki: Annotated[str, Field(description="Wiki id or name.")],
+    path: Annotated[str, Field(description="Page path, e.g. '/Runbooks/Old-Deploy'. Its sub-pages are deleted with it.")],
+    project: Annotated[str | None, Field(description="Project name/id; omit to use AZDO_PROJECT.")] = None,
+    comment: Annotated[str | None, Field(description="Comment for the wiki's change history.")] = None,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Delete a wiki page together with all its sub-pages (WRITE, DELETE — requires AZDO_ALLOW_WRITE and
+    AZDO_ALLOW_DELETE; always confirmed).
+
+    The preview lists every sub-page that goes with it. The confirm code is tied to the page's current
+    version, so an edit after the preview needs a new confirmation. The wiki's git history keeps the old
+    content. Unlike other writes this always asks for confirmation, even with AZDO_CONFIRM_WRITE=false.
+    DELETEs {project}/_apis/wiki/wikis/{wiki}/pages?path=...
+    """
+    _require_delete()
+    if (path or "").strip() in ("", "/"):
+        raise ValueError("Pass the path of the page to delete; the wiki root can't be deleted here.")
+    proj = _proj(project)
+    page_path = f"_apis/wiki/wikis/{wiki}/pages"
+    try:
+        page, etag = await _get_client().get_with_etag(
+            page_path, project=proj, params={"path": path, "recursionLevel": "full", "includeContent": "false"})
+    except AzdoError as exc:
+        if exc.status == 404:
+            return {"deleted": False, "path": path, "note": "No such page: nothing to delete."}
+        raise
+    subpages = _subpages(page if isinstance(page, dict) else {})
+    summary = f"Delete wiki page {path} in wiki {wiki}" + (
+        f" and its {len(subpages)} sub-page(s)." if subpages else ".")
+    change = {"wiki": wiki, "path": path, "project": proj, "version": etag, "subpages": subpages}
+    if preview := _confirm("delete_wiki_page", change, summary, confirm, always=True):
+        return {**preview, "subpages": subpages}
+    params = {"path": path, **({"comment": comment} if comment else {})}
+    await _get_client().delete(page_path, project=proj, params=params)
+    return {"deleted": True, "path": path, "subpages_deleted": subpages}
 
 
 # ---- tool: raw escape hatch ---------------------------------------------

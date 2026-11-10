@@ -178,6 +178,10 @@ class AzdoClient:
         resp = await self._send("PUT", self._url(path, project), params=params, json=body, extra_headers=extra)
         return self._json(resp), resp.headers.get("ETag")
 
+    async def delete(self, path: str, *, project: str | None = None, params: dict[str, Any] | None = None) -> Any:
+        """DELETE a resource (gated at the tool layer by AZDO_ALLOW_DELETE); returns the JSON body, {} if none."""
+        return self._json(await self._send("DELETE", self._url(path, project), params=params))
+
 
 def _try_json(resp: httpx.Response) -> Any:
     if not resp.content:
@@ -193,7 +197,8 @@ def _format_error(status: int, data: Any, resp: httpx.Response) -> str:
     if status == 401:
         return (
             "Azure DevOps 401 — authentication failed. Check AZDO_PAT and that it has the needed "
-            "scopes (reads: Code/Work Items/Build, Project & Team; writes: Work Items 'Read & write', Wiki 'Read & write')."
+            "scopes (reads: Code/Work Items/Build, Project & Team; writes: Work Items 'Read & write', Wiki "
+            "'Read & write'; deleting work items: Work Items 'Read, write, & manage')."
         )
     if status == 403:
         return f"Azure DevOps 403 — the PAT lacks permission for this resource. {msg}".rstrip()

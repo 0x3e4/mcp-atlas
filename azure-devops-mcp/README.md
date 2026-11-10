@@ -7,7 +7,8 @@ builds/pipelines, releases and the wiki — and, opt-in, **create/update work it
 
 - One shared `httpx.AsyncClient`; **PAT** auth over HTTP Basic, `Accept: application/json`.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
-- **Read-only by default**; write tools are **opt-in** behind `AZDO_ALLOW_WRITE` (see below).
+- **Read-only by default**; write tools are **opt-in** behind `AZDO_ALLOW_WRITE`, delete tools
+  additionally behind `AZDO_ALLOW_DELETE` (see below).
 - A raw escape-hatch tool (`azdo_get`) so any `_apis/...` resource stays reachable.
 
 Targets **on-prem** Azure DevOps Server (the base URL includes a **collection**), not cloud
@@ -49,6 +50,17 @@ effectively read-only.
 | `update_work_item(id, title?, state?, assigned_to?, comment?, fields?)` | Update fields and/or add a discussion comment (`System.History`). Pass only `comment` to just comment. |
 | `create_or_update_wiki_page(wiki, path, content, project?)` | Create a wiki page, or replace its content if it exists (uses the page's ETag with `If-Match`, so a concurrent edit fails cleanly instead of clobbering). |
 
+Deletes (opt-in on top of writes: **`AZDO_ALLOW_DELETE=true`** as well; always confirmed):
+
+| Tool | What it does |
+|---|---|
+| `delete_work_items(ids, destroy?)` | Move work items to the Recycle Bin (restorable in the web portal), or delete them permanently with `destroy=true`. The preview names each item; unknown ids are skipped. |
+| `delete_wiki_page(wiki, path, project?, comment?)` | Delete a wiki page **with all its sub-pages**; the preview lists them, and the code is tied to the page's current version. The wiki's git history keeps the old content. |
+
+Both always ask for confirmation, even with `AZDO_CONFIRM_WRITE=false`. Because the switch is read
+from each instance's env file, deletes can be on for one user's instance and off for everyone else
+(see [Multiple instances](#multiple-instances-one-image-several-env-files)).
+
 **Confirmation before every write** (`AZDO_CONFIRM_WRITE`, default `true`): a write tool's first
 call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
 and asks *"Confirm it?"*; only after you say yes does it repeat the call with `confirm=<code>`. The
@@ -60,7 +72,8 @@ expire when the server restarts). Set `AZDO_CONFIRM_WRITE=false` to let writes r
 In the web portal (`https://<server>/<collection>`): **User settings → Personal Access Tokens →
 New Token**. For read-only use, scope it to *Code (Read)*, *Work Items (Read)*, *Build (Read)*,
 *Project and Team (Read)*. If you enable writes (below), use *Work Items (Read & write)* and
-*Wiki (Read & write)* as well. Copy the token — it's `AZDO_PAT`.
+*Wiki (Read & write)* as well; deleting work items needs *Work Items (Read, write, & manage)*. Copy
+the token — it's `AZDO_PAT`.
 
 > Azure DevOps requires **HTTPS** for PAT auth. On a bad token the server returns an HTML sign-in
 > page rather than a clean 401; this server detects that and reports an auth error.
@@ -189,7 +202,8 @@ networks:
 - `env/instance_a.env` is a complete env file of its own (`mkdir -p env && cp .env.example
   env/instance_a.env`) with instance a's PAT and `AZDO_ALLOW_WRITE=true`. The shared instance keeps
   the flag off. Every write still asks for confirmation first unless
-  `AZDO_CONFIRM_WRITE=false`. `*.env` is gitignored, so it stays local.
+  `AZDO_CONFIRM_WRITE=false`. Add `AZDO_ALLOW_DELETE=true` to an instance's env file to let that user
+  delete work items and wiki pages; deletes always ask first. `*.env` is gitignored, so it stays local.
 - Every container listens on port 8000 inside its own network namespace, so nothing clashes; the
   gateway reaches each one by its `container_name`. Register them under separate names:
 
@@ -218,12 +232,14 @@ With `AZDO_ALLOW_WRITE=true` you can also:
 - "Create a Bug titled 'Login 500 on submit' in project Platform, assigned to me."
 - "Add a comment to work item 1423 saying the fix is deployed, and set its state to Resolved."
 - "Update the wiki page /Runbooks/Deploy in the Platform wiki with this content: …"
+- "Delete work items 1501 and 1502, they were test entries." (with `AZDO_ALLOW_DELETE=true`)
 
 ## Notes & scope
 
 - **Writes are opt-in.** Reads are always available; the write tools refuse unless
   `AZDO_ALLOW_WRITE=true` and the PAT carries the matching write scopes. Leave the flag unset for a
-  read-only deployment. No delete tools are provided.
+  read-only deployment. Deletes (work items, wiki pages) additionally need `AZDO_ALLOW_DELETE=true` and
+  always ask for confirmation.
 - **api-version** is global (`AZDO_API_VERSION`); a single tool can override it via
   `azdo_get(..., params={"api-version": "6.0"})`.
 - **Large lists** (commits, builds, work items) are capped — widen with `limit` or filter (branch,

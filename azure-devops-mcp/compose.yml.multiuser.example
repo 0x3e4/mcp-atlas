@@ -8,6 +8,8 @@
 #   mcpjungle register --name azure-devops --url http://azure-devops-mcp:8000/mcp
 #   mcpjungle register --name azure-devops-instance-a --url http://azure-devops-mcp-instance-a:8000/mcp
 # Writes still ask for confirmation first unless AZDO_CONFIRM_WRITE=false in that instance's env file.
+# Deletes are a separate switch per instance: AZDO_ALLOW_DELETE=true (on top of AZDO_ALLOW_WRITE) in one
+# user's env file allows deletes for that user only; they always ask for confirmation.
 # Images are built and pushed to GHCR by .github/workflows/build.yml.
 # (No GHCR? Replace the image: line with "build: ." to build from this folder instead.)
 
@@ -28,7 +30,7 @@ services:
     container_name: azure-devops-mcp
     env_file: ./azure-devops.env
 
-  azure-devops-mcp-instance-a:         # write access with instance a's PAT (AZDO_ALLOW_WRITE=true)
+  azure-devops-mcp-instance-a:         # write access with instance a's PAT (AZDO_ALLOW_WRITE=true, deletes only with AZDO_ALLOW_DELETE=true)
     <<: *azure-devops
     container_name: azure-devops-mcp-instance-a
     env_file: ./env/instance_a.env

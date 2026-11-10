@@ -31,6 +31,8 @@ EXPECTED_TOOLS = {
     "update_work_item",
     "create_or_update_wiki_page",
     "azdo_get",
+    "delete_work_items",
+    "delete_wiki_page",
 }
 
 
@@ -121,7 +123,8 @@ def test_allow_write_flag_defaults_off_and_parses():
     assert Settings.from_env(env).allow_write is True
 
 
-CONFIRM_TOOLS = {'update_work_item', 'create_work_item', 'create_or_update_wiki_page'}
+CONFIRM_TOOLS = {'update_work_item', 'create_work_item', 'create_or_update_wiki_page', 'delete_work_items',
+                 'delete_wiki_page'}
 
 
 def test_write_tools_take_a_confirm_code_and_confirm_defaults_on():
@@ -176,3 +179,95 @@ def test_version_is_reported():
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
     assert srv.mcp.version == __version__
+
+
+# ---- deletes ------------------------------------------------------------------
+
+def _delete_client(handler, **flags) -> server.AzdoClient:
+    env = _base_env()
+    env.update({"AZDO_ALLOW_WRITE": "true", "AZDO_ALLOW_DELETE": "true", "AZDO_CONFIRM_WRITE": "false", **flags})
+    client = server.AzdoClient(Settings.from_env(env))
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client
+
+
+def test_allow_delete_defaults_off_and_needs_write_too():
+    assert Settings.from_env(_base_env()).allow_delete is False
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.method)
+        return httpx.Response(200, json={})
+
+    for flags, missing in (({"AZDO_ALLOW_DELETE": "false"}, "AZDO_ALLOW_DELETE"),
+                           ({"AZDO_ALLOW_WRITE": "false"}, "AZDO_ALLOW_WRITE")):
+        server._client = _delete_client(handler, **flags)
+        try:
+            with pytest.raises(ValueError, match=missing):
+                asyncio.run(server.delete_work_items([7]))
+            with pytest.raises(ValueError, match=missing):
+                asyncio.run(server.delete_wiki_page("wiki1", "/Old", project="Platform"))
+        finally:
+            server._client = None
+    assert sent == []
+
+
+def test_delete_work_items_always_confirms_and_names_the_items():
+    sent: list[tuple[str, str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.method, request.url.path, dict(request.url.params)))
+        if request.method == "GET":
+            return httpx.Response(200, json={"count": 2, "value": [
+                {"id": 7, "fields": {"System.Title": "Old bug", "System.WorkItemType": "Bug", "System.State": "New",
+                                     "System.TeamProject": "Platform"}}, None]})
+        return httpx.Response(200, json={"id": 7})
+
+    server._client = _delete_client(handler)  # AZDO_CONFIRM_WRITE=false: deletes still ask
+
+    async def calls():
+        preview = await server.delete_work_items([7, 8], destroy=True)
+        assert preview["status"] == "confirmation_required" and preview["not_found"] == [8]
+        assert "PERMANENTLY" in preview["summary"] and "'Old bug'" in preview["summary"]
+        done = await server.delete_work_items([7, 8], destroy=True, confirm=preview["confirm_code"])
+        assert done["deleted"][0]["result"] == "destroyed" and done["not_found"] == [8]
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None
+    deletes = [s for s in sent if s[0] == "DELETE"]
+    assert len(deletes) == 1 and deletes[0][1].endswith("/_apis/wit/workitems/7")
+    assert deletes[0][2]["destroy"] == "true"
+
+
+def test_delete_wiki_page_lists_subpages_and_binds_the_version():
+    state = {"etag": '"v1"'}
+    sent: list[tuple[str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.method, dict(request.url.params)))
+        if request.method == "GET":
+            return httpx.Response(200, headers={"ETag": state["etag"]}, json={
+                "path": "/Old", "subPages": [{"path": "/Old/A", "subPages": [{"path": "/Old/A/1"}]}]})
+        return httpx.Response(200, json={})
+
+    server._client = _delete_client(handler)
+
+    async def calls():
+        preview = await server.delete_wiki_page("wiki1", "/Old", project="Platform")
+        assert preview["subpages"] == ["/Old/A", "/Old/A/1"] and "2 sub-page(s)" in preview["summary"]
+        state["etag"] = '"v2"'  # edited after the preview
+        again = await server.delete_wiki_page("wiki1", "/Old", project="Platform", confirm=preview["confirm_code"])
+        assert again["status"] == "confirmation_required" and "did not match" in again["note"]
+        done = await server.delete_wiki_page("wiki1", "/Old", project="Platform", confirm=again["confirm_code"])
+        assert done == {"deleted": True, "path": "/Old", "subpages_deleted": ["/Old/A", "/Old/A/1"]}
+        with pytest.raises(ValueError, match="root"):
+            await server.delete_wiki_page("wiki1", "/", project="Platform")
+
+    try:
+        asyncio.run(calls())
+    finally:
+        server._client = None
+    assert [m for m, _ in sent].count("DELETE") == 1
+    assert sent[-1] == ("DELETE", {"path": "/Old", "api-version": "7.0"})

@@ -5,6 +5,15 @@ All notable changes to azure-devops-mcp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-10
+
+### Added
+
+- `delete_work_items` (to the Recycle Bin, or permanently with `destroy=true`) and `delete_wiki_page`
+  (with its sub-pages, listed in the preview). Both need the new `AZDO_ALLOW_DELETE=true` on top of
+  `AZDO_ALLOW_WRITE`, so deletes can be switched on per instance / user, and both always ask for
+  confirmation, even with `AZDO_CONFIRM_WRITE=false`.
+
 ## [1.0.1] - 2026-11-09
 
 ### Changed
