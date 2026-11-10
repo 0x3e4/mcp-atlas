@@ -7,7 +7,7 @@ server/system health, and historic data — and, opt-in, **pause/resume objects,
 trigger a scan, rename and edit objects (tags, priority, comments, location, host, interval), set
 channel limits, clone, move and add devices/groups, and run auto-discovery**.
 
-- One shared `httpx.AsyncClient`; **API-token** auth (`Authorization: Bearer` + `apitoken`), with a
+- One shared `httpx.AsyncClient`; **API-token** auth (`apitoken` query param; no `Authorization` header, which PRTG 26.x rejects), with a
   legacy **username + passhash** fallback.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
 - **Read-only by default**; write tools are **opt-in** behind `PRTG_ALLOW_WRITE` (see below).

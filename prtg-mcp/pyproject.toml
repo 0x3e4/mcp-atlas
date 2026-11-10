@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "prtg-mcp"
-version = "1.0.1"
+version = "1.0.2"
 description = "PRTG Network Monitor MCP server — sensors, devices, status, logs and historic data, plus opt-in pause/resume, acknowledge and scan-now writes"
 readme = "README.md"
 requires-python = ">=3.14"

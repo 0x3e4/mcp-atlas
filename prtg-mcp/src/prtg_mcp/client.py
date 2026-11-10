@@ -1,8 +1,9 @@
 """Async PRTG Network Monitor HTTP API client.
 
-A single ``httpx.AsyncClient`` is shared across all tools. Auth (API token as ``Authorization:
-Bearer`` + ``apitoken`` query param, or legacy ``username``/``passhash``) is applied to every
-request. ``table.json`` and the other ``*.json`` endpoints return JSON; a failure — including PRTG's
+A single ``httpx.AsyncClient`` is shared across all tools. Auth goes only in the query string of
+every request: the API key as ``apitoken``, or the legacy ``username`` + ``passhash``. No
+``Authorization`` header is sent: the classic ``/api/*.htm`` and ``*.json`` endpoints of PRTG 26.x
+answer 401 to any request carrying ``Authorization: Bearer``, even with a valid ``apitoken``. ``table.json`` and the other ``*.json`` endpoints return JSON; a failure — including PRTG's
 habit of returning an XML/HTML error body on a bad token — becomes a clean ``PrtgError`` so tools
 never leak tracebacks to the model.
 
@@ -16,6 +17,7 @@ Calls that answer success with a redirect to the object's page (rename, clone, m
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit
@@ -23,6 +25,10 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 import httpx
 
 from .config import Settings
+
+# httpx logs every request URL at INFO, and the URL carries the API key (apitoken) or the passhash:
+# keep it out of the container log.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 # PRTG's classic API changes state through plain GETs (pause.htm, setobjectproperty.htm,
@@ -92,7 +98,7 @@ class PrtgClient:
         client = await self._http()
         try:
             resp = await client.get(
-                url, params=self._merged(params), headers=self._settings.auth_headers, follow_redirects=False
+                url, params=self._merged(params), follow_redirects=False
             )
         except httpx.HTTPError as exc:
             raise PrtgError(f"Network error calling PRTG {url}: {exc}") from exc
@@ -135,7 +141,7 @@ class PrtgClient:
     async def _request(self, url: str, *, params: dict[str, Any] | None = None, as_text: bool = False) -> Any:
         client = await self._http()
         try:
-            resp = await client.get(url, params=self._merged(params), headers=self._settings.auth_headers)
+            resp = await client.get(url, params=self._merged(params))
         except httpx.HTTPError as exc:
             raise PrtgError(f"Network error calling PRTG {url}: {exc}") from exc
 

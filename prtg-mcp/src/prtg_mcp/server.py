@@ -272,8 +272,11 @@ async def get_sensor(
 
 @mcp.tool()
 async def server_status() -> dict[str, Any]:
-    """PRTG core status and sensor counts (getstatus.json) — version, Up/Down/Warning/Paused totals, alarms."""
-    return await _get_client().get("getstatus.json", params={"id": 0})
+    """PRTG core status and sensor counts (status.json?id=0) — version, Up/Down/Warning/Paused totals, alarms.
+
+    status.json carries the same fields as getstatus.htm; getstatus.json does not exist on PRTG 26.x (404).
+    """
+    return await _get_client().get("status.json", params={"id": 0})
 
 
 @mcp.tool()

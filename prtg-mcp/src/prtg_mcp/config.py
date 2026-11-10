@@ -112,11 +112,6 @@ class Settings:
         return params
 
     @property
-    def auth_headers(self) -> dict[str, str]:
-        """Bearer header for API-token auth (newer PRTG); empty for username/passhash."""
-        return {"Authorization": f"Bearer {self.api_token}"} if self.api_token else {}
-
-    @property
     def httpx_verify(self) -> str | bool:
         """Value for httpx ``verify=``: a CA bundle path if set, else the verify_ssl bool."""
         return self.ca_bundle or self.verify_ssl

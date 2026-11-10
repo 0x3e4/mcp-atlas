@@ -95,7 +95,6 @@ def test_settings_with_api_token():
     assert s.api_base == "https://prtg.example.com/api"
     assert s.base_origin == "https://prtg.example.com"
     assert s.auth_params == {"apitoken": "tok"}
-    assert s.auth_headers == {"Authorization": "Bearer tok"}
     assert s.httpx_verify is True
 
 
@@ -104,7 +103,6 @@ def test_settings_with_username_passhash():
         {"PRTG_BASE_URL": "https://prtg.example.com", "PRTG_USERNAME": "ro", "PRTG_PASSHASH": "12345"}
     )
     assert s.auth_params == {"username": "ro", "passhash": "12345"}
-    assert s.auth_headers == {}
 
 
 def test_username_without_secret_rejected():
@@ -169,7 +167,9 @@ def test_write_requests_match_the_prtg_api():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append((request.method, request.url.path, dict(request.url.params)))
-        assert request.headers["authorization"] == "Bearer tok"
+        # PRTG 26.x answers 401 to any request with an Authorization header: the key goes in the query only
+        assert "authorization" not in request.headers
+        assert request.url.params["apitoken"] == "tok"
         return httpx.Response(200, text="<HTML><BODY>OK</BODY></HTML>")
 
     server._client = _write_client(handler)
@@ -440,3 +440,29 @@ def test_version_is_reported():
     pyproject = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
     assert srv.mcp.version == __version__
+
+
+def test_server_status_reads_status_json():
+    """getstatus.json is a 404 on PRTG 26.x; status.json?id=0 has the same fields."""
+    seen: list[tuple[str, dict[str, str], str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, dict(request.url.params), request.headers.get("authorization")))
+        return httpx.Response(200, json={"Version": "26.3", "NewAlarms": "0"})
+
+    server._client = _write_client(handler)
+    try:
+        out = asyncio.run(server.server_status())
+    finally:
+        server._client = None
+    assert out["Version"] == "26.3"
+    assert seen == [("/api/status.json", {"id": "0", "apitoken": "tok"}, None)]
+
+
+def test_httpx_request_logging_is_off():
+    """The request URL carries the API key; httpx must not log it at INFO."""
+    import logging
+
+    from prtg_mcp import client  # noqa: F401  (the import sets the level)
+
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING

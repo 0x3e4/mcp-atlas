@@ -5,6 +5,18 @@ All notable changes to prtg-mcp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-11-10
+
+### Fixed
+
+- Every call failed against PRTG 26.x: the API key was sent as `Authorization: Bearer` in addition to
+  the `apitoken` query parameter, and PRTG 26.x answers 401 to any request with that header. The key
+  now goes only in the query string; username + passhash is unchanged.
+- `server_status` called `getstatus.json`, which does not exist on PRTG 26.x (404); it reads
+  `status.json?id=0` now (same fields as `getstatus.htm`).
+- The API key (or passhash) no longer ends up in the container log: httpx logged every request URL,
+  query string included, at INFO; its logger is set to WARNING.
+
 ## [1.0.1] - 2026-11-09
 
 ### Changed
