@@ -1,0 +1,29 @@
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "audiocodes-sbc-mcp"
+version = "1.0.0"
+description = "AudioCodes Mediant SBC (device REST API) MCP server — status, alarms, KPIs, configuration, TLS; opt-in config changes, test calls and resets"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{ name = "cai", email = "cai@nohub.lol" }]
+keywords = ["mcp", "audiocodes", "mediant", "sbc", "voip", "sip"]
+dependencies = [
+    "mcp[cli]>=2.3,<3",
+    "httpx>=0.28",
+]
+
+[project.scripts]
+audiocodes-sbc-mcp = "audiocodes_sbc_mcp.server:main"
+
+[tool.poetry]
+packages = [{ include = "audiocodes_sbc_mcp", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

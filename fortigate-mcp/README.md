@@ -2,14 +2,16 @@
 
 A **lightweight** [MCP](https://modelcontextprotocol.io) server that connects a local agent (e.g.
 Claude Code) to a **FortiGate** firewall through the **FortiOS REST API**. Ask about your firewall in
-natural language — policies and their hit counters, address/service objects, VIPs, interfaces,
-routing, IPsec VPN status, HA, and system/license health — and, opt-in, **create/update address
-objects, add/remove address-group members, and enable/disable firewall policies**.
+natural language — policies and their hit counters, which policy a flow hits, address/service
+objects and every other common config table, VIPs, interfaces, routing, IPsec / SSL-VPN, SD-WAN
+health, sessions, logs, the configuration as CLI text, HA and system/license health — and, opt-in,
+**create, change and delete objects and policies**, place policies, and ban IPs.
 
 - One shared `httpx.AsyncClient`; static **API-token** auth (`Authorization: Bearer …`), no session.
 - **stdio** transport by default (for Claude Code); optional **streamable-http** mode.
-- **Read-only by default** — GET against the `cmdb` (config) and `monitor` (live) trees; write tools
-  are **opt-in** behind `FORTIGATE_ALLOW_WRITE` (see below).
+- **Read-only by default** — GET against the `cmdb` (config), `monitor` (live) and `log` trees;
+  write tools are **opt-in** behind `FORTIGATE_ALLOW_WRITE`, deletes and user actions each behind a
+  switch of their own (see below). Secrets (`ENC …` values, passwords, PSKs, private keys) are masked.
 - A raw escape-hatch tool (`fortios_get`) so any FortiOS resource stays reachable.
 
 ## Tools
@@ -19,6 +21,9 @@ objects, add/remove address-group members, and enable/disable firewall policies*
 | `list_policies(policyid?, ipv6?, vdom?, limit?, full?)` | Firewall policies + action/state (cmdb firewall/policy). |
 | `list_addresses(name?, groups?, vdom?, limit?, full?)` | Address objects, or address groups with `groups=true`. |
 | `list_services(name?, groups?, vdom?, limit?, full?)` | Custom services, or service groups with `groups=true`. |
+| `list_kinds()` | The config tables the generic object tools cover (address, address6, groups, services, VIPs, IP pools, schedules, policies, local-in policies, static / policy routes, zones, interfaces, DHCP servers, users and user groups, IPsec phase 1/2, SSL-VPN portals, shapers, security profiles). |
+| `list_objects(kind, filter?, vdom?, limit?, full?)` | List any of those tables, optionally filtered (`name=@web`). |
+| `get_object(kind, name, vdom?)` | One object with all attributes and its reference count (`q_ref`). |
 | `list_vips(name?, vdom?, limit?, full?)` | Virtual IPs / destination-NAT objects. |
 | `list_interfaces(name?, vdom?, limit?, full?)` | Interface **configuration** (IP, allowaccess, status). |
 | `list_static_routes(vdom?, limit?, full?)` | Configured IPv4 static routes. |
@@ -29,6 +34,12 @@ objects, add/remove address-group members, and enable/disable firewall policies*
 | `policy_stats(policyid?, ipv6?, vdom?, limit?, full?)` | Live per-policy hit counters, bytes, sessions. |
 | `vpn_status(name?, vdom?, limit?, full?)` | Live IPsec tunnel status + traffic (per-phase2 up/down). |
 | `routing_table(ipv6?, vdom?, limit?, full?)` | Live routing table / RIB (capped). |
+| `policy_lookup(srcintf, source_ip, dest, protocol?, dest_port?, source_port?, ipv6?, vdom?)` | Which policy a flow would hit — "may X reach Y on port Z?". |
+| `route_lookup(destination, ipv6?, vdom?)` | Which route / interface traffic to a destination takes. |
+| `list_sessions(source?, destination?, dest_port?, protocol?, policy_id?, srcintf?, dstintf?, count?, full?, vdom?)` | Current sessions, filtered and capped. |
+| `live_table(topic, vdom?, limit?)` | Live tables: `arp`, `dhcp_leases`, `fqdn_addresses`, `sdwan_health`, `ssl_vpn_sessions`, `firewall_users`, `banned_ips`, `fortiguard`, `certificates`, `managed_switches`, `managed_aps`, `ha_checksums`, `license`. |
+| `search_logs(log_type?, subtype?, filter?, source?, rows?, vdom?)` | Search traffic / event / UTM logs on disk, in memory, FortiAnalyzer or FortiCloud. |
+| `config_backup(section?, scope?, vdom?, max_chars?)` | The configuration as CLI text, whole or one block (`firewall policy`), secrets masked. |
 | `fortios_get(tree, path, vdom?, filter?, count?, start?)` | Escape hatch: raw read-only GET against any resource. |
 
 Results are trimmed to the useful fields by default; pass `full=true` for raw objects, and list
@@ -49,8 +60,20 @@ every tool takes `vdom` like the read tools. FortiOS errors come back with their
 | `add_to_address_group(group, members, vdom?)` | Add existing addresses/groups to an address group, keeping the current members. |
 | `remove_from_address_group(group, members, vdom?)` | Take members out of an address group, keeping the others (never empties a group; the objects stay). |
 | `set_policy_status(policy_id, enabled, comment?, vdom?)` | Enable or disable a firewall policy. `comment` **replaces** the policy's comments. |
+| `create_policy(name, srcintf, dstintf, srcaddr, dstaddr, service, action?, schedule?, nat?, logtraffic?, enabled?, comments?, extra?, before?, after?, vdom?)` | Create a firewall policy and place it before / after another (default: at the end). |
+| `move_policy(policy_id, before? \| after?, vdom?)` | Change a policy's position (policies match top-down). |
+| `add_object(kind, data, vdom?)` | Create an object in any covered table; lists of names become FortiOS tables. |
+| `update_object(kind, name, data, vdom?)` | Change attributes; the preview shows each old → new value and the code is tied to the current values. Table attributes are replaced whole. |
 
-There are no delete tools and no raw write escape hatch.
+Further writes need **a second switch** on top of `FORTIGATE_ALLOW_WRITE` (both default `false`,
+read per instance env file, so per user):
+
+| Switch | Tools |
+|---|---|
+| `FORTIGATE_ALLOW_DELETE` | `delete_object(kind, name, vdom?)` — **always confirmed**, even with `FORTIGATE_CONFIRM_WRITE=false`; the preview shows how often the object is referenced (FortiOS refuses to delete a referenced object). |
+| `FORTIGATE_ALLOW_USER_ACTIONS` | `ban_ips(ips, expiry_seconds?)`, `unban_ips(ips? \| all?)` (quarantine), `deauth_users(ips? \| all?)` (log out authenticated firewall users). |
+
+There is no raw write escape hatch, no reboot and no configuration restore.
 
 **Confirmation before every write** (`FORTIGATE_CONFIRM_WRITE`, default `true`): a write tool's first
 call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
@@ -66,8 +89,10 @@ In FortiOS: **System → Administrators → Create New → REST API Admin**.
    (e.g. *Firewall*, *System*, *Network*, *Log & Report*) — read is enough for every read tool.
    For the **write** tools (`FORTIGATE_ALLOW_WRITE=true`) the profile needs **Read/Write** on
    *Firewall* (at least *Address* and *Policy*; `fwgrp` with `address`/`policy` set to `read-write`
-   under custom permissions) instead of read-only. Prefer a separate write admin + token over
-   upgrading the read-only one.
+   under custom permissions) instead of read-only — plus *Network* / *VPN* / *User* / *Security
+   Profile* for writes to those tables, and *User & Device* for the user actions. `config_backup`
+   needs permission to back up the configuration (*System*). Prefer a separate write admin + token
+   over upgrading the read-only one.
 2. Assign that profile to the REST API admin, set a **Trusted Host** to the IP the server runs from,
    and create the admin. FortiOS shows the **API token once** — copy it; it's `FORTIGATE_API_TOKEN`.
 
@@ -233,6 +258,10 @@ In Claude Code, run `/mcp` to confirm the `fortigate` server connected, then ask
 - "Show the live hit counters for policy 12."
 - "Are all IPsec tunnels up?"
 - "What's the HA sync status and current CPU/memory?"
+- "Is 10.0.0.5 on port1 allowed to reach 203.0.113.10 on 443? Which policy matches?"
+- "Show denied traffic from 10.0.0.5 in the last log lines."
+- "Is the SD-WAN health check for the ISP links OK?"
+- "Show me the `firewall vip` config block."
 
 With `FORTIGATE_ALLOW_WRITE=true` you can also:
 
@@ -240,15 +269,24 @@ With `FORTIGATE_ALLOW_WRITE=true` you can also:
 - "Change the address app-fqdn to point at app.test.corp."
 - "Remove srv-old from the grp-web address group."
 - "Disable policy 12 with the comment 'paused for change CHG-1', and re-enable it afterwards."
+- "Create a policy web-in from wan1 to dmz for vip-web on HTTPS and put it before policy 3."
+- "Create a zone dmz with port3 and port4."
+- "Delete the address srv-old." (with `FORTIGATE_ALLOW_DELETE=true`)
+- "Ban 203.0.113.66 for an hour." (with `FORTIGATE_ALLOW_USER_ACTIONS=true`)
 
 ## Notes & scope
 
 - **Writes are opt-in.** Reads are always available; the write tools refuse unless
   `FORTIGATE_ALLOW_WRITE=true` and the REST API admin has a read-write Firewall profile. Leave the
-  flag unset (and keep a read-only profile) for a read-only server. The writes are reversible
-  (re-enable a policy, re-add a member, set the old address value); there are no delete tools.
+  flag unset (and keep a read-only profile) for a read-only server. Deletes need
+  `FORTIGATE_ALLOW_DELETE` and always ask first; banning IPs / logging out users needs
+  `FORTIGATE_ALLOW_USER_ACTIONS`.
 - **VDOMs** — multi-VDOM boxes scope most objects per VDOM; set `FORTIGATE_VDOM` or pass `vdom` per
   tool. Global resources (system status, license, HA) ignore it.
-- **Secrets are never returned** by FortiOS (e.g. IPsec `preshared-key`), so they can't leak here.
-- **`monitor/firewall/session`** can return tens of thousands of rows — it's intentionally not a
-  curated tool. Reach it via `fortios_get("monitor", "firewall/session", filter=..., count=...)`.
+- **Secrets are masked**: FortiOS returns secrets only as `ENC …` blobs, and this server masks those,
+  password / PSK attributes and private keys in every result (including `fortios_get` and
+  `config_backup`).
+- **Sessions** can number tens of thousands — `list_sessions` always filters and caps (`count`).
+- **IPv6 policies:** FortiOS 7.x keeps IPv4 and IPv6 rules together in `firewall/policy`
+  (`srcaddr6` / `dstaddr6`); `list_policies(ipv6=true)` reads the separate `firewall/policy6` table
+  of FortiOS 6.x.

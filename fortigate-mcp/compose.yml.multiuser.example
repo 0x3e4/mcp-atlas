@@ -8,6 +8,8 @@
 #   mcpjungle register --name fortigate --url http://fortigate-mcp:8000/mcp
 #   mcpjungle register --name fortigate-instance-a --url http://fortigate-mcp-instance-a:8000/mcp
 # Writes still ask for confirmation first unless FORTIGATE_CONFIRM_WRITE=false in that instance's env file.
+# Deletes (FORTIGATE_ALLOW_DELETE) and user actions (FORTIGATE_ALLOW_USER_ACTIONS) are separate switches per
+# instance, on top of FORTIGATE_ALLOW_WRITE; deletes always ask for confirmation.
 # Images are built and pushed to GHCR by .github/workflows/build.yml.
 # (No GHCR? Replace the image: line with "build: ." to build from this folder instead.)
 

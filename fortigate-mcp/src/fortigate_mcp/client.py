@@ -67,20 +67,41 @@ class FortiClient:
         ``tree`` is ``cmdb`` (configuration) or ``monitor`` (live status). The configured VDOM is
         applied unless ``vdom`` overrides it.
         """
-        if tree not in ("cmdb", "monitor"):
-            raise ValueError(f"tree must be 'cmdb' or 'monitor'; got {tree!r}.")
+        if tree not in ("cmdb", "monitor", "log"):
+            raise ValueError(f"tree must be 'cmdb', 'monitor' or 'log'; got {tree!r}.")
         url = f"{self._settings.api_base}/{tree}/{path.lstrip('/')}"
         return await self._request("GET", url, vdom=vdom, params=params)
+
+    async def get_text(
+        self, tree: str, path: str, *, vdom: str | None = None, params: dict[str, Any] | None = None
+    ) -> str:
+        """GET a resource that answers with a file instead of JSON (e.g. monitor system/config/backup)."""
+        url = f"{self._settings.api_base}/{tree}/{path.lstrip('/')}"
+        resp = await self._send("GET", url, vdom=vdom, params=params)
+        return resp.text
 
     async def post(self, path: str, *, json: Any, vdom: str | None = None) -> dict[str, Any]:
         """POST ``json`` to a cmdb table (write: create an object)."""
         url = f"{self._settings.api_base}/cmdb/{path.lstrip('/')}"
         return await self._request("POST", url, vdom=vdom, json=json)
 
-    async def put(self, path: str, *, json: Any, vdom: str | None = None) -> dict[str, Any]:
-        """PUT ``json`` to a cmdb object (write: only the given attributes change)."""
+    async def put(
+        self, path: str, *, json: Any, vdom: str | None = None, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """PUT ``json`` to a cmdb object (write: only the given attributes change; ``params`` for
+        ?action=move&before=/after=)."""
         url = f"{self._settings.api_base}/cmdb/{path.lstrip('/')}"
-        return await self._request("PUT", url, vdom=vdom, json=json)
+        return await self._request("PUT", url, vdom=vdom, json=json, params=params)
+
+    async def delete(self, path: str, *, vdom: str | None = None) -> dict[str, Any]:
+        """DELETE a cmdb object (gated at the tool layer by FORTIGATE_ALLOW_DELETE)."""
+        url = f"{self._settings.api_base}/cmdb/{path.lstrip('/')}"
+        return await self._request("DELETE", url, vdom=vdom)
+
+    async def monitor_post(self, path: str, *, json: Any = None, vdom: str | None = None) -> dict[str, Any]:
+        """POST a monitor action (e.g. user/banned/add_users); parameters go in the JSON body."""
+        url = f"{self._settings.api_base}/monitor/{path.lstrip('/')}"
+        return await self._request("POST", url, vdom=vdom, json=json if json is not None else {})
 
     async def get_raw(
         self, path: str, *, vdom: str | None = None, params: dict[str, Any] | None = None
@@ -108,6 +129,25 @@ class FortiClient:
         params: dict[str, Any] | None = None,
         json: Any = None,
     ) -> dict[str, Any]:
+        resp = await self._send(method, url, vdom=vdom, params=params, json=json)
+        env = _try_json(resp)
+        if isinstance(env, dict) and env.get("status") == "error":
+            raise FortiError(
+                _format_error(resp.status_code, env, resp),
+                status=resp.status_code,
+                fos_message=str(env.get("message", "")),
+            )
+        return env if isinstance(env, dict) else {"results": env}
+
+    async def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        vdom: str | None = None,
+        params: dict[str, Any] | None = None,
+        json: Any = None,
+    ) -> httpx.Response:
         q: dict[str, Any] = dict(params or {})
         effective_vdom = self._settings.vdom if vdom is None else vdom
         if effective_vdom:
@@ -118,16 +158,14 @@ class FortiClient:
             resp = await client.request(method, url, params=q, json=json, headers=self._auth_headers())
         except httpx.HTTPError as exc:
             raise FortiError(f"Network error calling FortiGate {url}: {exc}") from exc
-
-        env = _try_json(resp)
-        status = resp.status_code
-        if status >= 400 or (isinstance(env, dict) and env.get("status") == "error"):
+        if resp.status_code >= 400:
+            env = _try_json(resp)
             raise FortiError(
-                _format_error(status, env, resp),
-                status=status,
+                _format_error(resp.status_code, env, resp),
+                status=resp.status_code,
                 fos_message=(env.get("message", "") if isinstance(env, dict) else ""),
             )
-        return env if isinstance(env, dict) else {"results": env}
+        return resp
 
 
 def _try_json(resp: httpx.Response) -> dict[str, Any]:

@@ -21,6 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         server:
+          - audiocodes-sbc-mcp
           - azure-devops-mcp
           - bookstack-mcp
           - defender-mcp

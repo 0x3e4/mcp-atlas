@@ -1,0 +1,44 @@
+# Several instances of audiocodes-sbc-mcp from one image, each with its own env file — e.g. a shared
+# read-only instance next to a write-enabled one with another device user. Copy and customize locally:
+#   cp compose.yml.multiuser.example compose.yml      # compose.yml is gitignored (per-deployment)
+#   mkdir -p env && cp .env.example env/instance_a.env # instance a: its device user + AUDIOCODES_ALLOW_WRITE=true
+#   docker network create atlas-net                    # once; shared by the gateway + every server
+#   docker compose pull && docker compose up -d
+# Register each instance with the gateway under its own name:
+#   mcpjungle register --name audiocodes-sbc --url http://audiocodes-sbc-mcp:8000/mcp
+#   mcpjungle register --name audiocodes-sbc-instance-a --url http://audiocodes-sbc-mcp-instance-a:8000/mcp
+# Writes still ask for confirmation first unless AUDIOCODES_CONFIRM_WRITE=false in that instance's env file.
+# Resets / full config replace / firmware (AUDIOCODES_ALLOW_RESET), TLS changes (AUDIOCODES_ALLOW_TLS) and
+# license installs (AUDIOCODES_ALLOW_LICENSE) are separate switches per instance, on top of
+# AUDIOCODES_ALLOW_WRITE; resets, firmware, key generation and licenses always ask for confirmation.
+# One container per SBC (or HA pair): give each its own env file with that device's URL and user.
+# Images are built and pushed to GHCR by .github/workflows/build.yml.
+# (No GHCR? Replace the image: line with "build: ." to build from this folder instead.)
+
+# Shared settings. Compose ignores top-level x- keys; "<<:" merges shallowly, so an instance that sets
+# its own environment: replaces this whole block — keep per-instance settings in its env file.
+x-audiocodes: &audiocodes
+  image: ghcr.io/0x3e4/audiocodes-sbc-mcp:latest
+  environment:
+    MCP_TRANSPORT: streamable-http
+    MCP_HOST: 0.0.0.0           # bind all interfaces (required for the gateway to reach it)
+    MCP_PORT: "8000"            # every container listens on 8000 in its own namespace — no clash
+  restart: unless-stopped
+  networks: [atlas-net]         # no ports: — only the gateway reaches them, by container_name
+
+services:
+  audiocodes-sbc-mcp:                    # existing shared read-only instance (AUDIOCODES_ALLOW_WRITE unset/false)
+    <<: *audiocodes
+    container_name: audiocodes-sbc-mcp
+    env_file: ./audiocodes.env
+
+  audiocodes-sbc-mcp-instance-a:         # write access with instance a's device user (AUDIOCODES_ALLOW_WRITE=true)
+    <<: *audiocodes
+    container_name: audiocodes-sbc-mcp-instance-a
+    env_file: ./env/instance_a.env
+
+  # Add more instances the same way: a new service name + container_name + env file.
+
+networks:
+  atlas-net:
+    external: true

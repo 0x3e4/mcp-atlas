@@ -5,6 +5,36 @@ All notable changes to fortigate-mcp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-16
+
+### Added
+
+- Generic object tools over 30 config tables (`list_kinds`): `list_objects`, `get_object` (with the
+  reference count), `add_object`, `update_object` (preview shows old → new; code tied to the current
+  values) and `delete_object`.
+- `delete_object` behind the new `FORTIGATE_ALLOW_DELETE` switch (on top of `FORTIGATE_ALLOW_WRITE`,
+  per instance); it always asks for confirmation, even with `FORTIGATE_CONFIRM_WRITE=false`, and
+  shows how often the object is referenced.
+- Policies: `create_policy` (with placement), `move_policy`, `policy_lookup` (which policy a flow hits),
+  `route_lookup`.
+- Operations: `list_sessions`, `live_table` (ARP, DHCP leases, FQDN resolution, SD-WAN health,
+  SSL-VPN sessions, firewall users, banned IPs, FortiGuard, certificates, FortiSwitch, FortiAP, HA
+  checksums, license), `search_logs`, `config_backup` (CLI text, whole or one block).
+- `ban_ips`, `unban_ips`, `deauth_users` behind the new `FORTIGATE_ALLOW_USER_ACTIONS` switch.
+- Secrets (`ENC …` values, password / PSK attributes, private keys) are masked in every result.
+
+### Changed
+
+- Dependencies moved to the newest releases that are at least 7 days old: click 8.5.1, pydantic
+  2.14.3, pydantic-core 2.50.4, sse-starlette 3.7.0, typer 0.28.0, typing-inspection 0.4.5.
+
+### Fixed
+
+- `list_services` read `firewall/service/custom` and `firewall/service/group`, which FortiOS doesn't
+  have; it reads `firewall.service/custom` and `firewall.service/group` now.
+- `list_policies(ipv6=true)` read the non-existent `firewall/ipv6policy`; it reads `firewall/policy6`
+  (FortiOS 6.x). `policy_stats(ipv6=true)` asks `firewall/policy` with `ip_version=ipv6`.
+
 ## [1.0.1] - 2026-11-09
 
 ### Changed
