@@ -1,0 +1,29 @@
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "netscaler-console-mcp"
+version = "1.0.0"
+description = "NetScaler Console (formerly ADM) MCP server — instances, applications, events, syslog, WAF / security analytics, SSL, config audit, per-ADC troubleshooting through the Console"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{ name = "cai", email = "cai@nohub.lol" }]
+keywords = ["mcp", "netscaler", "netscaler-console", "adm", "citrix", "waf", "nitro"]
+dependencies = [
+    "mcp[cli]>=2.3,<3",
+    "httpx>=0.28",
+]
+
+[project.scripts]
+netscaler-console-mcp = "netscaler_console_mcp.server:main"
+
+[tool.poetry]
+packages = [{ include = "netscaler_console_mcp", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

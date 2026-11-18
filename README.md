@@ -1,8 +1,9 @@
 # mcp-atlas
 
-A collection of complete, drop-in [MCP](https://modelcontextprotocol.io) servers that connect a
-local agent (e.g. [Claude Code](https://docs.claude.com/en/docs/claude-code)) to security and ops
-systems. Each server is **self-contained** — its own source, tests, Dockerfile and README — and is
+A collection of complete, drop-in [MCP](https://modelcontextprotocol.io) servers that connect AI
+agents to security and ops systems — any MCP client: [Claude Code](https://docs.claude.com/en/docs/claude-code),
+VS Code / Copilot, an MCP gateway such as [mcpjungle](https://github.com/mcpjungle/MCPJungle), OpenAI, or
+your own model on Ollama, vLLM or LM Studio (see [Using with other clients & gateways](#using-with-other-clients--gateways)). Each server is **self-contained** — its own source, tests, Dockerfile and README — and is
 **read-only** by default: ask about your data in natural language, nothing writes back unless you
 switch on its write tools (see [Write tools & confirmation](#write-tools--confirmation)).
 
@@ -13,6 +14,7 @@ switch on its write tools (see [Write tools & confirmation](#write-tools--confir
 | [defender-mcp](defender-mcp/) | Query **Microsoft Defender XDR** via the Microsoft Graph security API — advanced hunting (KQL), incidents, alerts, devices and vulnerabilities, plus raw `graph_get` / `graph_hunt` escape hatches. Case management (Graph beta). Optional **write** tools (update incidents/alerts/cases, comments, case tasks) behind `DEFENDER_ALLOW_WRITE`; can act as the signed-in analyst (`DEFENDER_AUTH=delegated`). |
 | [wazuh-mcp](wazuh-mcp/) | Query a **Wazuh** deployment — alerts, the full event **archive** (every collected event, not just rule hits), vulnerabilities, agents, inventory, rules, SCA and manager status, across the Indexer and Manager APIs. Optional **write** tools (restart agents, assign/unassign agent groups, run active response) behind `WAZUH_ALLOW_WRITE`. |
 | [netscaler-mcp](netscaler-mcp/) | Query one or more **NetScaler ADC** appliances (or HA pairs) over the **NITRO REST API** — LB/CS/GSLB vservers + state, services and servers, SSL cert expiry, **GSLB** services/sites, **DNS** records/zones/nameservers, **WAF (AppFw)** and **Bot** profiles/policies + hit stats, HA status, and box CPU/memory/throughput, a per-object view with everything bound to it (e.g. a CS vserver's policies in priority order with their targets), a CS → LB → backend diagnosis, plus a raw `nitro_get` escape hatch. Several appliances that don't sync (standalone boxes, GSLB peers) can sit behind one server (`NETSCALER_INSTANCES`): every tool takes `instance`, reads also take `'all'`, and `compare_instances` diffs their GSLB (or any) configuration. **WAF and Bot rollout** tools cover learned rules, a URL inventory, per-check violation counters, bot detections and entries, signature currency, the enforcement path (which policy applies a profile) and the recent violation log lines, plus JSON export/import of profiles. Optional **write** tools (create/change/enable/disable/delete LB and CS vservers, services, service groups, servers, CS policies/actions, monitors, SSL certificates (upload to `/nsconfig/ssl`), profiles and SNI bindings, rewrite/responder policies, pattern sets, GSLB and DNS records and bind them together; clone an app for a new hostname; one batch on several appliances with one confirmation; easy global WAF rules, deploy learned rules, learn→block, bot allow/deny lists and rate limits, signature re-fetch, import/rehost profiles across environments) sit behind `NETSCALER_ALLOW_WRITE`. |
+| [netscaler-console-mcp](netscaler-console-mcp/) | Analyse and troubleshoot every NetScaler through **NetScaler Console** (formerly ADM, on-prem or service) — instances and their health, applications with health score / response time / errors, performance reports, events, collected syslog, SSL expiry, config audit (unsaved changes, drift), config jobs, licensing; **WAF**: Security Insight violations, single blocked requests parsed from the APPFW syslog, learned relaxation rules, per-profile check counters; per-ADC live diagnosis through the Console's API proxy (`vserver_diagnose`: what is DOWN behind a vserver, running config by app). Optional **write** tools (clear events, re-poll inventories) behind `NETSCALER_CONSOLE_ALLOW_WRITE`; enabling / disabling services, members and vservers behind `NETSCALER_CONSOLE_ALLOW_INSTANCE_WRITE`. |
 | [fortigate-mcp](fortigate-mcp/) | Query a **FortiGate** firewall over the **FortiOS REST API** — firewall policies (with live hit counters and policy lookup), objects across 30 config tables, VIPs, interfaces, routing, IPsec / SSL-VPN, SD-WAN health, sessions, logs, the config as CLI text, HA and system/license health, plus a raw `fortios_get` escape hatch. Optional **write** tools (objects and policies: create, change, place) behind `FORTIGATE_ALLOW_WRITE`; deletes behind `FORTIGATE_ALLOW_DELETE`, IP bans behind `FORTIGATE_ALLOW_USER_ACTIONS`. |
 | [audiocodes-sbc-mcp](audiocodes-sbc-mcp/) | Query an **AudioCodes Mediant SBC** over its device REST API — status and HA, active / historic alarms, call statistics and other KPIs, the configuration as CLI script or INI (secrets masked, filterable), live CLI `show` output, TLS certificates with expiry, the license, SIP test calls, plus a raw `sbc_get` escape hatch. Optional **write** tools (incremental CLI / INI configuration changes, save, test calls, SIP recording, CSRs) behind `AUDIOCODES_ALLOW_WRITE`; reset / configuration replace / firmware, TLS identity changes and license installs each need a switch of their own. |
 | [azure-devops-mcp](azure-devops-mcp/) | Query an on-prem **Azure DevOps Server** (formerly TFS) over its REST API — projects, teams, Git repos (files, commits, diffs, branches, tags), pull requests (threads, files, votes), work items (WIQL, links, history, sprints), builds with failed-task logs, releases, the wiki and search, plus a raw `azdo_get` escape hatch. Optional **write** tools behind `AZDO_ALLOW_WRITE` (work items of any type with links and attachments, wiki pages, pull requests, branches); pushes, merges, votes, pipelines, releases and deletes each need a switch of their own. |
@@ -35,7 +37,9 @@ claude mcp add <server> -- docker run -i --rm --env-file ./<server>.env <server>
 ```
 
 Then run `/mcp` in Claude Code to confirm the server connected, and ask away. Every server also
-supports an always-on `streamable-http` mode via `docker compose up -d` (see each README).
+supports an always-on `streamable-http` mode via `docker compose up -d` (see each README), which is
+what gateways, chat UIs and your own LLM connect to — see
+[Using with other clients & gateways](#using-with-other-clients--gateways).
 
 ## Write tools & confirmation
 
@@ -63,7 +67,8 @@ Run a read-only and a write-enabled instance side by side if you want both (see 
 
 ## Using with other clients & gateways
 
-Each server speaks plain MCP over two transports, so it works with any MCP client:
+The servers are not tied to Claude: each speaks plain MCP over two transports, so it works with any
+MCP client — desktop agents, gateways, chat UIs, OpenAI, or your own model:
 
 - **stdio** (default) — the client launches `docker run -i …` per session. Best for local clients
   (Claude Code, VS Code/Copilot, Cursor, …).
@@ -108,6 +113,16 @@ For example, register the gateway with Claude Code:
 ```bash
 claude mcp add --transport http atlas-gateway http://<gateway-host>:8080/mcp
 ```
+
+Good to know behind a gateway:
+
+- **Tool names are namespaced** by the gateway (mcpjungle: `<server>__<tool>`, e.g.
+  `netbox__list_devices`), so several servers with similar tools don't clash.
+- **Expose subsets.** Give each audience (or each local model) only the servers / tools it needs, e.g.
+  with the gateway's tool groups or by registering a read-only instance only.
+- **Confirm codes pass through unchanged**: a write still returns its preview and only runs when the
+  client repeats it with `confirm=<code>`.
+- **Protect the gateway** (its auth / an internal network): it holds the way into every system.
 
 ### Several instances of one server
 
@@ -158,6 +173,64 @@ resp = client.responses.create(
 )
 print(resp.output_text)
 ```
+
+### Your own LLM (Ollama, vLLM, LM Studio, llama.cpp …)
+
+A model server only generates text; it needs an **MCP client** in between that lists the tools, hands
+them to the model as function definitions, runs the calls and feeds the results back. Three ways:
+
+**1. The bridge script in this repo** — [`examples/llm_bridge.py`](examples/llm_bridge.py) connects any
+OpenAI-compatible endpoint to one server or the gateway, as an interactive chat. It only lets a write
+through with its confirm code after *you* said yes in the chat, so a model can't confirm its own writes.
+
+```bash
+pip install "mcp>=2.3,<3" httpx
+
+# Ollama: a tool-capable model (qwen2.5, llama3.1, mistral-nemo …) and enough context for tool lists
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve &
+ollama pull qwen2.5:14b
+python examples/llm_bridge.py --mcp http://gateway.example.com:8080/mcp \
+    --llm http://localhost:11434/v1 --model qwen2.5:14b
+
+# vLLM: tool calling must be switched on, with the parser that fits the model
+vllm serve Qwen/Qwen2.5-32B-Instruct --enable-auto-tool-choice --tool-call-parser hermes
+#   (Llama 3.1/3.3: --tool-call-parser llama3_json; Mistral: --tool-call-parser mistral)
+python examples/llm_bridge.py --mcp http://netbox-mcp:8000/mcp \
+    --llm http://vllm-host:8000/v1 --model Qwen/Qwen2.5-32B-Instruct
+
+# one server over stdio, only a few tools, see what the model gets
+python examples/llm_bridge.py --stdio "docker run -i --rm --env-file ./netbox.env netbox-mcp" \
+    --only list_devices,get_device --list-tools
+```
+
+`--mcp-token` sends a bearer token to a protected gateway; `--api-key` one to the model server.
+
+**2. A chat UI with MCP support.** Point it at a server's or the gateway's `/mcp` URL (streamable
+HTTP). Examples:
+
+- **Open WebUI**: add the URL under *Settings → Tools* (newer releases speak MCP directly), or put
+  [mcpo](https://github.com/open-webui/mcpo) in front, which turns MCP tools into an OpenAPI tool
+  server: `uvx mcpo --port 8001 --server-type streamable-http -- http://gateway.example.com:8080/mcp`.
+- **LibreChat** (`librechat.yaml`):
+
+  ```yaml
+  mcpServers:
+    atlas:
+      type: streamable-http
+      url: http://gateway.example.com:8080/mcp
+  ```
+
+**3. Your own code.** The official MCP SDKs (Python, TypeScript, …) give you `list_tools` / `call_tool`.
+The bridge script (about 150 lines) shows the whole loop.
+
+Tips for local models:
+
+- **Fewer tools work better.** A gateway with every server exposes hundreds of tools, too many for most
+  local models. Offer only what you need (`--only`, one server per chat, or a gateway tool group).
+- **Use tool-trained models** and enough context: tool definitions alone can take 10–30k tokens. Raise
+  Ollama's default context (`OLLAMA_CONTEXT_LENGTH`, or `num_ctx` in a Modelfile).
+- **Keep writes behind confirmation.** Leave `<PREFIX>_CONFIRM_WRITE` on and the sensitive switches
+  off for instances a local model uses.
 
 > Expose these only on trusted networks (or put auth on the gateway): they carry credentials to your
 > infrastructure. Keep `*_ALLOW_WRITE` off — and `require_approval` on — unless you intend writes.

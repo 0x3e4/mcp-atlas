@@ -27,6 +27,7 @@ jobs:
           - defender-mcp
           - fortigate-mcp
           - netbox-mcp
+          - netscaler-console-mcp
           - netscaler-mcp
           - prtg-mcp
           - snipeit-mcp
