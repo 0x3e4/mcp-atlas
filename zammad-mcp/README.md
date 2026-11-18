@@ -44,7 +44,7 @@ clear message). The token also needs **agent** (`ticket.agent`) permission.
 | `create_ticket(title, group, customer, body, internal?, state?, priority?, html?)` | Create a ticket with an initial note. `customer` is an email or user id (prefix an unknown email with `guess:`). |
 | `tag_ticket(ticket_id, add?, remove?)` | Add and/or remove tags; returns the ticket's tags afterwards. |
 | `link_tickets(ticket_id, add?, link_type='normal'\|'parent'\|'child', remove?)` | Link related tickets (Zammad's *Linked objects*), or remove links. Tickets as ids (`123`) or numbers (`'#20261020001'`). A ticket already linked with another type is re-linked; already-linked ones are skipped. Returns the links afterwards. |
-| `reply_email(ticket_id, body, recipients='customer'\|'all', article_id?, cc?, subject?, html?)` | **Sends a real email** through the group's email channel, threaded to the last email (or `article_id`). `customer` writes only to the ticket's customer; `all` works like *Reply all* on that email (sender, To, Cc — minus Zammad's own addresses and yours). The preview shows the resolved To/Cc/subject. Zammad adds `RE:` and the ticket number; it does not add the group signature for API articles. |
+| `reply_email(ticket_id, body, recipients='customer'\|'all', article_id?, cc?, subject?, html?)` | **Sends a real email** through the group's email channel, threaded to the last email (or `article_id`). `customer` writes only to the ticket's customer; `all` works like *Reply all* on that email (sender, To, Cc — minus Zammad's own addresses and yours). The preview shows the resolved To/Cc/subject. Zammad adds `RE:` and the ticket number; it does not add the group signature for API articles. With `ZAMMAD_EMAIL_CC_DOMAINS` set, extra `cc` addresses are only allowed to those domains (against mails to outsiders). |
 
 **Confirmation before every write** (`ZAMMAD_CONFIRM_WRITE`, default `true`): a write tool's first
 call changes nothing and returns a preview with a `confirm_code`. The agent shows you a short overview
@@ -214,6 +214,16 @@ With `ZAMMAD_ALLOW_WRITE=true` you can also:
 - "Reply to the customer on ticket 4521 by email: the VPN is fixed, please retry."
 - "Reply all on ticket 4521's last email and say we'll patch tonight."
 - "Create a ticket in group Support for alice@example.com titled 'Laptop won't boot'."
+
+## Security & hardening
+
+This server uses the shared mcp-atlas guard (see the [repo README → Security](../README.md#security)):
+writes are confirmed in the client's own dialog where the client supports it (`MCP_CONFIRM_MODE`), every
+tool carries read-only / destructive hints, text other people wrote comes back marked as
+`<untrusted>`, secrets are masked, writes that would carry secrets out are refused, and every write is
+audited (stderr, GELF `MCP_AUDIT_GELF`, syslog `MCP_AUDIT_SYSLOG`). In HTTP mode set `MCP_AUTH_TOKEN` and
+`MCP_ALLOWED_HOSTS`; the compose examples already run the container read-only and without capabilities.
+The variables are in [`.env.example`](.env.example).
 
 ## Notes & scope
 

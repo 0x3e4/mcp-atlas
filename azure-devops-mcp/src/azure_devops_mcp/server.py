@@ -34,10 +34,10 @@ from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from mcp.server.mcpserver import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
 from . import __version__
+from ._atlas_guard import harden, run_http
 from .client import AzdoClient, AzdoError
 from .config import ConfigError, Settings
 
@@ -2109,6 +2109,15 @@ async def azdo_get(
     return data if isinstance(data, dict) else {"value": data}
 
 
+# ---- security guard (shared across mcp-atlas, see _atlas_guard.py) ----------------------------------
+
+GUARD = harden(
+    mcp, server='azure-devops-mcp', version=__version__, errors=(AzdoError,),
+    untrusted_keys={'content', 'text', 'description', 'comment', 'comments', 'System.Description', 'System.History', 'log_tail', 'message', 'highlights', 'title'},
+    destructive={'complete_pull_request', 'deploy_release_stage', 'delete_work_items', 'delete_wiki_page', 'delete_branch'},
+)
+
+
 def main() -> None:
     """Console entry point: load settings, wire transport, and run the server."""
     try:
@@ -2122,13 +2131,8 @@ def main() -> None:
     _client = AzdoClient(settings)
 
     if settings.transport == "streamable-http":
-        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
-        mcp.run(
-            transport="streamable-http",
-            host=settings.host,
-            port=settings.port,
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-        )
+        # streamable HTTP: Host/Origin checks (MCP_ALLOWED_HOSTS) and a bearer token (MCP_AUTH_TOKEN)
+        run_http(mcp, host=settings.host, port=settings.port)
     else:
         mcp.run(transport="stdio")
 

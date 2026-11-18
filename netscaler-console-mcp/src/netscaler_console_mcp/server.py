@@ -27,10 +27,10 @@ from urllib.parse import quote
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from . import __version__
+from ._atlas_guard import harden, run_http
 from .client import ConsoleClient, ConsoleError
 from .config import ConfigError, Settings
 
@@ -827,6 +827,14 @@ async def set_entity_state(
             "note": "Running config changed, not saved on the ADC."}
 
 
+# ---- security guard (shared across mcp-atlas, see _atlas_guard.py) ----------------------------------
+
+GUARD = harden(
+    mcp, server='netscaler-console-mcp', version=__version__, errors=(ConsoleError,),
+    untrusted_keys={'full_message', 'syslog_msg', 'message', 'detail', 'url', 'description'},
+)
+
+
 def main() -> None:
     """Console entry point: load settings, wire transport, and run the server."""
     try:
@@ -838,8 +846,8 @@ def main() -> None:
     global _client
     _client = ConsoleClient(settings)
     if settings.transport == "streamable-http":
-        mcp.run(transport="streamable-http", host=settings.host, port=settings.port,
-                transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
+        # streamable HTTP: Host/Origin checks (MCP_ALLOWED_HOSTS) and a bearer token (MCP_AUTH_TOKEN)
+        run_http(mcp, host=settings.host, port=settings.port)
     else:
         mcp.run(transport="stdio")
 

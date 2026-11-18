@@ -218,10 +218,11 @@ def test_writes_need_a_matching_confirm_code():
     assert sent == ["POST"]
 
 
-def _reply_env_client(handler) -> None:
+def _reply_env_client(handler, **extra: str) -> None:
     env = _base_env()
     env["ZAMMAD_ALLOW_WRITE"] = "true"
     env["ZAMMAD_CONFIRM_WRITE"] = "false"
+    env.update(extra)
     client = server.ZammadClient(Settings.from_env(env))
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     server._client = client
@@ -287,6 +288,18 @@ def test_reply_email_all_drops_zammad_and_own_addresses():
     assert posted[0]["to"] == "bob@customer.test, jane@customer.test"
     assert posted[0]["cc"] == "ops@customer.test"
     assert posted[0]["in_reply_to"] == "<m3@customer.test>"
+
+
+def test_reply_email_extra_cc_only_to_allowed_domains():
+    posted: list = []
+    _reply_env_client(_reply_handler(posted), ZAMMAD_EMAIL_CC_DOMAINS="customer.test; @helpdesk.test")
+    try:
+        with pytest.raises(ValueError, match="not allowed: leak@attacker.example"):
+            asyncio.run(server.reply_email(42, "Fixed.", cc=["lead@customer.test", "leak@attacker.example"]))
+        asyncio.run(server.reply_email(42, "Fixed.", cc=["lead@customer.test"]))
+    finally:
+        server._client = None
+    assert len(posted) == 1 and posted[0]["cc"] == "lead@customer.test"
 
 
 def test_reply_email_all_on_an_agent_email_goes_to_its_recipients():

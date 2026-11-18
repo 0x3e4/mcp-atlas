@@ -21,10 +21,11 @@ import sys
 from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from . import __version__
+from ._atlas_guard import harden, run_http
+from .client import NetBoxError
 from .client import NetBoxClient
 from .config import ConfigError, Settings
 
@@ -487,6 +488,14 @@ async def add_journal_entry(
     return _written(_JOURNAL_FIELDS, await _get_client().post("extras/journal-entries", json=payload))
 
 
+# ---- security guard (shared across mcp-atlas, see _atlas_guard.py) ----------------------------------
+
+GUARD = harden(
+    mcp, server='netbox-mcp', version=__version__, errors=(NetBoxError,),
+    untrusted_keys={'comments'},
+)
+
+
 def main() -> None:
     """Console entry point: load settings, wire transport, and run the server."""
     try:
@@ -499,13 +508,8 @@ def main() -> None:
     _client = NetBoxClient(settings)
 
     if settings.transport == "streamable-http":
-        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
-        mcp.run(
-            transport="streamable-http",
-            host=settings.host,
-            port=settings.port,
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-        )
+        # streamable HTTP: Host/Origin checks (MCP_ALLOWED_HOSTS) and a bearer token (MCP_AUTH_TOKEN)
+        run_http(mcp, host=settings.host, port=settings.port)
     else:
         mcp.run(transport="stdio")
 

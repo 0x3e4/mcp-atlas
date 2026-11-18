@@ -235,6 +235,74 @@ Tips for local models:
 > Expose these only on trusted networks (or put auth on the gateway): they carry credentials to your
 > infrastructure. Keep `*_ALLOW_WRITE` off — and `require_approval` on — unless you intend writes.
 
+## Security
+
+A server cannot stop a model from being talked into something by text it reads (prompt injection:
+a ticket, wiki page, log line or PR comment that says "ignore your instructions and …"). So every server
+is built to **contain** it: as little power as needed, a human confirmation the model can't fake, foreign
+text marked as such, and a record of every write. All of this lives in one shared module,
+[`_shared/atlas_guard.py`](_shared/atlas_guard.py). Every server carries an identical copy
+(`src/<package>/_atlas_guard.py`, kept in sync by `scripts/sync_shared.py`, checked in CI). It wraps every
+tool and is configured with the same `MCP_*` variables everywhere:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MCP_CONFIRM_MODE` | `auto` | How writes are confirmed. The user confirms in the **client's own dialog** (MCP elicitation), and the server then runs exactly the previewed change; the model never sees or relays a confirm code. `auto`: the dialog when the client offers it, else the confirm-code fallback. `elicit`: only through the dialog (clients without it can't write). `elicit-destructive`: deletes, resets, merges, deploys only through the dialog. `code`: always the code flow. |
+| `MCP_AUTH_TOKEN` / `MCP_AUTH_TOKEN_FILE` | – | HTTP mode: clients / the gateway must send `Authorization: Bearer <token>` (401 otherwise). Use a different token per instance. |
+| `MCP_ALLOWED_HOSTS` | – | HTTP mode: allowed `Host` headers (DNS-rebinding protection, 421 otherwise), e.g. `netbox-mcp:8000,localhost:*`. The compose examples set it to the container name. `MCP_ALLOWED_ORIGINS` overrides the derived origins. |
+| `MCP_TOOLS` / `MCP_DISABLED_TOOLS` | – | Offer only matching tools / hide matching tools (glob patterns), e.g. `MCP_TOOLS=list_*,get_*`. |
+| `MCP_WRITE_LIMIT` | `30` | Max executed writes per minute (`0` = no limit). Brakes loops and mass changes. |
+| `MCP_SECRET_SCAN` | `true` | Refuse writes whose arguments carry private keys, cloud / API tokens, JWTs or the server's own credentials. Comments, tickets, wiki pages and mails are ideal exfiltration channels. |
+| `MCP_MARK_UNTRUSTED` | `true` | Text other people can write is wrapped in `<untrusted>…</untrusted>`; invisible, bidi and Unicode-tag characters are removed from every result; HTML comments are dropped from marked text. |
+| `MCP_AUDIT_STDERR` | `true` | Audit log of every write (preview, confirmed, executed, declined, refused, failed) as JSON lines on stderr, i.e. `docker logs`. |
+| `MCP_AUDIT_GELF` | – | The same events as GELF to Graylog: `udp://graylog:12201` or `tcp://graylog:12201`. |
+| `MCP_AUDIT_SYSLOG` | – | The same events as RFC 5424 syslog (JSON message, facility *log audit*), readable by any SIEM (Wazuh, Splunk, Elastic, rsyslog …): `udp://host:514`, `tcp://host:514` (RFC 6587 octet counting) or `tls://host:6514` (RFC 5425). |
+| `MCP_AUDIT_INSTANCE` / `MCP_AUDIT_READS` | host name / `false` | Label of this instance (e.g. the user) in every event; also log every read. |
+
+Also built in:
+
+- **Tool annotations** on every tool (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`),
+  so clients and gateways can auto-allow reads and always ask before destructive tools.
+- **Readable errors, no leaks**: the reason of an anticipated failure (bad argument, the upstream API's
+  own error) reaches the model; a crash shows only the SDK's generic message, with the traceback in the
+  server log. The server's own credentials are masked in every message and every result.
+- **Containers**: the compose examples run with a read-only root file system, no Linux capabilities, no
+  privilege escalation, `/tmp` as tmpfs and memory / CPU limits; the base image is pinned by digest.
+  Limit each container's outbound traffic to its one target system (firewall / Docker network) where
+  you can.
+- **Supply chain**: CI checks the guard copies, the locks against OSV, and runs every server's tests from
+  its `poetry.lock` before it builds; images get an SBOM and build provenance and are signed with cosign
+  (keyless). Verify a signature:
+
+  ```bash
+  cosign verify ghcr.io/0x3e4/netbox-mcp:<version> \
+    --certificate-identity-regexp 'https://github.com/0x3e4/mcp-atlas/.github/workflows/build.yml@.*' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  ```
+
+### On the client side
+
+- **Claude Code**: keep reads quiet and writes visible. Register a read-only instance and a write instance
+  separately; allow the read-only one entirely and leave the write one on "ask"
+  (`.claude/settings.json`):
+
+  ```json
+  {
+    "permissions": {
+      "allow": ["mcp__netbox"],
+      "ask": ["mcp__netbox-write"]
+    }
+  }
+  ```
+
+- **Gateways** (mcpjungle …): put auth on the gateway, give the gateway each instance's
+  `MCP_AUTH_TOKEN`, and expose write instances only to the people who need them. The gateway does not
+  pass the end user's identity on, so per-user rights are per instance (env file).
+- **Your own LLM**: `examples/llm_bridge.py` refuses confirm codes the user did not approve; with a
+  client that supports elicitation, the dialog makes that unnecessary.
+- **Local models** follow injected text more readily: give them read-only instances or a small tool set
+  (`MCP_TOOLS`), and keep `MCP_CONFIRM_MODE` at `elicit` for any instance that can write.
+
 ## House style
 
 The servers share a deliberate, lightweight design so they read and operate the same way:
@@ -248,6 +316,9 @@ The servers share a deliberate, lightweight design so they read and operate the 
 - **Trimmed results** — responses are projected to the useful fields and row-capped; pass
   `full=true` for the raw payload.
 - **Clean errors, not tracebacks**, and **secrets only from env vars**.
+- **One shared guard** ([`_shared/atlas_guard.py`](_shared/atlas_guard.py), see [Security](#security)) wraps every tool:
+  confirmation in the client's dialog, annotations, untrusted-text marking, secret masking and scanning,
+  write budget, audit log.
 - Built on the official **MCP SDK** (2.x, `MCPServer`), **Poetry** and **httpx**; **stdio** transport by
   default with an optional **streamable-http** mode; shipped as a slim, non-root **Docker** image.
 
@@ -277,7 +348,7 @@ change gets an entry under the new version in the same commit, and the server's 
 
 Updates are manual (`poetry update` per server, then rebuild) and checked as a whole each time: every
 locked package (direct and transitive), the Poetry version in the Dockerfiles, and the GitHub Actions
-in CI, plus `pip-audit` for known vulnerabilities. **A new release is adopted only once it is at least
+in CI, the base image digest in the Dockerfiles, plus an OSV check for known vulnerabilities (`python scripts/osv_check.py`, also run in CI). **A new release is adopted only once it is at least
 7 days old**, so a compromised or broken release has time to be spotted and yanked first; this holds for
 security fixes too. The CI actions are pinned to exact releases for the same reason.
 
@@ -294,10 +365,11 @@ Copy [`_template/`](_template/) to a new `<name>-mcp/` folder and rename it. Pic
    - `template.env` → `acme.env` — local env file
 3. Wire up `config.py` (required env vars), `client.py` (auth + error mapping) and `server.py`
    (replace the example tools; keep `api_get` as the raw escape hatch) for your API.
-4. Update `tests/test_smoke.py` (`EXPECTED_TOOLS`) and the server's own `README.md`. Set the
+4. Keep the `harden(...)` call at the end of `server.py` (set `untrusted_keys` to the fields other people can write, `errors` to your client's error class) and run `python scripts/sync_shared.py`, which adds the guard and its test.
+5. Update `tests/test_smoke.py` (`EXPECTED_TOOLS`) and the server's own `README.md`. Set the
    version (`pyproject.toml` + `__init__.py`) to `0.1.0` until the first release, then `1.0.0`, and
    keep the `CHANGELOG.md` the template brings along.
-5. Add a row for the new server to the table above.
+6. Add a row for the new server to the table above.
 
 The [`_template/README.md`](_template/README.md) doubles as the per-server README skeleton — edit it
 in place.

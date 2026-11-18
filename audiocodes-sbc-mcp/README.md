@@ -149,6 +149,16 @@ With `AUDIOCODES_ALLOW_WRITE=true` you can also:
 - "Create a CSR for TLS context 0 with CN sbc.example.com."
 - "Reset the SBC once all calls have ended." (with `AUDIOCODES_ALLOW_RESET=true`)
 
+## Security & hardening
+
+This server uses the shared mcp-atlas guard (see the [repo README → Security](../README.md#security)):
+writes are confirmed in the client's own dialog where the client supports it (`MCP_CONFIRM_MODE`), every
+tool carries read-only / destructive hints, text other people wrote comes back marked as
+`<untrusted>`, secrets are masked, writes that would carry secrets out are refused, and every write is
+audited (stderr, GELF `MCP_AUDIT_GELF`, syslog `MCP_AUDIT_SYSLOG`). In HTTP mode set `MCP_AUTH_TOKEN` and
+`MCP_ALLOWED_HOSTS`; the compose examples already run the container read-only and without capabilities.
+The variables are in [`.env.example`](.env.example).
+
 ## Notes & scope
 
 - **No per-table configuration API.** The device REST API documents no endpoints for single tables

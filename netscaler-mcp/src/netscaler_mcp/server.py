@@ -38,10 +38,10 @@ from typing import Annotated, Any
 from urllib.parse import quote
 
 from mcp.server.mcpserver import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field, validate_call
 
 from . import __version__, bot, lb, waf
+from ._atlas_guard import harden, run_http
 from .client import NitroClient, NitroError
 from .config import DEFAULT_INSTANCE, ConfigError, load_instances
 
@@ -3743,6 +3743,15 @@ async def nitro_get(
     )
 
 
+# ---- security guard (shared across mcp-atlas, see _atlas_guard.py) ----------------------------------
+
+GUARD = harden(
+    mcp, server='netscaler-mcp', version=__version__, errors=(NitroError,),
+    untrusted_keys={'message', 'url', 'line', 'lines', 'log'},
+    secret_scan_exempt={'upload_ssl_file'},
+)
+
+
 def main() -> None:
     """Console entry point: load settings, wire transport, and run the server."""
     global _clients, _default_instance
@@ -3757,13 +3766,8 @@ def main() -> None:
     _clients = {name: NitroClient(s) for name, s in instances.items()}
 
     if settings.transport == "streamable-http":
-        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
-        mcp.run(
-            transport="streamable-http",
-            host=settings.host,
-            port=settings.port,
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-        )
+        # streamable HTTP: Host/Origin checks (MCP_ALLOWED_HOSTS) and a bearer token (MCP_AUTH_TOKEN)
+        run_http(mcp, host=settings.host, port=settings.port)
     else:
         mcp.run(transport="stdio")
 

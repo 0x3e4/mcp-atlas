@@ -296,6 +296,16 @@ With `AZDO_ALLOW_WRITE=true` you can also:
 - "Run the api-ci pipeline on `feature/login`." (with `AZDO_ALLOW_PIPELINES=true`)
 - "Delete work items 1501 and 1502, they were test entries." (with `AZDO_ALLOW_DELETE=true`)
 
+## Security & hardening
+
+This server uses the shared mcp-atlas guard (see the [repo README → Security](../README.md#security)):
+writes are confirmed in the client's own dialog where the client supports it (`MCP_CONFIRM_MODE`), every
+tool carries read-only / destructive hints, text other people wrote comes back marked as
+`<untrusted>`, secrets are masked, writes that would carry secrets out are refused, and every write is
+audited (stderr, GELF `MCP_AUDIT_GELF`, syslog `MCP_AUDIT_SYSLOG`). In HTTP mode set `MCP_AUTH_TOKEN` and
+`MCP_ALLOWED_HOSTS`; the compose examples already run the container read-only and without capabilities.
+The variables are in [`.env.example`](.env.example).
+
 ## Notes & scope
 
 - **Writes are opt-in.** Reads are always available; the write tools refuse unless

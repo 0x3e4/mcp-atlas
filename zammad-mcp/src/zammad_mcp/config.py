@@ -27,6 +27,7 @@ class Settings:
     token: str
     allow_write: bool = False
     confirm_write: bool = True
+    email_cc_domains: tuple[str, ...] = ()  # if set, reply_email extra Cc only to these domains
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -63,6 +64,7 @@ class Settings:
             token=env["ZAMMAD_TOKEN"],
             allow_write=_bool_env(env, "ZAMMAD_ALLOW_WRITE", False),
             confirm_write=_bool_env(env, "ZAMMAD_CONFIRM_WRITE", True),
+            email_cc_domains=tuple(d.strip().lower().lstrip("@") for d in env.get("ZAMMAD_EMAIL_CC_DOMAINS", "").replace(";", ",").split(",") if d.strip()),
             transport=transport,
             host=env.get("MCP_HOST", "127.0.0.1").strip(),
             port=_int_env(env, "MCP_PORT", 8000),

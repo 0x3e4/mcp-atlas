@@ -123,6 +123,16 @@ Your own LLM: [`examples/llm_bridge.py`](../examples/llm_bridge.py).
 
 With writes enabled: "Take web2:443 out of sg-web on 192.0.2.10, gracefully over 60 seconds."
 
+## Security & hardening
+
+This server uses the shared mcp-atlas guard (see the [repo README → Security](../README.md#security)):
+writes are confirmed in the client's own dialog where the client supports it (`MCP_CONFIRM_MODE`), every
+tool carries read-only / destructive hints, text other people wrote comes back marked as
+`<untrusted>`, secrets are masked, writes that would carry secrets out are refused, and every write is
+audited (stderr, GELF `MCP_AUDIT_GELF`, syslog `MCP_AUDIT_SYSLOG`). In HTTP mode set `MCP_AUTH_TOKEN` and
+`MCP_ALLOWED_HOSTS`; the compose examples already run the container read-only and without capabilities.
+The variables are in [`.env.example`](.env.example).
+
 ## Notes & scope
 
 - **Untested against a live Console.** Built from the NetScaler Console (ADM) 14.1 NITRO reference and

@@ -21,10 +21,10 @@ from email.utils import getaddresses
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from . import __version__, attachments
+from ._atlas_guard import harden, run_http
 from .client import File, ZammadClient, ZammadError
 from .config import ConfigError, Settings
 
@@ -742,7 +742,11 @@ async def reply_email(
         if "@" not in email:
             raise ValueError(f"The customer of ticket {ticket_id} has no email address.")
         to, cc_list = [email.lower()], []
-    cc_list += [a for a in dict.fromkeys(_addresses(", ".join(cc or ()))) if a not in to and a not in cc_list]
+    extra = [a for a in dict.fromkeys(_addresses(", ".join(cc or ()))) if a not in to and a not in cc_list]
+    allowed = client.settings.email_cc_domains
+    if allowed and (outside := [a for a in extra if a.rsplit("@", 1)[-1].lower() not in allowed]):
+        raise ValueError(f"Extra Cc only to {', '.join(allowed)} (ZAMMAD_EMAIL_CC_DOMAINS); not allowed: {', '.join(outside)}.")
+    cc_list += extra
     if not to:
         raise ValueError("No recipients left after removing Zammad's own addresses — give article_id or use recipients='customer'.")
 
@@ -770,6 +774,14 @@ async def reply_email(
     return _pick(data, ("id", "ticket_id", "type", "internal", "to", "cc", "subject", "created_at"))
 
 
+# ---- security guard (shared across mcp-atlas, see _atlas_guard.py) ----------------------------------
+
+GUARD = harden(
+    mcp, server='zammad-mcp', version=__version__, errors=(ZammadError,),
+    untrusted_keys={'body', 'subject', 'note', 'text', 'content', 'message', 'preview'},
+)
+
+
 def main() -> None:
     """Console entry point: load settings, wire transport, and run the server."""
     try:
@@ -783,13 +795,8 @@ def main() -> None:
     _client = ZammadClient(settings)
 
     if settings.transport == "streamable-http":
-        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
-        mcp.run(
-            transport="streamable-http",
-            host=settings.host,
-            port=settings.port,
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-        )
+        # streamable HTTP: Host/Origin checks (MCP_ALLOWED_HOSTS) and a bearer token (MCP_AUTH_TOKEN)
+        run_http(mcp, host=settings.host, port=settings.port)
     else:
         mcp.run(transport="stdio")
 

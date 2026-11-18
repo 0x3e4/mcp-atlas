@@ -32,10 +32,10 @@ from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from . import __version__
+from ._atlas_guard import harden, run_http
 from .client import SbcClient, SbcError
 from .config import ConfigError, Settings
 
@@ -908,6 +908,16 @@ async def sbc_get(
     return await _get_client().get(clean, params=params)
 
 
+# ---- security guard (shared across mcp-atlas, see _atlas_guard.py) ----------------------------------
+
+GUARD = harden(
+    mcp, server='audiocodes-sbc-mcp', version=__version__, errors=(SbcError,),
+    untrusted_keys=set(),
+    destructive={'generate_private_key', 'generate_self_signed', 'install_license'},
+    extra_writes={'drop_test_call'},
+)
+
+
 def main() -> None:
     """Console entry point: load settings, wire transport, and run the server."""
     try:
@@ -920,12 +930,8 @@ def main() -> None:
     _client = SbcClient(settings)
 
     if settings.transport == "streamable-http":
-        mcp.run(
-            transport="streamable-http",
-            host=settings.host,
-            port=settings.port,
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-        )
+        # streamable HTTP: Host/Origin checks (MCP_ALLOWED_HOSTS) and a bearer token (MCP_AUTH_TOKEN)
+        run_http(mcp, host=settings.host, port=settings.port)
     else:
         mcp.run(transport="stdio")
 

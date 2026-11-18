@@ -25,10 +25,10 @@ from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from mcp.server.mcpserver import MCPServer
-from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from . import __version__
+from ._atlas_guard import harden, run_http
 from .client import FortiClient, FortiError
 from .config import ConfigError, Settings
 
@@ -1232,6 +1232,14 @@ async def deauth_users(
     return {"logged_out": addrs}
 
 
+# ---- security guard (shared across mcp-atlas, see _atlas_guard.py) ----------------------------------
+
+GUARD = harden(
+    mcp, server='fortigate-mcp', version=__version__, errors=(FortiError,),
+    untrusted_keys={'msg', 'url', 'agent', 'logdesc'},
+)
+
+
 def main() -> None:
     """Console entry point: load settings, wire transport, and run the server."""
     try:
@@ -1245,13 +1253,8 @@ def main() -> None:
     _client = FortiClient(settings)
 
     if settings.transport == "streamable-http":
-        # MCPServer.run() takes host/port per transport (mcp 1.x read them from mcp.settings).
-        mcp.run(
-            transport="streamable-http",
-            host=settings.host,
-            port=settings.port,
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-        )
+        # streamable HTTP: Host/Origin checks (MCP_ALLOWED_HOSTS) and a bearer token (MCP_AUTH_TOKEN)
+        run_http(mcp, host=settings.host, port=settings.port)
     else:
         mcp.run(transport="stdio")
 
