@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "audiocodes-sbc-mcp"
-version = "1.0.0"
+version = "1.0.1"
 description = "AudioCodes Mediant SBC (device REST API) MCP server — status, alarms, KPIs, configuration, TLS; opt-in config changes, test calls and resets"
 readme = "README.md"
 requires-python = ">=3.14"
