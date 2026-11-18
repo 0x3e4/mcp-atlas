@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because mcp 2.x hides the text of anything but a `ToolError`. The reason comes through now. Unexpected
   crashes still show only the generic message, and their traceback goes to the server log.
 
+### Changed
+
+- `pytest` is a declared dev dependency (it was missing from `pyproject.toml` and `poetry.lock`, so CI could not run the tests).
+
 ## [1.0.3] - 2026-11-18
 
 ### Changed

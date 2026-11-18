@@ -16,6 +16,9 @@ wazuh-mcp = "wazuh_mcp.server:main"
 [tool.poetry]
 packages = [{ include = "wazuh_mcp", from = "src" }]
 
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
