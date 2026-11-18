@@ -127,7 +127,8 @@ def test_on_prem_headers_errorcode_and_proxy_headers():
     h = fake.sent[-1]["headers"]
     assert h["mps-api-proxy-managed-instance-ip"] == "192.0.2.10" and h["_mps_api_proxy_managed_instance_ip"] == "192.0.2.10"
     # the API proxy needs a session, not X-NITRO-USER / -PASS
-    assert fake.logins()[0]["body"] == {"login": {"username": "api", "password": "pw"}}
+    from urllib.parse import parse_qs  # classic NITRO login: a form body object=<json>
+    assert json.loads(parse_qs(fake.logins()[0]["body"])["object"][0]) == {"login": {"username": "api", "password": "pw"}}
     assert h["sessid"] == "##S1" and "SESSID=##S1" in h["cookie"] and "x-nitro-user" not in h
     run(server.instance_get("adc-lab", "stat/lbvserver/web"))
     assert fake.sent[-1]["headers"]["mps-api-proxy-managed-instance-name"] == "adc-lab"
@@ -188,7 +189,7 @@ def test_performance_report_sends_args_and_tries_key_variants():
 
     fake = Fake().on("GET", rf"{V2}/perf_lb_vserver_report$", report)
     use(fake)
-    out = run(server.performance_report("192.0.2.10", "web-lb"))
+    out = run(server.performance_report("web-lb", instance_ip="192.0.2.10"))
     assert [s["params"]["args"] for s in fake.sent if "perf_" in s["path"]] == [
         "ip_address:192.0.2.10,vsvrName:web-lb", "device_ip_address:192.0.2.10,vsvrName:web-lb"]
     assert [r["hitsrate"] for r in out["rows"]] == [9, 5] and out["rows"][0]["timestamp"].endswith("+00:00")
@@ -196,7 +197,7 @@ def test_performance_report_sends_args_and_tries_key_variants():
     nothing = Fake().on("GET", rf"{V2}/perf_lb_servicegroup_report$", {"errorcode": 10006, "message": "Either IP Address or name is missing"})
     use(nothing)
     with pytest.raises(ToolError, match="console_get"):
-        run(server.performance_report("192.0.2.10", "sg-web", kind="lb_servicegroup"))
+        run(server.performance_report("sg-web", instance_ip="192.0.2.10", kind="lb_servicegroup"))
     ok_get = Fake().on("GET", rf"{V2}/perf_lb_servicegroup_report$", ok("perf_lb_servicegroup_report", []))
     use(ok_get)
     run(server.console_get("perf_lb_servicegroup_report", args="ip_address:192.0.2.10,name:sg-web"))
@@ -340,3 +341,85 @@ def test_writes_are_gated_and_confirmed():
         run(server.set_entity_state("192.0.2.10", "service", "svc", False, member="x:1"))
     cleared = run(server.clear_events(["7"]))
     assert cleared["status"] == "confirmation_required"
+
+
+# ---- login format, finding vservers --------------------------------------------------------------
+
+def _form_login(accept: str):
+    """A Console login that answers 10008 unless the body is an object= form in the given style."""
+    from urllib.parse import parse_qs
+
+    def login(request):
+        body = request.content.decode()
+        if request.headers.get("content-type") != "application/x-www-form-urlencoded" or not body.startswith("object="):
+            return httpx.Response(200, json={"errorcode": 10008, "message": "Invalid payload: payload should start with object="})
+        if accept == "form":
+            payload = json.loads(parse_qs(body)["object"][0])
+        else:
+            if "%7B" in body:
+                return httpx.Response(200, json={"errorcode": 10008, "message": "Invalid payload: payload should start with object="})
+            payload = json.loads(body[len("object="):])
+        assert payload == {"login": {"username": "api", "password": "pw"}}
+        return httpx.Response(200, json={"errorcode": 0, "sessionid": "##S9"})
+    return login
+
+
+def test_proxy_login_sends_an_object_form_body():
+    for accept, expected_tries in (("form", 1), ("raw", 2)):
+        fake = (Fake().on("POST", r"^/nitro/v1/config/login$", _form_login(accept))
+                .on("GET", r"/nitro/v1/stat/ns$", ok("ns", [{"cpuusagepcnt": 3}])))
+        use(fake)
+        run(server.instance_get("192.0.2.10", "stat/ns"))
+        assert len(fake.logins()) == expected_tries, accept
+        assert fake.sent[-1]["headers"]["sessid"] == "##S9"
+        if accept == "raw":  # the style that worked is tried first next time
+            server._client._session = None
+            run(server.instance_get("192.0.2.10", "stat/ns"))
+            assert len(fake.logins()) == 3
+
+
+def test_bad_credentials_are_not_retried_in_another_format():
+    fake = Fake().on("POST", r"^/nitro/v1/config/login$", {"errorcode": 354, "message": "Invalid username or password"}, status=401)
+    use(fake)
+    with pytest.raises(ToolError, match="Invalid username or password"):
+        run(server.instance_get("192.0.2.10", "stat/ns"))
+    assert len(fake.logins()) == 1
+
+
+SUMMARY = ok("adc_application_summary", [
+    {"appname": "Shop", "vservername": "shop-web-lb", "vservertype": "lb", "ip_address": "192.0.2.10", "curr_state": "UP"},
+    {"appname": "Shop", "vservername": "shop-api-lb", "vservertype": "lb", "ip_address": "192.0.2.11", "curr_state": "UP"},
+    {"appname": "Portal", "vservername": "portal-cs", "vservertype": "cs", "ip_address": "192.0.2.10", "curr_state": "DOWN"}])
+
+
+def test_list_vservers_from_the_console_and_from_one_adc():
+    fake = (Fake().on("GET", rf"{V2}/adc_application_summary$", SUMMARY)
+            .on("GET", r"/nitro/v1/config/lbvserver$", ok("lbvserver", [{"name": "shop-web-lb", "ipv46": "198.51.100.5", "port": 443, "curstate": "UP"}]))
+            .on("GET", r"/nitro/v1/config/csvserver$", ok("csvserver", [{"name": "portal-cs", "ipv46": "198.51.100.6", "port": 443}])))
+    use(fake)
+    out = run(server.list_vservers(search="shop"))
+    assert out["source"] == "console" and [v["name"] for v in out["vservers"]] == ["shop-web-lb", "shop-api-lb"]
+    assert [v["name"] for v in run(server.list_vservers(kind="cs"))["vservers"]] == ["portal-cs"]
+    live = run(server.list_vservers(instance="192.0.2.10"))
+    assert live["source"] == "adc" and [(v["type"], v["name"]) for v in live["vservers"]] == [("cs", "portal-cs"), ("lb", "shop-web-lb")]
+
+
+def test_performance_report_resolves_a_part_of_the_name():
+    def report(request):
+        args = request.url.params.get("args", "")
+        return httpx.Response(200, json=ok("perf_lb_vserver_report", [{"vsvrName": args, "timestamp": 1_763_460_000_000}]))
+
+    fake = (Fake().on("GET", rf"{V2}/adc_application_summary$", SUMMARY).on("GET", rf"{V2}/perf_lb_vserver_report$", report)
+            .on("GET", r"/nitro/v1/config/lbvserver$", ok("lbvserver", [{"name": "shop-web-lb"}, {"name": "shop-web-lb-old"}])))
+    use(fake)
+    ambiguous = run(server.performance_report("shop"))
+    assert ambiguous["status"] == "ambiguous" and {c["name"] for c in ambiguous["candidates"]} == {"shop-web-lb", "shop-api-lb"}
+    out = run(server.performance_report("api"))  # unique: instance found in the summary
+    assert out["name"] == "shop-api-lb" and out["instance_ip"] == "192.0.2.11"
+    # with an instance, the ADC's own list decides; an exact name wins over longer ones
+    assert run(server.performance_report("shop-web-lb", instance_ip="192.0.2.10"))["name"] == "shop-web-lb"
+    assert run(server.performance_report("WEB-LB-O", instance_ip="192.0.2.10"))["name"] == "shop-web-lb-old"
+    with pytest.raises(ToolError, match="list_vservers"):
+        run(server.performance_report("nothing-like-this"))
+    with pytest.raises(ToolError, match="instance_ip"):
+        run(server.performance_report("sg", kind="lb_servicegroup"))

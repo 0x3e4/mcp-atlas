@@ -5,6 +5,29 @@ All notable changes to netscaler-console-mcp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-18
+
+### Fixed
+
+- The Console login for the API proxy failed with errorcode 10008 ("payload should start with object="):
+  the Console's classic NITRO login takes a form body `object=<json>`, not plain JSON. The login (and
+  logout) now sends `object=` with the JSON URL-encoded, and falls back once to the unencoded form the
+  docs' curl examples use; the form that worked is used first from then on. Wrong credentials are not
+  retried. This fixes every per-ADC tool (`vserver_diagnose`, `instance_get`, `instance_running_config`,
+  `waf_profile_status`, `set_entity_state`).
+
+### Added
+
+- `list_vservers`: find vservers by a part of their name, across all ADCs (the Console's application
+  summary) or live from one ADC.
+
+### Changed
+
+- `performance_report` takes a part of the name: it resolves it to the one vserver / service / service
+  group it matches (on the ADC when `instance_ip` is given, else in the application summary, which also
+  supplies the instance IP), and returns the candidates when several match. `name` now comes first and
+  `instance_ip` is optional for vservers.
+
 ## [1.2.0] - 2026-11-18
 
 ### Security

@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json as _jsonlib
 import time
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 from mcp.server.mcpserver.exceptions import ToolError
@@ -46,6 +48,7 @@ class ConsoleClient:
         self._token_expiry = 0.0
         self._session: str | None = None
         self._session_lock = asyncio.Lock()
+        self._login_styles: list[str] = ["form", "raw"]  # the style that worked moves to the front
 
     @property
     def settings(self) -> Settings:
@@ -61,8 +64,9 @@ class ConsoleClient:
         if self._client is not None:
             if self._session:
                 try:  # best effort: don't leave the proxy session open on the Console
-                    await self._client.post(f"{self._settings.base_url}/nitro/v1/config/logout", json={"logout": {}},
-                                            headers={"Accept": "application/json", **_session_headers(self._session)})
+                    await self._client.post(f"{self._settings.base_url}/nitro/v1/config/logout",
+                                            content=_object_body({"logout": {}}, self._login_styles[0]),
+                                            headers={**_FORM_HEADERS, **_session_headers(self._session)})
                 except httpx.HTTPError:
                     pass
                 self._session = None
@@ -77,15 +81,25 @@ class ConsoleClient:
                 return self._session
             s = self._settings
             client = await self._http()
-            try:
-                resp = await client.post(f"{s.base_url}/nitro/v1/config/login",
-                                         json={"login": {"username": s.username, "password": s.password}},
-                                         headers={"Accept": "application/json"})
-            except httpx.HTTPError as exc:
-                raise ConsoleError(f"Network error logging in to the Console: {exc}") from exc
-            data = _json(resp)
-            code = data.get("errorcode")
-            if resp.status_code >= 400 or (isinstance(code, int) and code != 0):
+            login = {"login": {"username": s.username, "password": s.password}}
+            # The Console's classic NITRO login wants a form body "object=<json>" (errorcode 10008 "payload
+            # should start with object=" for plain JSON). Whether it URL-decodes the value is not documented:
+            # try the URL-encoded form first, then the raw form the docs' curl examples use.
+            for style in list(self._login_styles):
+                try:
+                    resp = await client.post(f"{s.base_url}/nitro/v1/config/login", content=_object_body(login, style),
+                                             headers=_FORM_HEADERS)
+                except httpx.HTTPError as exc:
+                    raise ConsoleError(f"Network error logging in to the Console: {exc}") from exc
+                data = _json(resp)
+                code = data.get("errorcode")
+                failed = resp.status_code >= 400 or (isinstance(code, int) and code != 0)
+                if not failed:
+                    self._login_styles.sort(key=lambda st: st != style)
+                    break
+                if not _payload_format_error(resp, data):  # wrong credentials etc.: another style won't help
+                    break
+            if failed:
                 raise ConsoleError("Console login for the API proxy failed: " + _format_error(resp, data),
                                    status=resp.status_code, errorcode=code if isinstance(code, int) else None)
             sid = _session_id(data)
@@ -180,6 +194,21 @@ class ConsoleClient:
         """``path`` like ``config/lbvserver/web`` or ``stat/lbvserver``; sent to /nitro/v1/<path>."""
         url = f"{self._settings.base_url}/nitro/v1/{path.lstrip('/')}"
         return await self._send(method, url, params=params, json=json, headers=self._proxy_headers(instance), proxy=True)
+
+
+_FORM_HEADERS = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
+
+
+def _object_body(payload: dict[str, Any], style: str) -> bytes:
+    """Classic NITRO form body: ``object=<json>``, URL-encoded (``form``) or as-is (``raw``)."""
+    text = _jsonlib.dumps(payload, separators=(",", ":"))
+    return (urlencode({"object": text}) if style == "form" else "object=" + text).encode()
+
+
+def _payload_format_error(resp: httpx.Response, data: dict[str, Any]) -> bool:
+    """True when the Console rejected the body's format (not the credentials)."""
+    msg = str(data.get("message") or resp.text or "").lower()
+    return data.get("errorcode") == 10008 or "object=" in msg or "payload" in msg
 
 
 def _session_headers(sid: str) -> dict[str, str]:

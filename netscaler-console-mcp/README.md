@@ -26,7 +26,8 @@ use this one for the fleet-wide picture and analytics, that one to change config
 | `list_instances(search?, problems_only?, limit?, full?)` | Managed instances: state, version, HA role, load, critical / major event counts. |
 | `list_applications(search?, problems_only?, sort_by?, limit?, full?)` | Apps / vservers across instances: state, health score, response time, error rate, throughput, issues. |
 | `app_anomalies(server_ip?, limit?)` | Anomalies the Console detected per application server. |
-| `performance_report(instance_ip, name, kind?, limit?)` | Collected counters of one LB vserver, service, service group or CS vserver on one ADC over time (the Console serves these reports only per entity). |
+| `list_vservers(search?, instance?, kind?, limit?)` | Find vservers by a part of their name: across all ADCs from the Console's application summary, or live from one ADC (IP, port, type, state). |
+| `performance_report(name, instance_ip?, kind?, limit?)` | Collected counters of one LB vserver, service, service group or CS vserver on one ADC over time (the Console serves these reports only per entity). A unique part of the name is enough; several matches come back as candidates. Services and service groups need `instance_ip`. |
 | `list_events(active_only?, severity?, instance?, category?, text?, hours?, limit?)` | Active or historic events: entity up/down, thresholds, HA, config changes — newest first. |
 | `search_syslog(instance?, severity?, module?, text?, limit?)` | Syslog the Console collected from the instances. |
 | `ssl_certificates(expiring_within_days?, instance_ip?, search?, limit?)` | Certificates on every instance, soonest expiry first. |

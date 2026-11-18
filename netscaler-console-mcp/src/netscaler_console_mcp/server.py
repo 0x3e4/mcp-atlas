@@ -270,16 +270,94 @@ _REPORT_IP_KEYS = ("ip_address", "device_ip_address")
 _MISSING_ARGS = 10006
 
 
+# entity listings on one ADC (through the Console's API proxy), used to find names
+_ENTITY_RES = {"lb_vserver": ("lbvserver", "name"), "cs_vserver": ("csvserver", "name"),
+               "lb_service": ("service", "name"), "lb_servicegroup": ("servicegroup", "servicegroupname")}
+
+
+async def _resolve_entity(kind: str, name: str, instance_ip: str | None) -> tuple[str | None, str | None, list[dict[str, str]]]:
+    """(instance ip, exact name, candidates): a part of a name becomes the one entity it matches; several
+    matches come back as candidates. Without instance_ip, vservers are looked up in the Console's
+    application summary."""
+    wanted = name.strip().lower()
+    found: list[tuple[str, str]] = []
+    if instance_ip:
+        res, key = _ENTITY_RES[kind]
+        try:
+            data = await _get_client().instance("GET", instance_ip, f"config/{res}", params={"attrs": key})
+        except ConsoleError:
+            return instance_ip.strip(), name.strip(), []  # can't list (proxy unavailable): use the name as given
+        found = sorted({(instance_ip.strip(), str(r[key])) for r in _rows(data, res) if r.get(key) and wanted in str(r[key]).lower()})
+        if not found:
+            return instance_ip.strip(), name.strip(), []
+    else:
+        if kind in ("lb_service", "lb_servicegroup"):
+            raise ToolError("For services and service groups give instance_ip (the ADC's management IP, see list_instances).")
+        want = "cs" if kind == "cs_vserver" else "lb"
+        found = sorted({(str(r.get("ip_address") or ""), str(r["vservername"])) for r in await _list("adc_application_summary")
+                        if r.get("vservername") and wanted in str(r["vservername"]).lower()
+                        and (not r.get("vservertype") or want in str(r.get("vservertype")).lower())})
+        if not found:
+            raise ToolError(f"No {kind.replace('_', ' ')} whose name contains '{name}' in the Console's application summary. "
+                            "list_vservers shows the names (with instance=<ADC IP> straight from that ADC).")
+    exact = [f for f in found if f[1].lower() == wanted]
+    pick = exact if len(exact) == 1 else found if len(found) == 1 else []
+    if pick:
+        return pick[0][0] or instance_ip, pick[0][1], []
+    return None, None, [{"instance_ip": ip, "name": n} for ip, n in found[:50]]
+
+
+@mcp.tool()
+async def list_vservers(
+    search: Annotated[str | None, Field(description="Only vservers whose name (or application) contains this, e.g. a part of the app name.")] = None,
+    instance: Annotated[str | None, Field(description="An ADC (management IP or name): list straight from it, through the Console. Omit for all ADCs (the Console's application summary).")] = None,
+    kind: Annotated[Literal["lb", "cs", "all"], Field(description="Load-balancing, content-switching or both.")] = "all",
+    limit: Annotated[int, Field(description="Max vservers.", ge=1, le=2000)] = 200,
+) -> dict[str, Any]:
+    """Find vservers by (part of) their name — across all ADCs from the Console, or live from one ADC with
+    their IP, port, type and state. Use the exact name and instance IP from here for performance_report,
+    vserver_diagnose and the other per-ADC tools."""
+    rows: list[dict[str, Any]] = []
+    if instance:
+        for k, res in (("lb", "lbvserver"), ("cs", "csvserver")):
+            if kind in (k, "all"):
+                data = await _get_client().instance("GET", instance, f"config/{res}",
+                                                    params={"attrs": "name,ipv46,port,servicetype,curstate,effectivestate"})
+                rows += [{"type": k, "instance": instance, **_pick(r, ("name", "ipv46", "port", "servicetype", "curstate",
+                                                                    "effectivestate"))} for r in _rows(data, res)]
+        source = "adc"
+    else:
+        for r in await _list("adc_application_summary"):
+            vtype = str(r.get("vservertype") or "")
+            if kind != "all" and vtype and kind not in vtype.lower():
+                continue
+            rows.append({"type": vtype or None, "instance": r.get("ip_address"), "name": r.get("vservername"),
+                         "app": r.get("appname"), "curstate": r.get("curr_state"), "health_score": r.get("health_score")})
+        source = "console"
+    if search:
+        rows = [r for r in rows if _contains(r, search, ("name", "app"))]
+    rows.sort(key=lambda r: (str(r.get("instance") or ""), str(r.get("name") or "")))
+    return {"source": source, "count": min(len(rows), limit), "total": len(rows), "vservers": rows[:limit]}
+
+
 @mcp.tool()
 async def performance_report(
-    instance_ip: Annotated[str, Field(description="The ADC's management IP (NSIP), as in list_instances.")],
-    name: Annotated[str, Field(description="Exact name of the vserver / service / service group on that ADC (see list_applications or vserver_diagnose).")],
+    name: Annotated[str, Field(description="Name of the vserver / service / service group, or a unique part of it (list_vservers shows them).")],
+    instance_ip: Annotated[str | None, Field(description="The ADC's management IP (NSIP). Needed for services and service groups; for vservers it is found when the name is unique.")] = None,
     kind: Annotated[Literal["lb_vserver", "lb_service", "lb_servicegroup", "cs_vserver"], Field(description="Which entity type.")] = "lb_vserver",
     limit: Annotated[int, Field(description="Max samples (newest first).", ge=1, le=1000)] = 50,
 ) -> dict[str, Any]:
     """Collected performance counters of one vserver / service / service group on one ADC over time —
     connections, hit and byte rates, surge queues (Console network-reporting perf_* resources). The
-    Console serves these reports only per entity, not fleet-wide."""
+    Console serves these reports only per entity: a part of the name is resolved to the one entity it
+    matches; several matches come back as candidates to choose from."""
+    ip, exact, candidates = await _resolve_entity(kind, name, instance_ip)
+    if candidates:
+        return {"status": "ambiguous", "candidates": candidates,
+                "note": "Several entities match; call again with the exact name (and its instance_ip)."}
+    instance_ip, name = ip, exact
+    if not instance_ip:
+        raise ToolError("The Console's application summary has no instance IP for this vserver; give instance_ip.")
     resource, name_keys = _REPORTS[kind]
     rows: list[dict[str, Any]] | None = None
     last: ConsoleError | None = None
