@@ -10,6 +10,8 @@ import time
 import httpx
 import pytest
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 from netscaler_console_mcp import server
 from netscaler_console_mcp.client import ConsoleError
 from netscaler_console_mcp.config import ConfigError, Settings
@@ -23,6 +25,8 @@ class Fake:
     def __init__(self) -> None:
         self.routes: list[tuple[str, re.Pattern[str], object, int]] = []
         self.sent: list[dict[str, object]] = []
+        # Console login for the API proxy (tests may override with a later route)
+        self.on("POST", r"^/nitro/v1/config/login$", {"errorcode": 0, "message": "Done", "login": [{"sessionid": "##S1"}]})
 
     def on(self, method: str, pattern: str, body: object = None, status: int = 200) -> "Fake":
         self.routes.append((method, re.compile(pattern), body, status))
@@ -43,7 +47,10 @@ class Fake:
         return httpx.Response(404, json={"errorcode": 404, "message": "Resource not found"})
 
     def writes(self):
-        return [s for s in self.sent if s["method"] != "GET"]
+        return [s for s in self.sent if s["method"] != "GET" and not s["path"].endswith("/config/login")]
+
+    def logins(self):
+        return [s for s in self.sent if s["path"].endswith("/config/login")]
 
 
 def use(fake: Fake, **flags: str) -> None:
@@ -119,12 +126,81 @@ def test_on_prem_headers_errorcode_and_proxy_headers():
     run(server.instance_get("192.0.2.10", "stat/lbvserver/web"))
     h = fake.sent[-1]["headers"]
     assert h["mps-api-proxy-managed-instance-ip"] == "192.0.2.10" and h["_mps_api_proxy_managed_instance_ip"] == "192.0.2.10"
+    # the API proxy needs a session, not X-NITRO-USER / -PASS
+    assert fake.logins()[0]["body"] == {"login": {"username": "api", "password": "pw"}}
+    assert h["sessid"] == "##S1" and "SESSID=##S1" in h["cookie"] and "x-nitro-user" not in h
     run(server.instance_get("adc-lab", "stat/lbvserver/web"))
     assert fake.sent[-1]["headers"]["mps-api-proxy-managed-instance-name"] == "adc-lab"
-    with pytest.raises(ValueError, match="config/"):
+    assert len(fake.logins()) == 1  # session reused
+    with pytest.raises(ToolError, match="config/"):
         run(server.instance_get("adc-lab", "../etc"))
-    with pytest.raises(ValueError, match="instance_running_config"):
+    with pytest.raises(ToolError, match="instance_running_config"):
         run(server.instance_get("adc-lab", "config/nsrunningconfig"))
+
+
+def test_proxy_session_renewed_once_on_401_and_parallel_calls_share_it():
+    sessions = iter(["##S1", "##S2"])
+
+    def login(request):
+        return httpx.Response(200, json={"errorcode": 0, "sessionid": next(sessions)})
+
+    def stat(request):
+        if request.headers.get("sessid") == "##S1":
+            return httpx.Response(401, json={"errorcode": 401, "message": "Invalid Session ID in APIProxy request:/nitro/v1/stat/ns"})
+        return httpx.Response(200, json=ok("ns", [{"cpuusagepcnt": 3}]))
+
+    fake = Fake().on("POST", r"/nitro/v1/config/login$", login).on("GET", r"/nitro/v1/stat/ns$", stat)
+    use(fake)
+    out = run(server.instance_get("192.0.2.10", "stat/ns"))
+    assert out["ns"] == [{"cpuusagepcnt": 3}] and len(fake.logins()) == 2
+
+    always = Fake().on("GET", r"/nitro/v1/stat/ns$", {"errorcode": 401, "message": "Invalid Session ID in APIProxy request"}, status=401)
+    use(always)
+    with pytest.raises(ConsoleError, match="Prompt Credentials for Instance Login"):
+        run(server.instance_get("192.0.2.10", "stat/ns"))
+    assert len(always.logins()) == 2
+
+    par = Fake().on("GET", r"/nitro/v1/.*", ok("lbvserver", [{"name": "web-lb", "curstate": "UP"}]))
+    use(par)
+    run(server.vserver_diagnose("192.0.2.10", "web-lb"))
+    assert len(par.logins()) == 1
+
+
+def test_console_error_reaches_the_model_as_tool_error():
+    fake = Fake().on("GET", rf"{V2}/ns_ssl_certkey$", {"errorcode": 351, "message": "Permission denied"})
+    use(fake)
+    from mcp.server.mcpserver.exceptions import UnexpectedToolError
+
+    # a ToolError (not UnexpectedToolError) keeps its message for the model instead of "Error executing tool …"
+    with pytest.raises(ToolError, match="Permission denied") as exc_info:
+        run(server.mcp.call_tool("ssl_certificates", {}))
+    assert not isinstance(exc_info.value, UnexpectedToolError)
+
+
+def test_performance_report_sends_args_and_tries_key_variants():
+    def report(request):
+        args = request.url.params.get("args", "")
+        if args.startswith("device_ip_address:192.0.2.10,vsvrName:web-lb"):
+            return httpx.Response(200, json=ok("perf_lb_vserver_report", [
+                {"vsvrName": "web-lb", "timestamp": 1_763_460_000_000, "hitsrate": 5},
+                {"vsvrName": "web-lb", "timestamp": 1_763_463_600_000, "hitsrate": 9}]))
+        return httpx.Response(200, json={"errorcode": 10006, "message": "Either IP Address or vSvrName is missing"})
+
+    fake = Fake().on("GET", rf"{V2}/perf_lb_vserver_report$", report)
+    use(fake)
+    out = run(server.performance_report("192.0.2.10", "web-lb"))
+    assert [s["params"]["args"] for s in fake.sent if "perf_" in s["path"]] == [
+        "ip_address:192.0.2.10,vsvrName:web-lb", "device_ip_address:192.0.2.10,vsvrName:web-lb"]
+    assert [r["hitsrate"] for r in out["rows"]] == [9, 5] and out["rows"][0]["timestamp"].endswith("+00:00")
+
+    nothing = Fake().on("GET", rf"{V2}/perf_lb_servicegroup_report$", {"errorcode": 10006, "message": "Either IP Address or name is missing"})
+    use(nothing)
+    with pytest.raises(ToolError, match="console_get"):
+        run(server.performance_report("192.0.2.10", "sg-web", kind="lb_servicegroup"))
+    ok_get = Fake().on("GET", rf"{V2}/perf_lb_servicegroup_report$", ok("perf_lb_servicegroup_report", []))
+    use(ok_get)
+    run(server.console_get("perf_lb_servicegroup_report", args="ip_address:192.0.2.10,name:sg-web"))
+    assert ok_get.sent[-1]["params"]["args"] == "ip_address:192.0.2.10,name:sg-web"
 
 
 def test_cloud_token_and_bearer():
@@ -245,10 +321,10 @@ def test_running_config_masks_secrets():
 def test_writes_are_gated_and_confirmed():
     fake = Fake().on("POST", r"/nitro/v1/config/servicegroup$", {"errorcode": 0, "message": "Done"}).on("DELETE", rf"{V2}/active_event/7$")
     use(fake, NETSCALER_CONSOLE_ALLOW_WRITE="false", NETSCALER_CONSOLE_ALLOW_INSTANCE_WRITE="true")
-    with pytest.raises(ValueError, match="NETSCALER_CONSOLE_ALLOW_WRITE"):
+    with pytest.raises(ToolError, match="NETSCALER_CONSOLE_ALLOW_WRITE"):
         run(server.clear_events(["7"]))
     use(fake)
-    with pytest.raises(ValueError, match="NETSCALER_CONSOLE_ALLOW_INSTANCE_WRITE"):
+    with pytest.raises(ToolError, match="NETSCALER_CONSOLE_ALLOW_INSTANCE_WRITE"):
         run(server.set_entity_state("192.0.2.10", "servicegroup", "sg-web", False))
     use(fake, NETSCALER_CONSOLE_ALLOW_INSTANCE_WRITE="true", NETSCALER_CONSOLE_CONFIRM_WRITE="true")
     preview = run(server.set_entity_state("192.0.2.10", "servicegroup", "sg-web", False, member="web2:443", delay_seconds=60))
@@ -260,7 +336,7 @@ def test_writes_are_gated_and_confirmed():
     assert w["path"] == "/nitro/v1/config/servicegroup" and w["params"] == {"action": "disable"}
     assert w["body"] == {"servicegroup": {"servicegroupname": "sg-web", "servername": "web2", "port": 443, "delay": 60, "graceful": "YES"}}
     assert w["headers"]["mps-api-proxy-managed-instance-ip"] == "192.0.2.10"
-    with pytest.raises(ValueError, match="member"):
+    with pytest.raises(ToolError, match="member"):
         run(server.set_entity_state("192.0.2.10", "service", "svc", False, member="x:1"))
     cleared = run(server.clear_events(["7"]))
     assert cleared["status"] == "confirmation_required"

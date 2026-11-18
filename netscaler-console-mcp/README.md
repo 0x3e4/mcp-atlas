@@ -26,14 +26,14 @@ use this one for the fleet-wide picture and analytics, that one to change config
 | `list_instances(search?, problems_only?, limit?, full?)` | Managed instances: state, version, HA role, load, critical / major event counts. |
 | `list_applications(search?, problems_only?, sort_by?, limit?, full?)` | Apps / vservers across instances: state, health score, response time, error rate, throughput, issues. |
 | `app_anomalies(server_ip?, limit?)` | Anomalies the Console detected per application server. |
-| `performance_report(kind?, name?, instance_ip?, limit?)` | Collected counters per LB vserver, service, service group or CS vserver. |
+| `performance_report(instance_ip, name, kind?, limit?)` | Collected counters of one LB vserver, service, service group or CS vserver on one ADC over time (the Console serves these reports only per entity). |
 | `list_events(active_only?, severity?, instance?, category?, text?, hours?, limit?)` | Active or historic events: entity up/down, thresholds, HA, config changes — newest first. |
 | `search_syslog(instance?, severity?, module?, text?, limit?)` | Syslog the Console collected from the instances. |
 | `ssl_certificates(expiring_within_days?, instance_ip?, search?, limit?)` | Certificates on every instance, soonest expiry first. |
 | `config_audit(instance?, drift_only?)` | Unsaved changes (running vs saved) and template drift per instance. |
 | `list_config_jobs(status?, search?, limit?)` | Configuration jobs with commands and per-instance results. |
 | `license_status()` | Console licenses, expiry and pooled-capacity usage. |
-| `console_get(resource, filter?, attrs?, pagesize?, pageno?, count?)` | Escape hatch: any Console NITRO resource (`/nitro/v2/config/…`). |
+| `console_get(resource, filter?, args?, attrs?, pagesize?, pageno?, count?)` | Escape hatch: any Console NITRO resource (`/nitro/v2/config/…`); `args` for resources that need them, e.g. `ip_address:192.0.2.10,vsvrName:web-lb`. |
 
 ### WAF / security
 
@@ -69,15 +69,18 @@ arguments and dies with a server restart.
 
 **On-prem:** create a Console user (**Settings → Users & Roles → Users**) with a read-only role for the
 read tools, or a role that may manage instances and events for the writes. The server sends it as
-`X-NITRO-USER` / `X-NITRO-PASS` on each request (no session to expire).
+`X-NITRO-USER` / `X-NITRO-PASS` on each Console request. The API proxy (all per-ADC tools) does not take
+those headers, so for proxied calls the server logs in once (`/nitro/v1/config/login`), reuses the
+session and logs in again when it expires.
 
 **Console service (cloud):** create a Citrix Cloud API client (**Identity and Access Management → API
 Access → Secure Clients**) and note the customer ID; set `NETSCALER_CONSOLE_CUSTOMER_ID`,
 `_CLIENT_ID`, `_CLIENT_SECRET` and `_CLOUD_REGION` instead of user and password.
 
 **ADC calls through the Console** use the instance profile credentials the Console already holds. If
-the Console is set to *prompt for instance credentials*, set `NETSCALER_CONSOLE_INSTANCE_USERNAME` /
-`_PASSWORD` (a read-only ADC user is enough for everything but `set_entity_state`).
+*Prompt Credentials for Instance Login* is enabled (**Settings → Administration → System
+Configurations**), disable it or set `NETSCALER_CONSOLE_INSTANCE_USERNAME` / `_PASSWORD` (a read-only
+ADC user is enough for everything but `set_entity_state`).
 
 **Data sources:** events and SSL inventory work out of the box; `search_syslog` and
 `waf_violation_logs` need the instances to send syslog to the Console; `list_applications`,
@@ -126,6 +129,9 @@ With writes enabled: "Take web2:443 out of sg-web on 192.0.2.10, gracefully over
   NetScaler's own Ansible collection / Terraform provider. Things to check first on your Console:
   - The instance resource (`managed_device`); `list_instances` falls back to the event summary.
   - The spelling of the API-proxy headers. Both documented forms are sent.
+  - How the proxy session is passed: the docs show both a `SESSID` header and a cookie, so both are sent.
+  - The `args` keys of the `perf_*` reports (not documented): `performance_report` tries
+    `ip_address` / `device_ip_address` with the entity-name key and says which one worked.
   - The APPFW syslog line format your firmware writes (`waf_violation_logs` parses it, and shows the raw
     line when it can't).
 - Analytics resources differ between Console builds and licenses; an empty result usually means the

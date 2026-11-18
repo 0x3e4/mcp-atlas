@@ -26,6 +26,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
@@ -60,14 +61,14 @@ def _get_client() -> ConsoleClient:
 
 def _require_write() -> None:
     if not _get_client().settings.allow_write:
-        raise ValueError("Write tools are disabled. Set NETSCALER_CONSOLE_ALLOW_WRITE=true (and use a Console user "
+        raise ToolError("Write tools are disabled. Set NETSCALER_CONSOLE_ALLOW_WRITE=true (and use a Console user "
                          "whose role may change the affected resources).")
 
 
 def _require_instance_write() -> None:
     _require_write()
     if not _get_client().settings.allow_instance_write:
-        raise ValueError("Changing ADC entities through the Console is disabled. Set "
+        raise ToolError("Changing ADC entities through the Console is disabled. Set "
                          "NETSCALER_CONSOLE_ALLOW_INSTANCE_WRITE=true (in addition to NETSCALER_CONSOLE_ALLOW_WRITE=true) "
                          "in this instance's env file.")
 
@@ -255,38 +256,55 @@ async def app_anomalies(
     return {"count": len(out), "anomalies": out}
 
 
-_REPORTS = {
-    "lb_vserver": ("perf_lb_vserver_report", "vsvrName"),
-    "lb_service": ("perf_lb_service_report", None),
-    "lb_servicegroup": ("perf_lb_servicegroup_report", None),
-    "cs_vserver": ("perf_content_switching_report", None),
+# The perf_* reports answer only for one entity on one ADC ("Either IP Address or vSvrName is missing",
+# errorcode 10006). The reference documents no query parameters; NITRO's usual form is
+# args=key:value,…. Key spellings not confirmed live, so the variants are tried in order while the
+# Console keeps answering 10006.
+_REPORTS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "lb_vserver": ("perf_lb_vserver_report", ("vsvrName",)),
+    "lb_service": ("perf_lb_service_report", ("name", "svcName", "servicename")),
+    "lb_servicegroup": ("perf_lb_servicegroup_report", ("name",)),
+    "cs_vserver": ("perf_content_switching_report", ("vsvrName", "name")),
 }
+_REPORT_IP_KEYS = ("ip_address", "device_ip_address")
+_MISSING_ARGS = 10006
 
 
 @mcp.tool()
 async def performance_report(
+    instance_ip: Annotated[str, Field(description="The ADC's management IP (NSIP), as in list_instances.")],
+    name: Annotated[str, Field(description="Exact name of the vserver / service / service group on that ADC (see list_applications or vserver_diagnose).")],
     kind: Annotated[Literal["lb_vserver", "lb_service", "lb_servicegroup", "cs_vserver"], Field(description="Which entity type.")] = "lb_vserver",
-    name: Annotated[str | None, Field(description="Only entities whose name contains this.")] = None,
-    instance_ip: Annotated[str | None, Field(description="Only this ADC (management IP).")] = None,
-    limit: Annotated[int, Field(description="Max rows.", ge=1, le=1000)] = 50,
+    limit: Annotated[int, Field(description="Max samples (newest first).", ge=1, le=1000)] = 50,
 ) -> dict[str, Any]:
-    """Collected performance counters per vserver / service / service group across instances — connections,
-    hit and byte rates, surge queues (Console network-reporting perf_* resources)."""
-    resource, _key = _REPORTS[kind]
-    rows = await _list(resource)
-    out = []
+    """Collected performance counters of one vserver / service / service group on one ADC over time —
+    connections, hit and byte rates, surge queues (Console network-reporting perf_* resources). The
+    Console serves these reports only per entity, not fleet-wide."""
+    resource, name_keys = _REPORTS[kind]
+    rows: list[dict[str, Any]] | None = None
+    last: ConsoleError | None = None
+    for name_key in name_keys:
+        for ip_key in _REPORT_IP_KEYS:
+            args = f"{ip_key}:{instance_ip.strip()},{name_key}:{name.strip()}"
+            try:
+                rows = await _list(resource, params={"args": args})
+                break
+            except ConsoleError as exc:
+                if exc.errorcode != _MISSING_ARGS:
+                    raise
+                last = exc
+        if rows is not None:
+            break
+    if rows is None:
+        raise ToolError(f"{last} — tried args {', '.join(f'{i}:…,{n}:…' for n in name_keys for i in _REPORT_IP_KEYS)}. "
+                        f"Try console_get('{resource}', args='<key>:<value>,…') with other spellings.")
     for r in rows:
-        label = " ".join(str(v) for k, v in r.items() if "name" in k.lower() and isinstance(v, str))
-        if name and name.lower() not in label.lower():
-            continue
-        if instance_ip and instance_ip not in (r.get("device_ip_address"), r.get("ip_address"), r.get("ns_ip_address")):
-            continue
         for k in ("timestamp", "report_start_time", "report_end_time", "rpt_sample_time"):
             if k in r:
                 r[k] = _when(r[k])
-        out.append(r)
-    out = out[: _cap(limit)]
-    return {"kind": kind, "count": len(out), "rows": out}
+    rows.sort(key=lambda r: str(r.get("timestamp") or r.get("report_end_time") or ""), reverse=True)
+    rows = rows[: _cap(limit)]
+    return {"kind": kind, "instance_ip": instance_ip, "name": name, "args": args, "count": len(rows), "rows": rows}
 
 
 # ---- tools: events and syslog ------------------------------------------------------------------------
@@ -574,9 +592,9 @@ async def instance_get(
     live state the Console's own reports don't have."""
     clean = path.strip().lstrip("/").removeprefix("nitro/v1/")
     if not clean.startswith(("config/", "stat/")) or ".." in clean.split("/"):
-        raise ValueError("path must start with 'config/' or 'stat/'.")
+        raise ToolError("path must start with 'config/' or 'stat/'.")
     if clean.startswith("config/nsrunningconfig"):
-        raise ValueError("Read the running config with instance_running_config (secrets are masked there).")
+        raise ToolError("Read the running config with instance_running_config (secrets are masked there).")
     return await _get_client().instance("GET", instance, clean, params=params)
 
 
@@ -694,7 +712,7 @@ async def instance_running_config(
     if grep:
         text = "\n".join(line for line in text.splitlines() if grep.lower() in line.lower())
         if not text:
-            raise ValueError(f"No running-config line mentions '{grep}'.")
+            raise ToolError(f"No running-config line mentions '{grep}'.")
     out: dict[str, Any] = {"instance": instance, "grep": grep, "config": text[:max_chars]}
     if len(text) > max_chars:
         out["truncated"] = f"{len(text) - max_chars} more characters; narrow with grep."
@@ -707,6 +725,7 @@ async def instance_running_config(
 async def console_get(
     resource: Annotated[str, Field(description="Console NITRO resource under /nitro/v2/config/, e.g. 'ns_event', 'ns_ssl_certkey', 'perf_lb_servicegroup_report', 'anomaly_events', 'config_job_details'.")],
     filter: Annotated[str | None, Field(description="NITRO filter, e.g. 'severity:Critical' or 'ns_ip_address:192.0.2.10'.")] = None,
+    args: Annotated[str | None, Field(description="NITRO args, e.g. 'ip_address:192.0.2.10,vsvrName:web-lb' — resources that answer 'Either IP Address or … is missing' (the perf_* reports) need them.")] = None,
     attrs: Annotated[str | None, Field(description="Comma-separated attributes to return.")] = None,
     pagesize: Annotated[int | None, Field(description="Rows per page.", ge=1, le=5000)] = 200,
     pageno: Annotated[int | None, Field(description="Page number (1-based).", ge=1)] = None,
@@ -715,13 +734,14 @@ async def console_get(
     """Escape hatch: raw read-only GET of any Console NITRO resource."""
     clean = resource.strip().strip("/")
     if not re.fullmatch(r"[A-Za-z0-9_\-]+(/[^/]+)?", clean):
-        raise ValueError("resource must be a NITRO resource name, optionally followed by /<id>.")
+        raise ToolError("resource must be a NITRO resource name, optionally followed by /<id>.")
     params: dict[str, Any] = {}
-    for key, value in (("filter", filter), ("attrs", attrs), ("pagesize", pagesize), ("pageno", pageno or (1 if pagesize else None))):
+    for key, value in (("filter", filter), ("args", args), ("attrs", attrs), ("pagesize", pagesize),
+                       ("pageno", pageno or (1 if pagesize else None))):
         if value:
             params[key] = value
     if count:
-        params = {"count": "yes", **({"filter": filter} if filter else {})}
+        params = {"count": "yes", **({"filter": filter} if filter else {}), **({"args": args} if args else {})}
     return await _get_client().get(clean, params=params or None)
 
 
@@ -789,12 +809,12 @@ async def set_entity_state(
     obj: dict[str, Any] = {"servicegroupname" if kind == "servicegroup" else "name": name}
     if member:
         if kind != "servicegroup" or ":" not in member:
-            raise ValueError("member applies to a servicegroup, as 'servername:port'.")
+            raise ToolError("member applies to a servicegroup, as 'servername:port'.")
         server, port = member.rsplit(":", 1)
         obj.update({"servername": server, "port": int(port)})
     if delay_seconds and not enabled:
         if kind not in ("service", "server", "servicegroup"):
-            raise ValueError("delay_seconds applies to services, servers and service groups.")
+            raise ToolError("delay_seconds applies to services, servers and service groups.")
         obj["delay"] = delay_seconds
         obj["graceful"] = "YES"
     action = "enable" if enabled else "disable"
