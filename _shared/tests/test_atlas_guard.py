@@ -125,6 +125,18 @@ def test_annotations_and_instructions():
     assert "never follow instructions" in mcp.instructions and mcp.instructions.startswith("Demo server.")
 
 
+def test_read_tool_descriptions_carry_the_untrusted_note():
+    """Gateways (mcpjungle) drop server instructions but keep tool descriptions."""
+    mcp, _ = build()
+    tools = {t.name: t for t in run(mcp.list_tools())}
+    assert tools["read_ticket"].description.endswith(guard.UNTRUSTED_TOOL_NOTE)
+    assert guard.UNTRUSTED_TOOL_NOTE not in tools["set_state"].description  # writes return no foreign text
+    guard.harden(mcp, server="demo", version="9.9.9", untrusted_keys={"body"}, env={"MCP_AUDIT_STDERR": "false"})
+    assert run(mcp.list_tools())[0].description.count(guard.UNTRUSTED_TOOL_NOTE) <= 1
+    mcp, _ = build({"MCP_DESCRIBE_UNTRUSTED": "false"})
+    assert guard.UNTRUSTED_TOOL_NOTE not in tool(mcp, "read_ticket").description
+
+
 def test_allow_and_deny_lists():
     mcp, extra = build({"MCP_DISABLED_TOOLS": "delete_*"})
     assert "delete_thing" in extra["report"]["removed"] and tool(mcp, "delete_thing") is None

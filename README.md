@@ -254,6 +254,7 @@ tool and is configured with the same `MCP_*` variables everywhere:
 | `MCP_WRITE_LIMIT` | `30` | Max executed writes per minute (`0` = no limit). Brakes loops and mass changes. |
 | `MCP_SECRET_SCAN` | `true` | Refuse writes whose arguments carry private keys, cloud / API tokens, JWTs or the server's own credentials. Comments, tickets, wiki pages and mails are ideal exfiltration channels. |
 | `MCP_MARK_UNTRUSTED` | `true` | Text other people can write is wrapped in `<untrusted>…</untrusted>`; invisible, bidi and Unicode-tag characters are removed from every result; HTML comments are dropped from marked text. |
+| `MCP_DESCRIBE_UNTRUSTED` | `true` | The same warning in every read tool's description, not only in the server instructions — gateways such as mcpjungle pass descriptions on but drop instructions. |
 | `MCP_AUDIT_STDERR` | `true` | Audit log of every write (preview, confirmed, executed, declined, refused, failed) as JSON lines on stderr, i.e. `docker logs`. |
 | `MCP_AUDIT_GELF` | – | The same events as GELF to Graylog: `udp://graylog:12201` or `tcp://graylog:12201`. |
 | `MCP_AUDIT_SYSLOG` | – | The same events as RFC 5424 syslog (JSON message, facility *log audit*), readable by any SIEM (Wazuh, Splunk, Elastic, rsyslog …): `udp://host:514`, `tcp://host:514` (RFC 6587 octet counting) or `tls://host:6514` (RFC 5425). |

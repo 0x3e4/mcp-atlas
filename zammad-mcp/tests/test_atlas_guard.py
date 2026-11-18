@@ -35,6 +35,14 @@ def test_instructions_warn_about_untrusted_content():
     assert guard.UNTRUSTED_NOTICE in (server.mcp.instructions or "")
 
 
+def test_read_tool_descriptions_warn_when_results_hold_foreign_text():
+    if not server.GUARD["untrusted_keys"]:
+        return  # this server returns no text other people write
+    for name, t in _tools().items():
+        if t.annotations.read_only_hint:
+            assert (t.description or "").count(guard.UNTRUSTED_TOOL_NOTE) == 1, name
+
+
 def test_guard_copy_matches_the_shared_source():
     shared = pathlib.Path(__file__).parents[2] / "_shared" / "atlas_guard.py"
     if shared.exists():  # inside the repo; the Docker build context has only the server folder

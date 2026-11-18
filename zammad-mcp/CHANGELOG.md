@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     syslog over UDP / TCP / TLS (`MCP_AUDIT_SYSLOG`); `MCP_AUDIT_INSTANCE`, `MCP_AUDIT_READS`.
   - Text other people wrote comes back wrapped in `<untrusted>…</untrusted>`; invisible, bidi and
     Unicode-tag characters are removed; secrets are masked in every result.
+    Read tools repeat that warning in their description (`MCP_DESCRIBE_UNTRUSTED`), because
+    gateways such as mcpjungle drop the server instructions.
   - Writes whose arguments carry private keys, tokens or the server's own credentials are refused
     (`MCP_SECRET_SCAN`). Writes are limited per minute (`MCP_WRITE_LIMIT`, default 30), and tools can
     be limited (`MCP_TOOLS` / `MCP_DISABLED_TOOLS`).
