@@ -825,6 +825,60 @@ async def _learned_entries(
     return entries
 
 
+# Rows per NITRO bulk request (NETSCALER_BULK_BIND).
+_BULK_CHUNK = 100
+
+
+async def _run_parallel(items: list[Any], fn: Any) -> list[Any]:
+    """``await fn(item)`` for every item, at most NETSCALER_WRITE_CONCURRENCY at once; results in item order.
+
+    Rule writes are independent of each other (one binding or learned entry each), so a bulk deploy or
+    import no longer waits for one round trip after the other. The tasks inherit the call's context, so
+    they all talk to the same instance.
+    """
+    limit = _get_client().settings.write_concurrency
+    if limit <= 1 or len(items) <= 1:
+        return [await fn(item) for item in items]
+    gate = asyncio.Semaphore(limit)
+
+    async def one(item: Any) -> Any:
+        async with gate:
+            return await fn(item)
+
+    return list(await asyncio.gather(*(one(item) for item in items)))
+
+
+def _bulk_status(answer: dict[str, Any]) -> str:
+    code = answer.get("errorcode")
+    if code in (0, None):
+        return "added"
+    message = str(answer.get("message") or "").strip()
+    if code in waf.EXISTS_CODES or "already exist" in message.lower():
+        return "exists"
+    return f"error: {message or 'failed'} (errorcode {code})"
+
+
+async def _bind_many(rule: waf.RuleType, profile: str, rows: list[dict[str, Any]]) -> list[str]:
+    """Bind several rules of one type.
+
+    With NETSCALER_BULK_BIND on: one NITRO bulk request per chunk. Otherwise, and whenever the appliance
+    rejects a bulk request as a whole, one parallel request per rule.
+    """
+    client = _get_client()
+    if not (client.settings.bulk_bind and len(rows) > 1):
+        return await _run_parallel(rows, lambda row: _bind(rule, profile, row))
+    statuses: list[str] = []
+    for start in range(0, len(rows), _BULK_CHUNK):
+        chunk = rows[start:start + _BULK_CHUNK]
+        try:
+            answers = await client.bulk_update(rule.binding, [{"name": profile, **row} for row in chunk])
+        except NitroError:
+            statuses += await _run_parallel(chunk, lambda row: _bind(rule, profile, row))
+            continue
+        statuses += [_bulk_status(answer) for answer in answers]
+    return statuses
+
+
 async def _bind(rule: waf.RuleType, profile: str, row: dict[str, Any]) -> str:
     try:
         await _get_client().update(rule.binding, {"name": profile, **row})
@@ -982,20 +1036,27 @@ async def _apply_document(
         if status.startswith("error") and len(errors) < 50:
             errors.append(f"{key} {op} {row.get(kind.types[key].identity[0])!r}: {status[len('error: '):]}")
 
-    # Add first, re-bind changed, remove last: allowed traffic never loses its rule mid-import.
+    # Add first, re-bind changed, remove last: allowed traffic never loses its rule mid-import. Within a
+    # phase the writes run in parallel (NETSCALER_WRITE_CONCURRENCY) or as bulk binds (NETSCALER_BULK_BIND).
     for key, ops in plan.items():
-        for row in ops["add"]:
-            _record(key, "add", await _bind(kind.types[key], target, row), row)
-    for key, ops in plan.items():
-        for change in ops["update"]:
-            status = await _unbind(kind.types[key], target, change["current"])
-            if not status.startswith("error"):
-                status = await _bind(kind.types[key], target, change["desired"])
-                status = "updated" if status == "added" else status
-            _record(key, "update", status, change["desired"])
-    for key, ops in plan.items():
-        for row in ops["remove"]:
-            _record(key, "remove", await _unbind(kind.types[key], target, row), row)
+        for row, status in zip(ops["add"], await _bind_many(kind.types[key], target, ops["add"])):
+            _record(key, "add", status, row)
+
+    async def _rebind(item: tuple[str, dict[str, Any]]) -> str:
+        key, change = item
+        status = await _unbind(kind.types[key], target, change["current"])
+        if not status.startswith("error"):
+            status = await _bind(kind.types[key], target, change["desired"])
+            status = "updated" if status == "added" else status
+        return status
+
+    updates = [(key, change) for key, ops in plan.items() for change in ops["update"]]
+    for (key, change), status in zip(updates, await _run_parallel(updates, _rebind)):
+        _record(key, "update", status, change["desired"])
+    removes = [(key, row) for key, ops in plan.items() for row in ops["remove"]]
+    statuses = await _run_parallel(removes, lambda item: _unbind(kind.types[item[0]], target, item[1]))
+    for (key, row), status in zip(removes, statuses):
+        _record(key, "remove", status, row)
 
     out["applied"] = {key: _tally(statuses) for key, statuses in applied.items()}
     out["errors"] = errors
@@ -1064,9 +1125,10 @@ async def _apply_rule(
     summary = f"Add {kind.key} {key} rule to {', '.join(targets) or 'no profile'}."
     if not _gate(tool, change, summary, preview, dry_run=dry_run, confirm=confirm, writes=bool(targets)):
         return preview
-    out["results"] = [
-        {**r, "status": await _bind(spec, r["profile"], row)} if r["status"] == "would add" else r for r in results
-    ]
+    async def _one(r: dict[str, Any]) -> dict[str, Any]:
+        return {**r, "status": await _bind(spec, r["profile"], row)} if r["status"] == "would add" else r
+
+    out["results"] = await _run_parallel(results, _one)
     return out
 
 
@@ -1103,7 +1165,8 @@ async def _remove_rule(
     summary = f"Remove {len(matches)} {kind.key} {key} rule(s) from profile '{profile}'."
     if not _gate(tool, change, summary, preview, dry_run=dry_run, confirm=confirm, writes=bool(matches)):
         return preview
-    out["results"] = [{"rule": row, "status": await _unbind(spec, profile, row)} for row in matches]
+    statuses = await _run_parallel(matches, lambda row: _unbind(spec, profile, row))
+    out["results"] = [{"rule": row, "status": status} for row, status in zip(matches, statuses)]
     return out
 
 
@@ -1416,6 +1479,73 @@ async def remove_waf_rule(
 
 
 @_tool
+async def set_waf_rule_state(
+    profile: Annotated[str, Field(description="AppFw profile name.")],
+    rule_type: Annotated[str, Field(description="Rule type, as in list_waf_rules (e.g. 'start_url', 'sql_injection').")],
+    state: Annotated[str, Field(description="ENABLED (rule applies) or DISABLED (rule parked: kept in the profile, but ignored).")],
+    rule: Annotated[dict[str, Any] | None, Field(description="Identifying attributes of the rule(s), e.g. a row from list_waf_rules or just {\"starturl\": \"^https://app\\\\.corp/old/.*$\"}.")] = None,
+    contains: Annotated[str | None, Field(description="Or: every rule of this type with a value containing this text (case-insensitive), e.g. a host or path.")] = None,
+    all_matches: Annotated[bool, Field(description="Change every matching rule (otherwise several matches is an error).")] = False,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Park or re-activate WAF relaxation rules without deleting them (WRITE — requires NETSCALER_ALLOW_WRITE).
+
+    DISABLED keeps a rule (with its comment and settings) in the profile but stops it from applying:
+    stage rules before go-live, or take one back quickly and restore it later. NITRO has no update for
+    bindings, so each change is an unbind followed by a bind with the same attributes and the new state;
+    if the bind fails, the original rule is bound again. Rules already in the wanted state are skipped.
+    Previews by default; live immediately once applied; persist with save_config.
+    """
+    args = _call_args(locals())
+    wanted = (state or "").strip().upper()
+    if wanted not in waf.RULE_STATES:
+        raise ValueError(f"state must be one of {waf.RULE_STATES}; got {state!r}.")
+    key = waf.WAF.rule_type(rule_type)
+    spec = waf.WAF.types[key]
+    identity = spec.identity + spec.ident_extra
+    given = {a: v for a, v in (rule or {}).items() if a in identity and v not in (None, "")}
+    if not given and not contains:
+        raise ValueError(f"Pass rule (at least {spec.identity[0]!r}) or contains.")
+    if not dry_run:
+        _require_write()
+    existing = _rows(await _get_client().get("config", spec.binding, resource_name=profile), spec.binding)
+    matches = [
+        waf.clean_binding(r) for r in existing
+        if (not given or waf.row_matches(spec, r, given)) and _matches(waf.clean_binding(r), contains)
+    ]
+    if len(matches) > 1 and not all_matches:
+        raise ValueError(
+            f"{len(matches)} rules match; add identifying attributes or pass all_matches=true. Matches: {matches[:10]}"
+        )
+    todo = [r for r in matches if str(r.get("state") or "ENABLED").upper() != wanted]
+    out: dict[str, Any] = {
+        "profile": profile, "rule_type": key, "state": wanted, "dry_run": dry_run,
+        "matched": len(matches), "already": len(matches) - len(todo),
+    }
+    preview = {**out, "results": [{"rule": r, "status": f"would set {wanted}"} for r in todo[:200]]}
+    change = {"args": args, "plan": {"rule_type": key, "state": wanted, "rules": todo}}
+    summary = f"Set {len(todo)} WAF {key} rule(s) on profile '{profile}' to {wanted}."
+    if not _gate("set_waf_rule_state", change, summary, preview, dry_run=dry_run, confirm=confirm, writes=bool(todo)):
+        return preview
+
+    async def _flip(row: dict[str, Any]) -> str:
+        status = await _unbind(spec, profile, row)
+        if status.startswith("error"):
+            return status
+        status = await _bind(spec, profile, {**row, "state": wanted})
+        if status in ("added", "exists"):
+            return "updated"
+        restored = await _bind(spec, profile, row)
+        return f"{status} (original rule {'restored' if restored == 'added' else 'NOT restored: ' + restored})"
+
+    statuses = await _run_parallel(todo, _flip)
+    out["results"] = [{"rule": r, "status": st} for r, st in zip(todo, statuses)][:200]
+    out["summary"] = _tally(statuses)
+    return out
+
+
+@_tool
 async def deploy_waf_learned_rules(
     profile: Annotated[str, Field(description="AppFw profile name.")],
     rule_type: Annotated[str, Field(description="Learned check to deploy: start_url, sql_injection, cross_site_scripting, field_consistency, cookie_consistency, field_format, csrf_tag, content_type or credit_card.")],
@@ -1500,14 +1630,19 @@ async def deploy_waf_learned_rules(
         dry_run=dry_run, confirm=confirm, writes=bool(adds or (remove_learned and results)),
     ):
         return preview
+    to_add = [r for r in results if r["status"] == "would add"]
+    for result, status in zip(to_add, await _bind_many(spec, profile, [r["rule"] for r in to_add])):
+        result["status"] = status
+    forget = []
     for result in results:
-        if result["status"] == "would add":
-            result["status"] = await _bind(spec, profile, result["rule"])
         if "learned" in result:
             if result["status"] in ("exists", "covered", "added"):
-                result["learned"] = await _forget_learned(spec, profile, result["rule"])
+                forget.append(result)
             else:  # the bind failed: keep the learned entry
                 del result["learned"]
+    statuses = await _run_parallel(forget, lambda r: _forget_learned(spec, profile, r["rule"]))
+    for result, status in zip(forget, statuses):
+        result["learned"] = status
     return _answer(results, True)
 
 
@@ -1569,9 +1704,10 @@ async def discard_waf_learned_rules(
         dry_run=dry_run, confirm=confirm, writes=bool(removals),
     ):
         return preview
-    for entry, result in zip(picked, results):
-        if result["status"] == "would remove":
-            result["status"] = await _forget_learned(spec, profile, entry.get("rule") or {})
+    todo = [(entry, result) for entry, result in zip(picked, results) if result["status"] == "would remove"]
+    statuses = await _run_parallel(todo, lambda item: _forget_learned(spec, profile, item[0].get("rule") or {}))
+    for (_, result), status in zip(todo, statuses):
+        result["status"] = status
     return _answer(True)
 
 
@@ -2158,6 +2294,134 @@ async def update_signatures(
         return preview
     await _get_client().action(resource, "update", body)
     return {"dry_run": False, "kind": features[0], "updated": name}
+
+
+# Actions a signature rule can carry ('set appfw signatures -action').
+_SIGNATURE_ACTIONS = ("block", "log", "stats")
+
+
+def _on_off(value: bool | None) -> str | None:
+    return None if value is None else ("ON" if value else "OFF")
+
+
+@_tool
+async def set_signature_rules(
+    name: Annotated[str, Field(description="WAF signature object name, as listed by list_signatures.")],
+    rule_ids: Annotated[list[int] | None, Field(description="Signature rule IDs to change, e.g. [999981, 999982].")] = None,
+    category: Annotated[str | None, Field(description="Or: a whole signature category, e.g. 'web-cgi' or 'web-php'.")] = None,
+    enabled: Annotated[bool | None, Field(description="true = enable the rules / category, false = disable them.")] = None,
+    actions: Annotated[list[str] | None, Field(description="Actions for the rules / category: any of block, log, stats (an empty list removes all actions).")] = None,
+    auto_enable_new: Annotated[bool | None, Field(description="Whether rules that later signature updates add arrive enabled (object-wide).")] = None,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Enable / disable WAF signature rules or categories and set their actions (WRITE — requires
+    NETSCALER_ALLOW_WRITE).
+
+    The NITRO form of 'set appfw signatures <name> -ruleID … | -category … -enabled ON|OFF -action …'
+    (PUT appfwsignatures). Typical use: switch on a category that matters for the application, or take
+    a single false-positive rule out of blocking while keeping it logging. Per-rule state lives in the
+    signature file, which NITRO does not return, so the preview shows the change that will be sent, not
+    the current state. Not yet tried on a live appliance: check the result in the GUI the first time.
+    Live at once for every profile using the object; persist with save_config.
+    """
+    args = _call_args(locals())
+    if rule_ids and category:
+        raise ValueError("Pass rule_ids or category, not both.")
+    if (enabled is not None or actions is not None) and not (rule_ids or category):
+        raise ValueError("enabled / actions need rule_ids or category.")
+    if (rule_ids or category) and enabled is None and actions is None:
+        raise ValueError("Say what to change: enabled and/or actions.")
+    if not (rule_ids or category) and auto_enable_new is None:
+        raise ValueError("Nothing to change: pass rule_ids or category with enabled / actions, or auto_enable_new.")
+    acts = None
+    if actions is not None:
+        acts = sorted({a.strip().lower() for a in actions if a.strip()})
+        if bad := [a for a in acts if a not in _SIGNATURE_ACTIONS]:
+            raise ValueError(f"actions must be from {_SIGNATURE_ACTIONS}; got {bad}.")
+    if not dry_run:
+        _require_write()
+    body: dict[str, Any] = {"name": name}
+    if rule_ids:
+        body["ruleid"] = sorted(set(rule_ids))
+    if category:
+        body["category"] = category.strip()
+    if enabled is not None:
+        body["enabled"] = _on_off(enabled)
+    if acts is not None:
+        body["action"] = acts or ["none"]
+    if auto_enable_new is not None:
+        body["autoenablenewsignatures"] = _on_off(auto_enable_new)
+    preview = {
+        "dry_run": True,
+        "would_put": "config/appfwsignatures",
+        "body": body,
+        "next": "Call again with dry_run=false to apply (needs NETSCALER_ALLOW_WRITE); persist with save_config.",
+    }
+    target = f"rules {body['ruleid']}" if rule_ids else (f"category '{body['category']}'" if category else "new rules")
+    summary = f"Change WAF signature object '{name}': {target}."
+    if not _gate("set_signature_rules", {"args": args, "plan": body}, summary, preview, dry_run=dry_run, confirm=confirm):
+        return preview
+    await _get_client().update("appfwsignatures", body)
+    return {"dry_run": False, "updated": name, "body": body}
+
+
+@_tool
+async def set_signature_auto_update(
+    kind: Annotated[str, Field(description="'waf', 'bot' or 'both'.")],
+    enabled: Annotated[bool | None, Field(description="Turn automatic signature updates on or off.")] = None,
+    url: Annotated[str | None, Field(description="Signature update URL (https). Leave empty to keep the vendor default.")] = None,
+    proxy_server: Annotated[str | None, Field(description="Proxy the appliance uses to reach the update URL (IP or hostname); '' clears it.")] = None,
+    proxy_port: Annotated[int | None, Field(description="Proxy port.", ge=1, le=65535)] = None,
+    dry_run: Annotated[bool, Field(description="Preview only (default). Set false to apply; needs NETSCALER_ALLOW_WRITE and, unless NETSCALER_CONFIRM_WRITE=false, the confirm code from the preview.")] = True,
+    confirm: Annotated[str | None, Field(description=_CONFIRM_DESC)] = None,
+) -> dict[str, Any]:
+    """Configure automatic WAF / Bot signature updates (WRITE — requires NETSCALER_ALLOW_WRITE).
+
+    Sets signatureautoupdate, signatureurl and the proxy in appfwsettings / botsettings (appliance-wide).
+    With auto update on, the appliance fetches new signatures by itself, so new rules can reach traffic
+    without a change window; pair it with set_signature_rules auto_enable_new=false if new rules should
+    arrive disabled. Proxy credentials are not handled here (set them on the appliance). Shows the
+    current values next to the new ones; previews by default; persist with save_config.
+    """
+    args = _call_args(locals())
+    wanted: dict[str, Any] = {}
+    if enabled is not None:
+        wanted["signatureautoupdate"] = _on_off(enabled)
+    if url is not None:
+        clean = url.strip()
+        if clean and not clean.lower().startswith("https://"):
+            raise ValueError("url must start with https:// (signatures are code the appliance runs).")
+        wanted["signatureurl"] = clean
+    if proxy_server is not None:
+        wanted["proxyserver"] = proxy_server.strip()
+    if proxy_port is not None:
+        wanted["proxyport"] = proxy_port
+    if not wanted:
+        raise ValueError("Nothing to change: pass enabled, url, proxy_server or proxy_port.")
+    if not dry_run:
+        _require_write()
+    client = _get_client()
+    plan: dict[str, dict[str, Any]] = {}
+    current: dict[str, dict[str, Any]] = {}
+    for feature in _features(kind):
+        resource = _SIGNATURE_SOURCES[feature][2]
+        now = _one(await client.get("config", resource), resource)
+        current[feature] = {k: now.get(k) for k in wanted}
+        diff = {k: v for k, v in wanted.items() if str(now.get(k) if now.get(k) is not None else "") != str(v)}
+        if diff:
+            plan[feature] = diff
+    out: dict[str, Any] = {"dry_run": dry_run, "current": current, "changes": plan}
+    preview = {**out, "next": "Call again with dry_run=false to apply (needs NETSCALER_ALLOW_WRITE); persist with save_config."}
+    summary = "Set signature auto-update: " + "; ".join(f"{f} {c}" for f, c in plan.items())
+    if not _gate("set_signature_auto_update", {"args": args, "plan": plan}, summary, preview,
+                 dry_run=dry_run, confirm=confirm, writes=bool(plan)):
+        return preview
+    errors: list[str] = []
+    for feature, diff in plan.items():
+        errors += await _update_attrs(_SIGNATURE_SOURCES[feature][2], {}, diff)
+    out["errors"] = errors
+    return out
 
 
 @_tool

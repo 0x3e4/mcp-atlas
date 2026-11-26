@@ -45,6 +45,7 @@ EXPECTED_TOOLS = {
     "export_waf_profile",
     "add_waf_rule",
     "remove_waf_rule",
+    "set_waf_rule_state",
     "deploy_waf_learned_rules",
     "discard_waf_learned_rules",
     "set_waf_check_actions",
@@ -64,6 +65,8 @@ EXPECTED_TOOLS = {
     "waf_violations",
     "list_signatures",
     "update_signatures",
+    "set_signature_rules",
+    "set_signature_auto_update",
     "list_enforcement",
     "recent_security_violations",
     # several appliances, and several changes under one confirmation
@@ -318,7 +321,7 @@ WRITE_TOOLS = {
     "add_waf_rule", "remove_waf_rule", "deploy_waf_learned_rules", "discard_waf_learned_rules",
     "set_waf_check_actions", "import_waf_profile", "rehost_waf_profile", "save_config",
     "add_bot_rule", "remove_bot_rule", "set_bot_detections", "import_bot_profile", "rehost_bot_profile",
-    "update_signatures", "apply_batch",
+    "update_signatures", "set_signature_rules", "set_signature_auto_update", "set_waf_rule_state", "apply_batch",
     "add_object", "update_object", "set_object_state", "change_bindings", "delete_object",
     "upload_ssl_file", "sync_gslb_config", "clone_app_setup",
 }

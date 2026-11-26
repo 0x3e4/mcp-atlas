@@ -18,8 +18,9 @@ def ns(tmp_path):
     """
     fake = FakeNetScaler()
 
-    def use(allow_write: bool = True, confirm_write: bool = False, allow_delete: bool = True) -> None:
+    def use(allow_write: bool = True, confirm_write: bool = False, allow_delete: bool = True, **extra: object) -> None:
         env = {
+            **{f"NETSCALER_{k.upper()}": str(v).lower() for k, v in extra.items()},
             "NETSCALER_BASE_URL": "https://ns",
             "NETSCALER_USER": "u",
             "NETSCALER_PASSWORD": "p",

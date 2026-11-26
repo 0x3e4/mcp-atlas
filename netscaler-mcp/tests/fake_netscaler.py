@@ -21,6 +21,7 @@ TEST_HOST = "app.test.corp"
 BINDING_IDENTITY = {
     "appfwprofile_starturl_binding": ("starturl", "ruletype"),
     "appfwprofile_denyurl_binding": ("denyurl", "ruletype"),
+    "appfwprofile_blockkeyword_binding": ("blockkeyword", "as_blockkeyword_formurl", "fieldname", "ruletype"),
     "appfwprofile_sqlinjection_binding": (
         "sqlinjection", "formactionurl_sql", "as_scan_location_sql", "as_value_type_sql",
         "as_value_expr_sql", "ruletype",
@@ -153,6 +154,11 @@ class FakeNetScaler:
         self.saved = False
         self.writes: list[tuple[str, str, str | None, dict[str, str], Any]] = []
         self.signature_updates: list[tuple[str, Any]] = []
+        self.signature_sets: list[Any] = []
+        self.bulk_supported = True
+        self.bulk_requests = 0
+        self.in_flight = 0
+        self.max_in_flight = 0
         self.profiles = {"pr_app": self.profile(
             "appfwprofile", "pr_app", learning="ON", starturlaction=["learn", "log", "stats"],
             sqlinjectionaction=["learn", "log", "stats"], errorurl=f"https://{TEST_HOST}/error.html",
@@ -169,7 +175,7 @@ class FakeNetScaler:
                     "pr_app", "appfwprofile_sqlinjection_binding",
                     {"sqlinjection": "q", "formactionurl_sql": rf"^https://app\.test\.corp/search$", "isregex_sql": "NOTREGEX"},
                 )],
-                "appfwprofile_logexpression_binding": [{"name": "pr_app", "logexpression": "le1"}],
+                "appfwprofile_futurecheck_binding": [{"name": "pr_app", "futurecheck": "x1"}],
             },
             "bot_app": {
                 "botprofile_blacklist_binding": [self.row("bot_app", "botprofile_blacklist_binding", {
@@ -436,8 +442,14 @@ class FakeNetScaler:
             if params.get("action") == "update":
                 self.signature_updates.append((resource, body.get(resource)))
                 return reply()
+            if method == "PUT":
+                self.signature_sets.append(body.get(resource))
+                return reply()
             return reply(**{resource: self.signatures[resource]})
         if resource in ("appfwsettings", "botsettings"):
+            if method == "PUT":
+                self.settings[resource].update(body[resource])
+                return reply()
             return reply(**{resource: [self.settings[resource]]})
         if resource in ("appfwpolicy", "botpolicy"):
             return reply(**{resource: self.policies[resource]})
@@ -487,6 +499,16 @@ class FakeNetScaler:
     def _binding_api(
         self, method: str, binding: str, name: str | None, args: dict[str, str], obj: dict[str, Any]
     ) -> httpx.Response:
+        if method == "PUT" and isinstance(obj, list):  # NITRO bulk: one answer per object
+            if not self.bulk_supported:
+                return reply(400, 1092, "Invalid JSON input")
+            self.bulk_requests += 1
+            answers = []
+            for item in obj:
+                one = json.loads(self._binding_api("PUT", binding, None, args, item).content or b"{}")
+                answers.append({"errorcode": one.get("errorcode", 0), "message": one.get("message", "Done")})
+            failed = any(a["errorcode"] for a in answers)
+            return reply(200, 1243 if failed else 0, "Bulk operation failed" if failed else "Done", response=answers)
         profile = name or obj.get("name")
         family = "appfwprofile" if binding.startswith("appfwprofile_") else "botprofile"
         if profile not in self._profiles(family):

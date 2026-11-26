@@ -123,6 +123,7 @@ and apply only with the preview's `confirm` code, see [Confirmation before every
 |---|---|
 | `add_waf_rule(profile, rule, host?, path?, match?, scheme?, extensions?, field?, …, dry_run)` | Easy rules without hand-written regex: `allow_url`, `allow_static`, `deny_url`, `allow_sql_field`, `allow_xss_field`, `allow_cmd_field`, `allow_field_consistency`, `allow_cookie`, `allow_csrf`, `allow_content_type`, `trusted_learning_client`, or `raw`. `host='*'` makes a rule global across environments; comma-separate profiles to add it to several. |
 | `remove_waf_rule(profile, rule_type, rule, all_matches?, dry_run)` | Unbind a rule (pass a row from `list_waf_rules`). |
+| `set_waf_rule_state(profile, rule_type, state, rule? \| contains?, all_matches?, dry_run)` | **Park or re-activate rules** without deleting them (`DISABLED` / `ENABLED`): stage rules before go-live or take one back and restore it later. Unbind + bind with the new state (NITRO has no binding update); if the bind fails the original rule is bound again. |
 | `deploy_waf_learned_rules(profile, rule_type, contains?, min_hits?, remove_learned?, limit?, dry_run)` | Turn learned entries into rules — skipping ones that exist or that a start URL rule already covers — and clear them from learning. |
 | `discard_waf_learned_rules(profile, rule_type, contains?, max_hits?, all_entries?, limit?, dry_run)` | Drop learned noise (scanners, attack attempts) so it never becomes a rule. |
 | `set_waf_check_actions(profile, checks, set_actions?, add_actions?, remove_actions?, dry_run)` | The learn → block switch, per check or `['all']`, with before/after. |
@@ -160,6 +161,8 @@ and apply only with the preview's `confirm` code, see [Confirmation before every
 | `list_enforcement(kind?, profile?, limit?)` | Which policies select a profile and where each is bound; flags policies bound nowhere and profiles no policy selects. |
 | `list_signatures(kind?, full?)` | Signature objects (source URL, `encryptedversion`) plus the auto-update switch and the related appliance settings. |
 | `update_signatures(kind, name, merge_default?, dry_run, confirm?)` | **Write:** re-fetch a signature object from its configured source URL (previews by default, applies with the confirm code). |
+| `set_signature_rules(name, rule_ids? \| category?, enabled?, actions?, auto_enable_new?, dry_run, confirm?)` | **Write (WAF):** enable / disable signature rules or a whole category and set their actions (`block`, `log`, `stats`), e.g. take one false-positive rule out of blocking but keep it logging; `auto_enable_new` decides whether rules from later updates arrive enabled. `set appfw signatures` over NITRO — not yet tried on a live box. |
+| `set_signature_auto_update(kind, enabled?, url?, proxy_server?, proxy_port?, dry_run, confirm?)` | **Write:** automatic signature updates for WAF (`appfwsettings`) and/or Bot (`botsettings`): switch, https URL and proxy, shown next to the current values. |
 | `recent_security_violations(feature?, contains?, loglevel?, limit?)` | Recent `APPFW_*` / `BOT_*` lines from `auditmessages`, with the check, profile, client IP and URL pulled out. |
 
 ## 1. Create a read-only account
@@ -215,8 +218,10 @@ NETSCALER_DC2_PASSWORD=...           # … unless an instance sets its own
 
 - Each listed instance needs its own `NETSCALER_<NAME>_BASE_URL` (`-` in a name becomes `_` in the
   variable). Every other appliance setting — `USER`, `PASSWORD`, `AUTH_MODE`, `SESSION_TIMEOUT`,
-  `TIMEOUT`, `VERIFY_SSL`, `CA_BUNDLE`, `ALLOW_WRITE`, `ALLOW_DELETE`, `CONFIRM_WRITE`, `EXPORT_DIR` — can be set per
-  instance as `NETSCALER_<NAME>_<KEY>`, with the plain `NETSCALER_<KEY>` as shared fallback. So writes can
+  `TIMEOUT`, `VERIFY_SSL`, `CA_BUNDLE`, `ALLOW_WRITE`, `ALLOW_DELETE`, `CONFIRM_WRITE`, `EXPORT_DIR`,
+  `WRITE_CONCURRENCY`, `BULK_BIND` — can be set per instance as `NETSCALER_<NAME>_<KEY>`, with the plain
+  `NETSCALER_<KEY>` as shared fallback. Passwords can come from files per instance as well
+  (`NETSCALER_DC2_PASSWORD_FILE=/run/secrets/dc2_password`). So writes can
   be on for one box and off for another (`NETSCALER_DC2_ALLOW_WRITE=true`).
 - Every tool takes **`instance`**; omitted, it uses the default instance. Read tools also take
   **`instance='all'`**: they run on every appliance at once and return `{"instances": {name: result}}`.
@@ -575,9 +580,19 @@ behind a block — the fastest way to tell a false positive from a real one.
   list includes log, the appliance keeps at most 256 recent audit messages, and the account needs
   `show audit messages`. The message format varies by build and CEF setting, so the raw line is always
   included and the parsed fields are best effort.
-- **Not everything is modelled.** Binding types such as log expressions, deny/bypass lists and
-  gRPC/REST validation are exported under `other_bindings` for reference but not imported. Use
-  `nitro_get` / the GUI for those. The profile must still be bound to an AppFw policy to take effect.
+- **Rule types.** Besides the relaxations above, export / import / add (`rule='raw'`) / remove / state
+  cover block keywords (`block_keyword`, `json_block_keyword`), allow and deny lists (`allow_list`,
+  `deny_list`), fake-account detection, file-upload types, XML SQL / XSS, log expressions, excluded
+  response content types, confidential fields and REST / gRPC / XML validation (the 14.1 binding types,
+  with the DELETE arguments NetScaler's Terraform provider uses). Binding types not in the table are still
+  exported under `other_bindings` for reference but not imported. The profile must still be bound to an
+  AppFw policy to take effect.
+- **Parallel rule writes.** Deploy, discard, import, rehost, remove and state changes send their rule
+  writes in parallel, `NETSCALER_WRITE_CONCURRENCY` (default 4, 1 = one after another) at a time, and
+  keep a status per rule; the import order (add → re-bind → remove) still holds phase by phase. With
+  `NETSCALER_BULK_BIND=true`, adds go as NITRO bulk requests (100 rules per request, `X-NITRO-ONERROR:
+  continue`) and fall back to single requests whenever the appliance rejects a bulk request. Bulk is off
+  by default because it has not been tried on a live box yet.
 - NetScaler's native `restore appfw profile … -matchURLString/-replaceURLString` needs a tar archive
   created on the appliance. These tools do the same job purely over NITRO, with a reviewable JSON
   document.
@@ -598,7 +613,7 @@ tool carries read-only / destructive hints, text other people wrote comes back m
 `<untrusted>`, secrets are masked, writes that would carry secrets out are refused, and every write is
 audited (stderr, GELF `MCP_AUDIT_GELF`, syslog `MCP_AUDIT_SYSLOG`). In HTTP mode set `MCP_AUTH_TOKEN` and
 `MCP_ALLOWED_HOSTS`; the compose examples already run the container read-only and without capabilities.
-The variables are in [`.env.example`](.env.example).
+Credentials can come from files (Docker / Kubernetes secrets) instead of the env file: set `NETSCALER_PASSWORD_FILE=/run/secrets/…` and leave `NETSCALER_PASSWORD` unset; this works for every password, secret, token, API key and user variable (`<VAR>_FILE`). The variables are in [`.env.example`](.env.example).
 
 ## Notes & scope
 

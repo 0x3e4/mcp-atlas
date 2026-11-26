@@ -15,6 +15,7 @@ httpx silently drops a URL's own query when ``params=`` is also passed, and NITR
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from urllib.parse import quote
 
@@ -44,6 +45,8 @@ class NitroClient:
         self._settings = settings
         self._client: httpx.AsyncClient | None = None
         self._sessionid: str | None = None
+        # Parallel rule writes share one session: only one of them logs in when it is missing or expired.
+        self._login_lock = asyncio.Lock()
 
     @property
     def settings(self) -> Settings:
@@ -127,7 +130,9 @@ class NitroClient:
                 "X-NITRO-PASS": self._settings.password,
             }
         if self._sessionid is None:
-            await self._login()
+            async with self._login_lock:
+                if self._sessionid is None:
+                    await self._login()
         return {"Cookie": f"NITRO_AUTH_TOKEN={self._sessionid}"}
 
     # ---- requests -------------------------------------------------------
@@ -192,6 +197,23 @@ class NitroClient:
         """PUT a config resource: ``set`` for a resource, ``bind`` for a ``*_binding`` type."""
         return await self._request("PUT", f"config/{resourcetype}", body={resourcetype: obj})
 
+    async def bulk_update(self, resourcetype: str, objs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """PUT several objects in one request (NITRO bulk, ``X-NITRO-ONERROR: continue``).
+
+        Returns one ``{"errorcode", "message"}`` per object, in order. A request the appliance rejects as a
+        whole raises ``NitroError``; the caller then falls back to one request per object.
+        """
+        env = await self._request(
+            "PUT", f"config/{resourcetype}", body={resourcetype: objs},
+            extra_headers={"X-NITRO-ONERROR": "continue"}, partial_ok=True,
+        )
+        answers = env.get("response")
+        if not isinstance(answers, list):
+            return [{"errorcode": 0, "message": "Done"} for _ in objs]
+        if len(answers) != len(objs):
+            raise NitroError(f"NITRO bulk answer has {len(answers)} results for {len(objs)} objects.")
+        return [a if isinstance(a, dict) else {"errorcode": -1, "message": str(a)} for a in answers]
+
     async def delete(
         self,
         resourcetype: str,
@@ -219,8 +241,10 @@ class NitroClient:
         path: str,
         *,
         params: dict[str, Any] | None = None,
-        body: dict[str, Any] | None = None,
+        body: Any = None,
         absolute: bool = False,
+        extra_headers: dict[str, str] | None = None,
+        partial_ok: bool = False,
     ) -> dict[str, Any]:
         url = path if absolute else f"{self._settings.nitro_base}/{path}"
         query = _encode_query(params)
@@ -232,8 +256,9 @@ class NitroClient:
         # Two attempts: a 444/401 on the first forces a fresh login on the retry (session mode only).
         for attempt in (1, 2):
             headers = await self._auth_headers()
+            used = self._sessionid
             try:
-                resp = await client.request(method, url, headers=headers, json=body)
+                resp = await client.request(method, url, headers=extra_headers | headers if extra_headers else headers, json=body)
             except httpx.HTTPError as exc:
                 raise NitroError(f"Network error calling NITRO {path}: {exc}") from exc
 
@@ -241,8 +266,11 @@ class NitroClient:
             code = env.get("errorcode")
 
             if (resp.status_code == 401 or code == _SESSION_EXPIRED) and attempt == 1 and session_mode:
-                self._sessionid = None  # force re-login on the retry
+                if self._sessionid == used:  # another parallel request may have logged in already
+                    self._sessionid = None  # force re-login on the retry
                 continue
+            if partial_ok and code not in (0, None) and isinstance(env.get("response"), list):
+                return env  # bulk request: some items failed, the per-item answers are in "response"
             if resp.status_code >= 400:
                 raise NitroError(
                     _format_http_error(resp, env, write=write),

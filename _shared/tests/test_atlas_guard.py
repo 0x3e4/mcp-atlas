@@ -364,3 +364,38 @@ def test_http_app_sets_host_checks_and_token(tmp_path):
     token_file.write_text("file-token\n")
     app = guard.http_app(mcp, host="0.0.0.0", env={"MCP_ALLOWED_HOSTS": "demo-mcp:8000", "MCP_AUTH_TOKEN_FILE": str(token_file)})
     assert any(m.cls is guard.BearerAuth and m.kwargs["token"] == "file-token" for m in app.user_middleware)
+
+
+def test_secret_files_fill_credentials(tmp_path):
+    pw = tmp_path / "pw"
+    pw.write_text("s3cret-from-file\n", encoding="utf-8")
+    cert = tmp_path / "ca.pem"
+    cert.write_text("-----BEGIN CERTIFICATE-----", encoding="utf-8")
+    env = {"APP_PASSWORD_FILE": str(pw), "SSL_CERT_FILE": str(cert), "APP_USER": "reader"}
+    assert guard.load_secret_files(env) == ["APP_PASSWORD"]
+    assert env["APP_PASSWORD"] == "s3cret-from-file"  # trailing newline dropped
+    assert "SSL_CERT" not in env  # path-style variables are left alone
+    config = guard.GuardConfig.from_env(env)
+    assert "s3cret-from-file" in config.own_secrets and str(pw) not in config.own_secrets
+
+
+def test_secret_files_fail_closed(tmp_path):
+    with pytest.raises(RuntimeError, match="cannot read"):
+        guard.load_secret_files({"APP_TOKEN_FILE": str(tmp_path / "missing")})
+    empty = tmp_path / "empty"
+    empty.write_text("\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="is empty"):
+        guard.load_secret_files({"APP_TOKEN_FILE": str(empty)})
+    other = tmp_path / "other"
+    other.write_text("from-file", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="set only one"):
+        guard.load_secret_files({"APP_TOKEN_FILE": str(other), "APP_TOKEN": "from-env"})
+    same = {"APP_TOKEN_FILE": str(other), "APP_TOKEN": "from-file"}
+    assert guard.load_secret_files(same) == ["APP_TOKEN"]
+
+
+def test_harden_reports_secret_files(tmp_path):
+    pw = tmp_path / "pw"
+    pw.write_text("another-secret", encoding="utf-8")
+    _, extra = build({"OTHER_API_KEY_FILE": str(pw)})
+    assert extra["report"]["secret_files"] == ["OTHER_API_KEY"]

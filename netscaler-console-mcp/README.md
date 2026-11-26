@@ -132,7 +132,7 @@ tool carries read-only / destructive hints, text other people wrote comes back m
 `<untrusted>`, secrets are masked, writes that would carry secrets out are refused, and every write is
 audited (stderr, GELF `MCP_AUDIT_GELF`, syslog `MCP_AUDIT_SYSLOG`). In HTTP mode set `MCP_AUTH_TOKEN` and
 `MCP_ALLOWED_HOSTS`; the compose examples already run the container read-only and without capabilities.
-The variables are in [`.env.example`](.env.example).
+Credentials can come from files (Docker / Kubernetes secrets) instead of the env file: set `NETSCALER_CONSOLE_PASSWORD_FILE=/run/secrets/…` and leave `NETSCALER_CONSOLE_PASSWORD` unset; this works for every password, secret, token, API key and user variable (`<VAR>_FILE`). The variables are in [`.env.example`](.env.example).
 
 ## Notes & scope
 

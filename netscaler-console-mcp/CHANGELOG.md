@@ -5,6 +5,21 @@ All notable changes to netscaler-console-mcp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-26
+
+### Changed
+
+- Dependencies (each release at least 7 days old): annotated-doc 0.0.7, httpcore2 / httpx2 2.16.2, python-multipart 0.0.34, typer 0.29.2.
+- Held back by the 7-day rule: certifi 2026.11.20, packaging 26.4, pydantic 2.14.4 / pydantic-core 2.50.5, sse-starlette 3.7.1 (and Poetry 2.5.2 in the image) until they are a week old.
+
+### Security
+
+- Credentials can come from files (Docker / Kubernetes secrets): `NETSCALER_CONSOLE_PASSWORD_FILE=/run/secrets/…` fills
+  `NETSCALER_CONSOLE_PASSWORD`, and the same works for every password, secret, token, API key, user and client-id
+  variable (`<VAR>_FILE`). The value is then neither in the env file nor in `docker inspect`. A missing
+  or empty file, or both variables set to different values, stops the server at start instead of
+  running with the wrong credentials (shared guard `load_secret_files`).
+
 ## [1.3.0] - 2026-11-18
 
 ### Fixed

@@ -493,7 +493,48 @@ RULE_TYPES: dict[str, RuleType] = {
     "json_sql_url": _json_rule("sql"),
     "json_xss_url": _json_rule("xss"),
     "json_cmd_url": _json_rule("cmd"),
+    # Added in 1.3.0 from the 14.1 binding structs (adc-nitro-go) with the DELETE args the official
+    # Terraform provider sends. Not learned by the appliance, so add / remove / import only.
+    "block_keyword": RuleType(
+        "appfwprofile_blockkeyword_binding", ("blockkeyword", "as_blockkeyword_formurl", "fieldname"),
+        ("as_blockkeyword_formurl",),
+    ),
+    "json_block_keyword": RuleType(
+        "appfwprofile_jsonblockkeyword_binding", ("jsonblockkeyword", "jsonblockkeywordurl", "keyname_json_blockkeyword"),
+        ("jsonblockkeywordurl",),
+    ),
+    "allow_list": RuleType(
+        "appfwprofile_bypasslist_binding", ("as_bypass_list", "as_bypass_list_location", "as_bypass_list_value_type"),
+    ),
+    "deny_list": RuleType(
+        "appfwprofile_denylist_binding", ("as_deny_list", "as_deny_list_location", "as_deny_list_value_type"),
+    ),
+    "fake_account": RuleType(
+        "appfwprofile_fakeaccount_binding", ("fakeaccount", "formexpression", "formurl_fad", "tag"), ("formurl_fad",),
+    ),
+    # filetype is a list on the wire, so it stays out of the identity (DELETE args are plain strings).
+    "file_upload_type": RuleType(
+        "appfwprofile_fileuploadtype_binding", ("fileuploadtype", "as_fileuploadtypes_url"), ("as_fileuploadtypes_url",),
+    ),
+    "xml_sql_injection": RuleType("appfwprofile_xmlsqlinjection_binding", ("xmlsqlinjection", "as_scan_location_xmlsql")),
+    "xml_xss": RuleType("appfwprofile_xmlxss_binding", ("xmlxss", "as_scan_location_xmlxss")),
+    "log_expression": RuleType("appfwprofile_logexpression_binding", ("logexpression",)),
+    "exclude_response_content_type": RuleType(
+        "appfwprofile_excluderescontenttype_binding", ("excluderescontenttype",),
+    ),
+    "confidential_field": RuleType(
+        "appfwprofile_appfwconfidfield_binding", ("confidfield", "cffield_url"), ("cffield_url",),
+    ),
+    "rest_validation": RuleType("appfwprofile_restvalidation_binding", ("restvalidation", "rest_validation_action")),
+    "grpc_validation": RuleType(
+        "appfwprofile_grpcvalidation_binding", ("grpcvalidation", "grpc_relax_validation_action"),
+    ),
+    "xml_validation_url": RuleType("appfwprofile_xmlvalidationurl_binding", ("xmlvalidationurl",), ("xmlvalidationurl",)),
 }
+
+# Binding states: a rule can be parked (DISABLED) without deleting it. Bindings have no update in
+# NITRO, so a state change is unbind + bind with the same attributes and the new state.
+RULE_STATES = ("ENABLED", "DISABLED")
 
 # Learned checks without a deployable rule mapping (listed only).
 LIST_ONLY_CHECKS = {"xml_dos": "XMLDoSCheck", "xml_wsi": "XMLWSICheck", "xml_attachment": "XMLAttachmentCheck"}
@@ -537,7 +578,10 @@ def as_int(value: Any) -> int | None:
 _BINDING_DROP = frozenset({"name", "alertonly", "resourceid", "__count", "_nextgenapiresource"})
 # Not worth re-binding a rule over (how the rule was created, not what it does).
 _COMPARE_IGNORE = frozenset({"isautodeployed"})
-_ENUM_ATTR = re.compile(r"ruletype|as_scan_location_\w+|as_value_type_\w+|bot_\w+_type|category")
+_ENUM_ATTR = re.compile(
+    r"ruletype|as_scan_location_\w+|as_value_type_\w+|as_\w+_list_(location|value_type)|\w+_validation_action"
+    r"|bot_\w+_type|category"
+)
 
 
 def arg_value(value: Any) -> str:
@@ -554,7 +598,7 @@ def _norm(attr: str, value: Any) -> str:
         text = text.lower()
         if not text and attr == "ruletype":
             return "allow"
-        if not text and attr.startswith("as_scan_location_"):
+        if not text and attr.startswith("as_scan_location_") and not attr.endswith(("xmlsql", "xmlxss")):
             return "formfield"
     return text
 

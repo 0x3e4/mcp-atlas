@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "fortigate-mcp"
-version = "1.2.0"
+version = "1.3.0"
 description = "FortiGate (FortiOS REST API) MCP server — policies, objects, VPN, SD-WAN, sessions, logs, HA, system status; opt-in object/policy writes and deletes"
 readme = "README.md"
 requires-python = ">=3.14"

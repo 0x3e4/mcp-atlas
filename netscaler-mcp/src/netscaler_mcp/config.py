@@ -25,7 +25,7 @@ DEFAULT_INSTANCE = "default"
 # the row cap belong to the server and stay shared.
 INSTANCE_KEYS = (
     "BASE_URL", "USER", "PASSWORD", "AUTH_MODE", "SESSION_TIMEOUT", "TIMEOUT", "VERIFY_SSL",
-    "CA_BUNDLE", "ALLOW_WRITE", "ALLOW_DELETE", "CONFIRM_WRITE", "EXPORT_DIR",
+    "CA_BUNDLE", "ALLOW_WRITE", "ALLOW_DELETE", "CONFIRM_WRITE", "EXPORT_DIR", "WRITE_CONCURRENCY", "BULK_BIND",
 )
 _INSTANCE_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 # Every NETSCALER_* variable the server reads itself; an instance prefix must not produce one of them.
@@ -56,6 +56,10 @@ class Settings:
     allow_delete: bool = False
     confirm_write: bool = True
     export_dir: str = ""
+    # Rule writes (binds / unbinds / learned-data deletes) in flight at once; 1 = one after another.
+    write_concurrency: int = 4
+    # Bind many WAF/Bot rules per request (NITRO bulk, X-NITRO-ONERROR: continue). Off until tried on a live box.
+    bulk_bind: bool = False
     name: str = DEFAULT_INSTANCE
 
     @classmethod
@@ -104,6 +108,8 @@ class Settings:
             allow_delete=_bool_env(env, "NETSCALER_ALLOW_DELETE", False),
             confirm_write=_bool_env(env, "NETSCALER_CONFIRM_WRITE", True),
             export_dir=env.get("NETSCALER_EXPORT_DIR", "").strip(),
+            write_concurrency=_concurrency(env),
+            bulk_bind=_bool_env(env, "NETSCALER_BULK_BIND", False),
         )
 
     @property
@@ -197,6 +203,13 @@ def _int_env(env: dict[str, str], name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be an integer; got {raw!r}.") from exc
+
+
+def _concurrency(env: dict[str, str]) -> int:
+    value = _int_env(env, "NETSCALER_WRITE_CONCURRENCY", 4)
+    if not 1 <= value <= 16:
+        raise ConfigError(f"NETSCALER_WRITE_CONCURRENCY must be 1-16; got {value}.")
+    return value
 
 
 def _float_env(env: dict[str, str], name: str, default: float) -> float:

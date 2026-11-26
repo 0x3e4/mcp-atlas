@@ -25,11 +25,12 @@ from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from . import __version__
-from ._atlas_guard import harden, run_http
+from ._atlas_guard import harden, load_secret_files, run_http
 from .config import Settings, WazuhError
 from .indexer import IndexerClient
 from .manager import ManagerClient
 
+load_secret_files()  # <VAR>_FILE secrets must be in place before the settings are read
 settings = Settings.from_env()
 
 _manager: ManagerClient | None = None

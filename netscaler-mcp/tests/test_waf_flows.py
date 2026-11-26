@@ -37,7 +37,7 @@ def test_url_inventory_and_learned_rules(ns):
     async def scenario():
         rules = await server.list_waf_rules("pr_app")
         assert rules["counts"] == {"start_url": 2, "sql_injection": 1}
-        assert rules["other_bindings"] == {"appfwprofile_logexpression_binding": 1}
+        assert rules["other_bindings"] == {"appfwprofile_futurecheck_binding": 1}
         assert "resourceid" not in rules["rules"]["start_url"][0]
 
         learned = await server.list_waf_learned_rules("pr_app", "startURL", min_hits=2)
@@ -144,7 +144,7 @@ def test_export_import_to_new_profile_with_host_switch(ns):
     assert (prod["starturlaction"], prod["errorurl"]) == (["learn", "log", "stats"], "https://app.corp/error.html")
     assert ns.learning_settings["pr_app_prod"]["starturlminthreshold"] == 5
     assert ns.start_urls("pr_app_prod") == sorted([r"^https://app\.corp/app/.*$", STATIC])
-    assert "appfwprofile_logexpression_binding" not in ns.bindings["pr_app_prod"]
+    assert "appfwprofile_futurecheck_binding" not in ns.bindings["pr_app_prod"]
 
 
 def test_rehost_in_place_binds_before_unbinding(ns):

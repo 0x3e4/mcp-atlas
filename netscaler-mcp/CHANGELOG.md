@@ -5,6 +5,49 @@ All notable changes to netscaler-mcp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-26
+
+### Added
+
+- WAF rule types for the 14.1 bindings that were missing: `block_keyword`, `json_block_keyword`,
+  `allow_list` (bypass list), `deny_list`, `fake_account`, `file_upload_type`, `xml_sql_injection`,
+  `xml_xss`, `log_expression`, `exclude_response_content_type`, `confidential_field`, `rest_validation`,
+  `grpc_validation`, `xml_validation_url`. Attribute names come from NetScaler's Go SDK, the DELETE
+  arguments from its Terraform provider. Export, import, rehost, `add_waf_rule(rule='raw')`,
+  `remove_waf_rule` and the new state tool handle them; before, they were exported under
+  `other_bindings` only.
+- `set_waf_rule_state`: park (`DISABLED`) or re-activate (`ENABLED`) relaxation rules without deleting
+  them. NITRO has no binding update, so this unbinds and binds again with the new state; if the bind
+  fails, the original rule is bound again.
+- `set_signature_rules`: enable / disable WAF signature rules (`rule_ids`) or a whole `category`, set
+  their actions (`block`, `log`, `stats`) and `auto_enable_new` (`set appfw signatures`, PUT
+  `appfwsignatures`). Not yet tried on a live appliance.
+- `set_signature_auto_update`: signature auto-update switch, https URL and proxy for WAF
+  (`appfwsettings`) and Bot (`botsettings`), with the current values in the preview.
+- `NETSCALER_WRITE_CONCURRENCY` (default 4, 1-16) and `NETSCALER_BULK_BIND` (default off), also per
+  instance.
+
+### Changed
+
+- Rule writes run in parallel: deploy / discard learned rules, import, rehost, remove and add to several
+  profiles send up to `NETSCALER_WRITE_CONCURRENCY` requests at once, with one status per rule. An import
+  still adds first, re-binds second and removes last; only the writes inside a phase overlap.
+- `NETSCALER_BULK_BIND=true` binds new rules with NITRO bulk requests (100 per request,
+  `X-NITRO-ONERROR: continue`, one status per rule) and falls back to single requests whenever the
+  appliance rejects a bulk request. Off by default until tried on a live box.
+- Parallel requests share one session: only one of them logs in again when the session is missing or
+  has expired.
+- Dependencies (each release at least 7 days old): annotated-doc 0.0.7, httpcore2 / httpx2 2.16.2, python-multipart 0.0.34, typer 0.29.2.
+- Held back by the 7-day rule: certifi 2026.11.20, packaging 26.4, pydantic 2.14.4 / pydantic-core 2.50.5, sse-starlette 3.7.1 (and Poetry 2.5.2 in the image) until they are a week old.
+
+### Security
+
+- Credentials can come from files (Docker / Kubernetes secrets): `NETSCALER_PASSWORD_FILE=/run/secrets/…` fills
+  `NETSCALER_PASSWORD`, and the same works for every password, secret, token, API key, user and client-id
+  variable (`<VAR>_FILE`). The value is then neither in the env file nor in `docker inspect`. A missing
+  or empty file, or both variables set to different values, stops the server at start instead of
+  running with the wrong credentials (shared guard `load_secret_files`).
+
 ## [1.2.0] - 2026-11-18
 
 ### Security
