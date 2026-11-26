@@ -5,6 +5,16 @@ All notable changes to prtg-mcp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-26
+
+### Added
+
+- `MCP_COMPACT_TOOLS=true` (shared guard, default off) sends a smaller tool list: the first paragraph of
+  each description, no schema titles, plain optional types and short `confirm` / `dry_run` help.
+  This server's tool list shrinks from about 6,876 to 4,371 tokens (−36 %). Parameter
+  descriptions stay whole, since they list the valid values. Meant for local models and gateways that
+  pass every tool on; see also atlas-hub-mcp.
+
 ## [1.2.0] - 2026-11-26
 
 ### Changed

@@ -399,3 +399,39 @@ def test_harden_reports_secret_files(tmp_path):
     pw.write_text("another-secret", encoding="utf-8")
     _, extra = build({"OTHER_API_KEY_FILE": str(pw)})
     assert extra["report"]["secret_files"] == ["OTHER_API_KEY"]
+
+
+# ---- compact tool lists ----------------------------------------------------------------------------
+
+def test_compact_schema_keeps_meaning():
+    schema = {"title": "args", "type": "object", "required": ["name"], "properties": {
+        "name": {"title": "Name", "type": "string", "description": "Kind: 'a', 'b' or 'c'. Long help stays."},
+        "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}], "default": None, "title": "Limit"},
+        "mode": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": "x", "title": "Mode"},
+        "confirm": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None, "description": "long " * 40},
+    }}
+    out = guard.compact_schema(schema)
+    assert "title" not in json.dumps(out)
+    assert out["properties"]["name"]["description"] == "Kind: 'a', 'b' or 'c'. Long help stays."
+    assert out["properties"]["limit"] == {"type": "integer"}
+    assert out["properties"]["mode"] == {"type": "string", "default": "x"}
+    assert out["properties"]["confirm"]["description"] == guard._COMPACT_PARAM_HELP["confirm"]
+    assert schema["properties"]["name"]["title"] == "Name"  # input untouched
+    assert guard.compact_description("First line\n  continues.\n\nDetails for humans.") == "First line continues."
+
+
+def test_compact_mode_shrinks_the_tool_list_and_tools_still_work():
+    full, _ = build()
+    small, extra = build({"MCP_COMPACT_TOOLS": "true"})
+    assert extra["report"]["compact"] is True
+
+    def size(mcp):
+        return len(json.dumps([[t.description, t.input_schema] for t in run(mcp.list_tools())]))
+
+    assert size(small) < size(full)
+    tools = {t.name: t for t in run(small.list_tools())}
+    assert "title" not in json.dumps(tools["set_state"].input_schema)
+    assert tools["set_state"].annotations.read_only_hint is False  # annotations unaffected
+    assert tools["read_ticket"].description.endswith(guard.UNTRUSTED_TOOL_NOTE_SHORT)
+    result = run(small.call_tool("set_state", {"name": "x", "enabled": True, "confirm": None}))
+    assert "confirmation_required" in json.dumps(result.model_dump(), default=str)

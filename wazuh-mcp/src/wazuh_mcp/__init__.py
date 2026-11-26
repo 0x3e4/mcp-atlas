@@ -1,3 +1,3 @@
 """Lightweight MCP server for Wazuh (alerts, archives, and management data)."""
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
