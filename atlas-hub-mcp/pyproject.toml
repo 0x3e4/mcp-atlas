@@ -1,0 +1,29 @@
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "atlas-hub-mcp"
+version = "1.0.0"
+description = "Hub in front of many MCP servers: search tools, describe and call them through five tools - saves tokens for local models"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{ name = "cai", email = "cai@nohub.lol" }]
+keywords = ["mcp", "gateway", "tool-search", "ollama", "vllm", "local-llm"]
+dependencies = [
+    "mcp[cli]>=2.3,<3",
+    "httpx2>=2.16",
+]
+
+[project.scripts]
+atlas-hub-mcp = "atlas_hub_mcp.server:main"
+
+[tool.poetry]
+packages = [{ include = "atlas_hub_mcp", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

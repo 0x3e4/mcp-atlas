@@ -1,0 +1,37 @@
+# atlas-hub-mcp in front of other mcp-atlas containers (for local models). Copy and customize locally:
+#   cp compose.yml.example compose.yml      # compose.yml is gitignored (per-deployment)
+#   docker compose pull && docker compose up -d
+# The upstream servers run in HTTP mode on the same Docker network (see their compose.yml.example) with
+# MCP_AUTH_TOKEN set, and the hub gets the same tokens (ATLAS_HUB_<NAME>_TOKEN in atlas-hub.env, or files).
+services:
+  atlas-hub-mcp:
+    image: ghcr.io/0x3e4/atlas-hub-mcp:latest
+    container_name: atlas-hub-mcp         # reachable at http://atlas-hub-mcp:8000/mcp for clients on the network
+    env_file: ./atlas-hub.env
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      MCP_ALLOWED_HOSTS: "atlas-hub-mcp:8000,localhost:*,127.0.0.1:*"
+      # Upstream tokens as Docker secrets instead of env values:
+      # ATLAS_HUB_NETSCALER_TOKEN_FILE: /run/secrets/netscaler_mcp_token
+    # secrets: [netscaler_mcp_token]
+    ports:
+      - "8000:8000"                       # drop when only containers on atlas-net use the hub
+    networks: [atlas-net]
+    restart: unless-stopped
+    # --- hardening: read-only root fs, no Linux capabilities, no privilege escalation, bounded resources.
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpus: 0.5
+
+networks:
+  atlas-net:
+    external: true                        # the network the upstream mcp-atlas containers are on
+
+# secrets:
+#   netscaler_mcp_token:
+#     file: ./secrets/netscaler_mcp_token

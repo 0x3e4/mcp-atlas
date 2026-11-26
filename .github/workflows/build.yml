@@ -50,6 +50,7 @@ jobs:
       fail-fast: false
       matrix:
         server:
+          - atlas-hub-mcp
           - audiocodes-sbc-mcp
           - azure-devops-mcp
           - bookstack-mcp
@@ -89,6 +90,7 @@ jobs:
       fail-fast: false
       matrix:
         server:
+          - atlas-hub-mcp
           - audiocodes-sbc-mcp
           - azure-devops-mcp
           - bookstack-mcp
