@@ -30,6 +30,9 @@ jobs:
       - name: Guard copies match _shared/atlas_guard.py
         run: python scripts/sync_shared.py --check
 
+      - name: README server table shows every server's current version
+        run: python scripts/sync_readme_versions.py --check
+
       - name: Known vulnerabilities in the locks (OSV)
         run: python scripts/osv_check.py
 
