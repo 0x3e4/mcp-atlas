@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "atlas-hub-mcp"
-version = "1.0.0"
+version = "1.0.1"
 description = "Hub in front of many MCP servers: search tools, describe and call them through five tools - saves tokens for local models"
 readme = "README.md"
 requires-python = ">=3.14"

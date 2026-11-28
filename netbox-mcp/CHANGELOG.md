@@ -5,6 +5,13 @@ All notable changes to netbox-mcp will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-11-28
+
+### Changed
+
+- Dependencies (each release at least 7 days old): certifi 2026.11.20, pydantic 2.14.4 / pydantic-core 2.50.5.
+- Held back by the 7-day rule: httpx 0.29.0, packaging 26.4, sse-starlette 3.7.1, typer 0.29.3 (and Poetry 2.5.2 in the image, cosign-installer v4.1.4 in CI) until they are a week old.
+
 ## [1.3.0] - 2026-11-26
 
 ### Added
